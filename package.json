@@ -1,0 +1,14 @@
+{
+  "name": "nodesend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "nodemailer": "^6.10.1"
+  }
+}
