@@ -34,6 +34,86 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+/**
+ * Normalizes a provider base URL.
+ */
+function sanitizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+/**
+ * Restrict proxying to known Alibaba / DashScope hosts.
+ * This avoids turning the service into an arbitrary open proxy.
+ */
+function isAllowedAlibabaBaseUrl(baseUrl) {
+  try {
+    const url = new URL(baseUrl);
+
+    if (url.protocol !== "https:") {
+      return false;
+    }
+
+    const host = url.hostname.toLowerCase();
+
+    return (
+      host.endsWith(".maas.aliyuncs.com") ||
+      host === "dashscope-intl.aliyuncs.com" ||
+      host === "dashscope.aliyuncs.com" ||
+      host === "dashscope-us.aliyuncs.com" ||
+      host === "cn-hongkong.dashscope.aliyuncs.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Calls Alibaba using credentials supplied transiently by the caller.
+ *
+ * Credentials are not stored by this service.
+ */
+async function callAlibaba(config, path, body) {
+  const apiKey = String(config?.apiKey || "").trim();
+  const baseUrl = sanitizeBaseUrl(config?.baseUrl);
+
+  if (!apiKey) {
+    throw new Error("Alibaba API key is required");
+  }
+
+  if (!baseUrl) {
+    throw new Error("Alibaba base URL is required");
+  }
+
+  if (!isAllowedAlibabaBaseUrl(baseUrl)) {
+    throw new Error("Alibaba base URL is not allowed");
+  }
+
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const responseText = await response.text();
+
+  let responseBody;
+
+  try {
+    responseBody = JSON.parse(responseText);
+  } catch {
+    responseBody = responseText;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    body: responseBody
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -41,7 +121,9 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "GET /health",
       email: "POST /send",
-      rocketchat: "POST /rocketchat"
+      rocketchat: "POST /rocketchat",
+      aiTest: "POST /ai/test",
+      aiChat: "POST /ai/chat"
     }
   });
 });
@@ -51,7 +133,8 @@ app.get("/health", (req, res) => {
     success: true,
     service: "NodeSend",
     status: "healthy",
-    rocketchatConfigured: Boolean(ROCKETCHAT_WEBHOOK_URL)
+    rocketchatConfigured: Boolean(ROCKETCHAT_WEBHOOK_URL),
+    aiProxyConfigured: true
   });
 });
 
@@ -217,6 +300,200 @@ app.post("/rocketchat", requireApiKey, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || "Rocket.Chat message could not be sent"
+    });
+  }
+});
+
+/**
+ * Test an Alibaba AI connection and selected model.
+ *
+ * Expected request:
+ *
+ * {
+ *   "provider": "alibaba",
+ *   "config": {
+ *     "apiKey": "...",
+ *     "baseUrl": "https://.../compatible-mode/v1"
+ *   },
+ *   "model": "..."
+ * }
+ */
+app.post("/ai/test", requireApiKey, async (req, res) => {
+  try {
+    const { provider, config, model } = req.body || {};
+
+    if (provider !== "alibaba") {
+      return res.status(400).json({
+        success: false,
+        error: "Unsupported AI provider"
+      });
+    }
+
+    if (!config?.apiKey || !config?.baseUrl) {
+      return res.status(400).json({
+        success: false,
+        error: "Alibaba apiKey and baseUrl are required"
+      });
+    }
+
+    if (!model) {
+      return res.status(400).json({
+        success: false,
+        error: "model is required"
+      });
+    }
+
+    const result = await callAlibaba(
+      config,
+      "/chat/completions",
+      {
+        model: String(model),
+        messages: [
+          {
+            role: "user",
+            content: "Reply only with OK"
+          }
+        ],
+        max_tokens: 10,
+        temperature: 0
+      }
+    );
+
+    if (!result.ok) {
+      return res.status(result.status).json({
+        success: false,
+        provider: "alibaba",
+        model,
+        error: "Alibaba model test failed",
+        details: result.body
+      });
+    }
+
+    const answer =
+      result.body?.choices?.[0]?.message?.content ?? null;
+
+    return res.json({
+      success: true,
+      provider: "alibaba",
+      model,
+      response: answer
+    });
+  } catch (error) {
+    console.error("Alibaba AI test error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Alibaba AI test failed"
+    });
+  }
+});
+
+/**
+ * Generic Alibaba AI chat proxy.
+ *
+ * Expected request:
+ *
+ * {
+ *   "provider": "alibaba",
+ *   "config": {
+ *     "apiKey": "...",
+ *     "baseUrl": "https://.../compatible-mode/v1"
+ *   },
+ *   "model": "...",
+ *   "messages": [...],
+ *   "temperature": 0.2,
+ *   "max_tokens": 1000
+ * }
+ */
+app.post("/ai/chat", requireApiKey, async (req, res) => {
+  try {
+    const {
+      provider,
+      config,
+      model,
+      messages,
+      temperature = 0.2,
+      max_tokens = 1000
+    } = req.body || {};
+
+    if (provider !== "alibaba") {
+      return res.status(400).json({
+        success: false,
+        error: "Unsupported AI provider"
+      });
+    }
+
+    if (!config?.apiKey || !config?.baseUrl) {
+      return res.status(400).json({
+        success: false,
+        error: "Alibaba apiKey and baseUrl are required"
+      });
+    }
+
+    if (!model) {
+      return res.status(400).json({
+        success: false,
+        error: "model is required"
+      });
+    }
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "messages must be a non-empty array"
+      });
+    }
+
+    if (messages.length > 100) {
+      return res.status(400).json({
+        success: false,
+        error: "Too many messages"
+      });
+    }
+
+    const safeMaxTokens = Math.min(
+      Math.max(Number(max_tokens) || 1000, 1),
+      8000
+    );
+
+    const safeTemperature = Math.min(
+      Math.max(Number(temperature) || 0, 0),
+      2
+    );
+
+    const result = await callAlibaba(
+      config,
+      "/chat/completions",
+      {
+        model: String(model),
+        messages,
+        temperature: safeTemperature,
+        max_tokens: safeMaxTokens
+      }
+    );
+
+    if (!result.ok) {
+      return res.status(result.status).json({
+        success: false,
+        provider: "alibaba",
+        model,
+        error: "Alibaba AI request failed",
+        details: result.body
+      });
+    }
+
+    return res.json({
+      success: true,
+      provider: "alibaba",
+      model,
+      response: result.body
+    });
+  } catch (error) {
+    console.error("Alibaba AI error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Alibaba AI request failed"
     });
   }
 });
