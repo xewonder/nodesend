@@ -11,6 +11,23 @@ const PORT = Number(process.env.PORT || 3001);
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const ROCKETCHAT_WEBHOOK_URL = process.env.ROCKETCHAT_WEBHOOK_URL;
 
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+
+/**
+ * Hard-coded Alibaba Token Plan models for now.
+ * Keep this list in one place.
+ */
+const ALIBABA_TOKEN_PLAN_MODELS = [
+  {
+    id: "qwen3.8-flash",
+    name: "Qwen 3.8 Flash"
+  },
+  {
+    id: "qwen3.8-max",
+    name: "Qwen 3.8 Max"
+  }
+];
+
 /**
  * Checks the API key supplied by the caller.
  */
@@ -42,7 +59,7 @@ function sanitizeBaseUrl(value) {
 }
 
 /**
- * Restrict AI proxy calls to Alibaba/DashScope hosts.
+ * Restrict Alibaba proxy calls to Alibaba/DashScope hosts.
  */
 function isAllowedAlibabaBaseUrl(baseUrl) {
   try {
@@ -64,6 +81,27 @@ function isAllowedAlibabaBaseUrl(baseUrl) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Safely parse an HTTP response.
+ */
+async function parseResponse(response) {
+  const responseText = await response.text();
+
+  let responseBody;
+
+  try {
+    responseBody = JSON.parse(responseText);
+  } catch {
+    responseBody = responseText;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    body: responseBody
+  };
 }
 
 /**
@@ -97,82 +135,58 @@ async function callAlibaba(config, path, body) {
     body: JSON.stringify(body)
   });
 
-  const responseText = await response.text();
-
-  let responseBody;
-
-  try {
-    responseBody = JSON.parse(responseText);
-  } catch {
-    responseBody = responseText;
-  }
-
-  return {
-    ok: response.ok,
-    status: response.status,
-    body: responseBody
-  };
+  return parseResponse(response);
 }
 
 /**
- * List Alibaba models.
+ * Call OpenAI API.
  *
- * For Token Plan, model discovery is queried through the
- * Singapore international DashScope model-list endpoint.
+ * Credentials are supplied transiently in the request.
+ * They are not stored by NodeSend.
  */
-async function listAlibabaModels(config) {
+async function callOpenAI(config, path, options = {}) {
   const apiKey = String(config?.apiKey || "").trim();
-  const baseUrl = sanitizeBaseUrl(config?.baseUrl);
 
   if (!apiKey) {
-    throw new Error("Alibaba API key is required");
+    throw new Error("OpenAI API key is required");
   }
 
-  if (!baseUrl) {
-    throw new Error("Alibaba base URL is required");
-  }
-
-  if (!isAllowedAlibabaBaseUrl(baseUrl)) {
-    throw new Error("Alibaba base URL is not allowed");
-  }
-
-  let modelsUrl;
-
-  const url = new URL(baseUrl);
-
-  if (url.hostname === "token-plan.ap-southeast-1.maas.aliyuncs.com") {
-    modelsUrl =
-      "https://dashscope-intl.aliyuncs.com/api/v1/models" +
-      "?providers=qwen&capabilities=TG&page_no=1&page_size=100";
-  } else {
-    modelsUrl =
-      `${url.origin}/api/v1/models` +
-      "?providers=qwen&capabilities=TG&page_no=1&page_size=100";
-  }
-
-  const response = await fetch(modelsUrl, {
-    method: "GET",
+  const response = await fetch(`${OPENAI_BASE_URL}${path}`, {
+    method: options.method || "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    }
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    },
+    ...(options.body !== undefined
+      ? { body: JSON.stringify(options.body) }
+      : {})
   });
 
-  const responseText = await response.text();
+  return parseResponse(response);
+}
 
-  let responseBody;
+/**
+ * Convert app max_tokens setting to a safe integer.
+ */
+function normalizeMaxTokens(value, fallback = 1000) {
+  return Math.min(
+    Math.max(Number(value) || fallback, 1),
+    8000
+  );
+}
 
-  try {
-    responseBody = JSON.parse(responseText);
-  } catch {
-    responseBody = responseText;
+/**
+ * Convert temperature to safe range.
+ */
+function normalizeTemperature(value, fallback = 0.2) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
   }
 
-  return {
-    ok: response.ok,
-    status: response.status,
-    body: responseBody
-  };
+  return Math.min(Math.max(parsed, 0), 2);
 }
 
 /**
@@ -189,7 +203,11 @@ app.get("/", (req, res) => {
       aiModels: "POST /ai/models",
       aiTest: "POST /ai/test",
       aiChat: "POST /ai/chat"
-    }
+    },
+    providers: [
+      "alibaba",
+      "openai"
+    ]
   });
 });
 
@@ -202,7 +220,11 @@ app.get("/health", (req, res) => {
     service: "NodeSend",
     status: "healthy",
     rocketchatConfigured: Boolean(ROCKETCHAT_WEBHOOK_URL),
-    aiProxyConfigured: true
+    aiProxyConfigured: true,
+    providers: {
+      alibaba: true,
+      openai: true
+    }
   });
 });
 
@@ -340,27 +362,19 @@ app.post("/rocketchat", requireApiKey, async (req, res) => {
       body: JSON.stringify(payload)
     });
 
-    const responseText = await response.text();
+    const result = await parseResponse(response);
 
-    let responseBody;
-
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
-      responseBody = responseText;
-    }
-
-    if (!response.ok) {
-      return res.status(response.status).json({
+    if (!result.ok) {
+      return res.status(result.status).json({
         success: false,
         error: "Rocket.Chat rejected the request",
-        details: responseBody
+        details: result.body
       });
     }
 
     return res.json({
       success: true,
-      rocketchat: responseBody
+      rocketchat: result.body
     });
   } catch (error) {
     console.error("Rocket.Chat error:", error.message);
@@ -373,143 +387,97 @@ app.post("/rocketchat", requireApiKey, async (req, res) => {
 });
 
 /**
- * List available Alibaba AI models.
+ * List available AI models.
  *
- * Expected request:
+ * Alibaba:
+ * returns current local Token Plan allowlist.
  *
- * {
- *   "provider": "alibaba",
- *   "config": {
- *     "apiKey": "...",
- *     "baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
- *   }
- * }
+ * OpenAI:
+ * dynamically queries GET /v1/models.
  */
 app.post("/ai/models", requireApiKey, async (req, res) => {
   try {
     const { provider, config } = req.body || {};
 
-    if (provider !== "alibaba") {
-      return res.status(400).json({
-        success: false,
-        error: "Unsupported AI provider"
-      });
-    }
-
-    if (!config?.apiKey || !config?.baseUrl) {
-      return res.status(400).json({
-        success: false,
-        error: "Alibaba apiKey and baseUrl are required"
-      });
-    }
-
-    const result = await listAlibabaModels(config);
-
-    if (!result.ok) {
-      return res.status(result.status).json({
-        success: false,
+    if (provider === "alibaba") {
+      return res.json({
+        success: true,
         provider: "alibaba",
-        error: "Alibaba model discovery failed",
-        details: result.body
+        source: "local-token-plan-list",
+        models: ALIBABA_TOKEN_PLAN_MODELS
       });
     }
 
-    let rawModels = [];
+    if (provider === "openai") {
+      if (!config?.apiKey) {
+        return res.status(400).json({
+          success: false,
+          error: "OpenAI apiKey is required"
+        });
+      }
 
-    if (Array.isArray(result.body?.output?.models)) {
-      rawModels = result.body.output.models;
-    } else if (Array.isArray(result.body?.data)) {
-      rawModels = result.body.data;
-    } else if (Array.isArray(result.body?.models)) {
-      rawModels = result.body.models;
+      const result = await callOpenAI(
+        config,
+        "/models",
+        {
+          method: "GET"
+        }
+      );
+
+      if (!result.ok) {
+        return res.status(result.status).json({
+          success: false,
+          provider: "openai",
+          error: "OpenAI model discovery failed",
+          details: result.body
+        });
+      }
+
+      const models = Array.isArray(result.body?.data)
+        ? result.body.data
+            .map((model) => ({
+              id: model.id,
+              name: model.id,
+              created: model.created || null,
+              ownedBy: model.owned_by || null
+            }))
+            .filter((model) => model.id)
+            .sort((a, b) => a.id.localeCompare(b.id))
+        : [];
+
+      return res.json({
+        success: true,
+        provider: "openai",
+        source: "openai-api",
+        total: models.length,
+        models
+      });
     }
 
-    const models = rawModels
-      .map((model) => {
-        const id =
-          model.model ||
-          model.id ||
-          model.name ||
-          null;
-
-        return {
-          id,
-          name:
-            model.name ||
-            model.model ||
-            model.id ||
-            null,
-          provider:
-            model.provider ||
-            "qwen",
-          capabilities:
-            model.capabilities ||
-            [],
-          features:
-            model.features ||
-            [],
-          contextWindow:
-            model.model_info?.context_window ??
-            model.context_window ??
-            null,
-          maxOutputTokens:
-            model.model_info?.max_output_tokens ??
-            model.max_output_tokens ??
-            null
-        };
-      })
-      .filter((model) => model.id);
-
-    return res.json({
-      success: true,
-      provider: "alibaba",
-      total:
-        result.body?.output?.total ??
-        result.body?.total ??
-        models.length,
-      models
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported AI provider"
     });
   } catch (error) {
-    console.error("Alibaba models error:", error.message);
+    console.error("AI models error:", error.message);
 
     return res.status(500).json({
       success: false,
-      error: error.message || "Alibaba model discovery failed"
+      error: error.message || "AI model discovery failed"
     });
   }
 });
 
 /**
- * Test an Alibaba AI connection and selected model.
- *
- * Expected request:
- *
- * {
- *   "provider": "alibaba",
- *   "config": {
- *     "apiKey": "...",
- *     "baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
- *   },
- *   "model": "..."
- * }
+ * Test AI connection and selected model.
  */
 app.post("/ai/test", requireApiKey, async (req, res) => {
   try {
-    const { provider, config, model } = req.body || {};
-
-    if (provider !== "alibaba") {
-      return res.status(400).json({
-        success: false,
-        error: "Unsupported AI provider"
-      });
-    }
-
-    if (!config?.apiKey || !config?.baseUrl) {
-      return res.status(400).json({
-        success: false,
-        error: "Alibaba apiKey and baseUrl are required"
-      });
-    }
+    const {
+      provider,
+      config,
+      model
+    } = req.body || {};
 
     if (!model) {
       return res.status(400).json({
@@ -518,55 +486,113 @@ app.post("/ai/test", requireApiKey, async (req, res) => {
       });
     }
 
-    const result = await callAlibaba(
-      config,
-      "/chat/completions",
-      {
-        model: String(model),
-        messages: [
-          {
-            role: "user",
-            content: "Reply only with OK"
-          }
-        ],
-        max_tokens: 10,
-        temperature: 0
+    if (provider === "alibaba") {
+      if (!config?.apiKey || !config?.baseUrl) {
+        return res.status(400).json({
+          success: false,
+          error: "Alibaba apiKey and baseUrl are required"
+        });
       }
-    );
 
-    if (!result.ok) {
-      return res.status(result.status).json({
-        success: false,
+      const result = await callAlibaba(
+        config,
+        "/chat/completions",
+        {
+          model: String(model),
+          messages: [
+            {
+              role: "user",
+              content: "Reply only with OK"
+            }
+          ],
+          max_tokens: 10,
+          temperature: 0,
+          enable_thinking: false
+        }
+      );
+
+      if (!result.ok) {
+        return res.status(result.status).json({
+          success: false,
+          provider: "alibaba",
+          model,
+          error: "Alibaba model test failed",
+          details: result.body
+        });
+      }
+
+      return res.json({
+        success: true,
         provider: "alibaba",
         model,
-        error: "Alibaba model test failed",
-        details: result.body
+        response:
+          result.body?.choices?.[0]?.message?.content ?? null
       });
     }
 
-    const answer =
-      result.body?.choices?.[0]?.message?.content ?? null;
+    if (provider === "openai") {
+      if (!config?.apiKey) {
+        return res.status(400).json({
+          success: false,
+          error: "OpenAI apiKey is required"
+        });
+      }
 
-    return res.json({
-      success: true,
-      provider: "alibaba",
-      model,
-      response: answer
+      const result = await callOpenAI(
+        config,
+        "/chat/completions",
+        {
+          body: {
+            model: String(model),
+            messages: [
+              {
+                role: "user",
+                content: "Reply only with OK"
+              }
+            ],
+            max_completion_tokens: 20,
+            reasoning_effort: "none"
+          }
+        }
+      );
+
+      if (!result.ok) {
+        return res.status(result.status).json({
+          success: false,
+          provider: "openai",
+          model,
+          error: "OpenAI model test failed",
+          details: result.body
+        });
+      }
+
+      return res.json({
+        success: true,
+        provider: "openai",
+        model,
+        response:
+          result.body?.choices?.[0]?.message?.content ?? null
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported AI provider"
     });
   } catch (error) {
-    console.error("Alibaba AI test error:", error.message);
+    console.error("AI test error:", error.message);
 
     return res.status(500).json({
       success: false,
-      error: error.message || "Alibaba AI test failed"
+      error: error.message || "AI model test failed"
     });
   }
 });
 
 /**
- * Generic Alibaba AI chat proxy.
+ * Generic AI chat proxy.
  *
- * Expected request:
+ * Alibaba example:
  *
  * {
  *   "provider": "alibaba",
@@ -574,10 +600,24 @@ app.post("/ai/test", requireApiKey, async (req, res) => {
  *     "apiKey": "...",
  *     "baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
  *   },
- *   "model": "...",
+ *   "model": "qwen3.8-flash",
  *   "messages": [...],
- *   "temperature": 0.2,
- *   "max_tokens": 1000
+ *   "temperature": 0,
+ *   "max_tokens": 40,
+ *   "enable_thinking": false
+ * }
+ *
+ * OpenAI example:
+ *
+ * {
+ *   "provider": "openai",
+ *   "config": {
+ *     "apiKey": "sk-..."
+ *   },
+ *   "model": "gpt-5.6-luna",
+ *   "messages": [...],
+ *   "max_tokens": 40,
+ *   "reasoning_effort": "none"
  * }
  */
 app.post("/ai/chat", requireApiKey, async (req, res) => {
@@ -588,22 +628,10 @@ app.post("/ai/chat", requireApiKey, async (req, res) => {
       model,
       messages,
       temperature = 0.2,
-      max_tokens = 1000
+      max_tokens = 1000,
+      enable_thinking = false,
+      reasoning_effort = "none"
     } = req.body || {};
-
-    if (provider !== "alibaba") {
-      return res.status(400).json({
-        success: false,
-        error: "Unsupported AI provider"
-      });
-    }
-
-    if (!config?.apiKey || !config?.baseUrl) {
-      return res.status(400).json({
-        success: false,
-        error: "Alibaba apiKey and baseUrl are required"
-      });
-    }
 
     if (!model) {
       return res.status(400).json({
@@ -626,50 +654,179 @@ app.post("/ai/chat", requireApiKey, async (req, res) => {
       });
     }
 
-    const safeMaxTokens = Math.min(
-      Math.max(Number(max_tokens) || 1000, 1),
-      8000
+    const safeMaxTokens = normalizeMaxTokens(
+      max_tokens,
+      1000
     );
 
-    const parsedTemperature = Number(temperature);
+    const safeTemperature = normalizeTemperature(
+      temperature,
+      0.2
+    );
 
-    const safeTemperature = Number.isFinite(parsedTemperature)
-      ? Math.min(Math.max(parsedTemperature, 0), 2)
-      : 0.2;
+    if (provider === "alibaba") {
+      if (!config?.apiKey || !config?.baseUrl) {
+        return res.status(400).json({
+          success: false,
+          error: "Alibaba apiKey and baseUrl are required"
+        });
+      }
 
-    const result = await callAlibaba(
-      config,
-      "/chat/completions",
-      {
+      const body = {
         model: String(model),
         messages,
         temperature: safeTemperature,
         max_tokens: safeMaxTokens
-      }
-    );
+      };
 
-    if (!result.ok) {
-      return res.status(result.status).json({
-        success: false,
+      if (typeof enable_thinking === "boolean") {
+        body.enable_thinking = enable_thinking;
+      }
+
+      let result = await callAlibaba(
+        config,
+        "/chat/completions",
+        body
+      );
+
+      /**
+       * Some Alibaba-compatible models may reject
+       * enable_thinking. Retry once without it.
+       */
+      if (
+        !result.ok &&
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "enable_thinking"
+        )
+      ) {
+        const retryBody = {
+          ...body
+        };
+
+        delete retryBody.enable_thinking;
+
+        result = await callAlibaba(
+          config,
+          "/chat/completions",
+          retryBody
+        );
+      }
+
+      if (!result.ok) {
+        return res.status(result.status).json({
+          success: false,
+          provider: "alibaba",
+          model,
+          error: "Alibaba AI request failed",
+          details: result.body
+        });
+      }
+
+      return res.json({
+        success: true,
         provider: "alibaba",
         model,
-        error: "Alibaba AI request failed",
-        details: result.body
+        response: result.body
       });
     }
 
-    return res.json({
-      success: true,
-      provider: "alibaba",
-      model,
-      response: result.body
+    if (provider === "openai") {
+      if (!config?.apiKey) {
+        return res.status(400).json({
+          success: false,
+          error: "OpenAI apiKey is required"
+        });
+      }
+
+      const allowedReasoningEfforts = new Set([
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]);
+
+      const safeReasoningEffort =
+        allowedReasoningEfforts.has(reasoning_effort)
+          ? reasoning_effort
+          : "none";
+
+      /**
+       * Current OpenAI reasoning-capable models use
+       * max_completion_tokens and reasoning_effort.
+       *
+       * We deliberately omit temperature here because
+       * current flagship reasoning-model guidance says
+       * unsupported sampling parameters should be removed.
+       */
+      const openAIBody = {
+        model: String(model),
+        messages,
+        max_completion_tokens: safeMaxTokens,
+        reasoning_effort: safeReasoningEffort
+      };
+
+      let result = await callOpenAI(
+        config,
+        "/chat/completions",
+        {
+          body: openAIBody
+        }
+      );
+
+      /**
+       * Compatibility fallback for older/non-reasoning
+       * OpenAI models that may reject reasoning_effort.
+       */
+      if (
+        !result.ok &&
+        result.status === 400
+      ) {
+        const fallbackBody = {
+          model: String(model),
+          messages,
+          max_completion_tokens: safeMaxTokens
+        };
+
+        result = await callOpenAI(
+          config,
+          "/chat/completions",
+          {
+            body: fallbackBody
+          }
+        );
+      }
+
+      if (!result.ok) {
+        return res.status(result.status).json({
+          success: false,
+          provider: "openai",
+          model,
+          error: "OpenAI AI request failed",
+          details: result.body
+        });
+      }
+
+      return res.json({
+        success: true,
+        provider: "openai",
+        model,
+        response: result.body
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported AI provider"
     });
   } catch (error) {
-    console.error("Alibaba AI error:", error.message);
+    console.error("AI chat error:", error.message);
 
     return res.status(500).json({
       success: false,
-      error: error.message || "Alibaba AI request failed"
+      error: error.message || "AI request failed"
     });
   }
 });
