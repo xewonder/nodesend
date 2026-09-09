@@ -14,8 +14,12 @@ const ROCKETCHAT_WEBHOOK_URL = process.env.ROCKETCHAT_WEBHOOK_URL;
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 /**
- * Hard-coded Alibaba Token Plan models for now.
- * Keep this list in one place.
+ * Hard-coded Alibaba Token Plan model discovery list.
+ *
+ * NOTE:
+ * BridgeMind's application/database may maintain its own
+ * provider/model catalog. This list exists only for the
+ * legacy /ai/models Alibaba discovery endpoint.
  */
 const ALIBABA_TOKEN_PLAN_MODELS = [
   {
@@ -55,7 +59,9 @@ function requireApiKey(req, res, next) {
  * Normalize provider base URL.
  */
 function sanitizeBaseUrl(value) {
-  return String(value || "").trim().replace(/\/+$/, "");
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
 }
 
 /**
@@ -102,6 +108,25 @@ async function parseResponse(response) {
     status: response.status,
     body: responseBody
   };
+}
+
+/**
+ * Remove proxy-only fields from a BridgeMind request.
+ *
+ * Everything else is passed to the AI provider unchanged.
+ *
+ * This is deliberate:
+ * NodeSend should transport provider parameters,
+ * not invent or reinterpret them.
+ */
+function buildProviderBody(input = {}) {
+  const {
+    provider,
+    config,
+    ...providerBody
+  } = input;
+
+  return providerBody;
 }
 
 /**
@@ -159,34 +184,13 @@ async function callOpenAI(config, path, options = {}) {
       ...(options.headers || {})
     },
     ...(options.body !== undefined
-      ? { body: JSON.stringify(options.body) }
+      ? {
+          body: JSON.stringify(options.body)
+        }
       : {})
   });
 
   return parseResponse(response);
-}
-
-/**
- * Convert app max_tokens setting to a safe integer.
- */
-function normalizeMaxTokens(value, fallback = 1000) {
-  return Math.min(
-    Math.max(Number(value) || fallback, 1),
-    8000
-  );
-}
-
-/**
- * Convert temperature to safe range.
- */
-function normalizeTemperature(value, fallback = 0.2) {
-  const parsed = Number(value);
-
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-
-  return Math.min(Math.max(parsed, 0), 2);
 }
 
 /**
@@ -196,6 +200,7 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     service: "NodeSend",
+    version: "bridge-pass-through-v1",
     endpoints: {
       health: "GET /health",
       email: "POST /send",
@@ -218,8 +223,11 @@ app.get("/health", (req, res) => {
   res.json({
     success: true,
     service: "NodeSend",
+    version: "bridge-pass-through-v1",
     status: "healthy",
-    rocketchatConfigured: Boolean(ROCKETCHAT_WEBHOOK_URL),
+    rocketchatConfigured: Boolean(
+      ROCKETCHAT_WEBHOOK_URL
+    ),
     aiProxyConfigured: true,
     providers: {
       alibaba: true,
@@ -244,7 +252,9 @@ app.post("/send", requireApiKey, async (req, res) => {
 
     const host = String(config.host || "").trim();
     const port = Number(config.port);
-    const username = String(config.username || "").trim();
+    const username = String(
+      config.username || ""
+    ).trim();
     const password = String(config.password || "");
 
     const from = String(email.from || "").trim();
@@ -258,21 +268,24 @@ app.post("/send", requireApiKey, async (req, res) => {
     if (!host || !port || !username || !password) {
       return res.status(400).json({
         success: false,
-        error: "SMTP host, port, username and password are required"
+        error:
+          "SMTP host, port, username and password are required"
       });
     }
 
     if (!from || !to || !subject) {
       return res.status(400).json({
         success: false,
-        error: "Email from, to and subject are required"
+        error:
+          "Email from, to and subject are required"
       });
     }
 
     if (!text && !html) {
       return res.status(400).json({
         success: false,
-        error: "Email text or html content is required"
+        error:
+          "Email text or html content is required"
       });
     }
 
@@ -305,11 +318,16 @@ app.post("/send", requireApiKey, async (req, res) => {
       rejected: result.rejected
     });
   } catch (error) {
-    console.error("Email error:", error.message);
+    console.error(
+      "Email error:",
+      error.message
+    );
 
     return res.status(500).json({
       success: false,
-      error: error.message || "Email could not be sent"
+      error:
+        error.message ||
+        "Email could not be sent"
     });
   }
 });
@@ -317,519 +335,654 @@ app.post("/send", requireApiKey, async (req, res) => {
 /**
  * Send a message through a Rocket.Chat incoming webhook.
  */
-app.post("/rocketchat", requireApiKey, async (req, res) => {
-  try {
-    if (!ROCKETCHAT_WEBHOOK_URL) {
+app.post(
+  "/rocketchat",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      if (!ROCKETCHAT_WEBHOOK_URL) {
+        return res.status(500).json({
+          success: false,
+          error:
+            "ROCKETCHAT_WEBHOOK_URL is not configured"
+        });
+      }
+
+      const {
+        text,
+        channel,
+        username,
+        emoji,
+        avatar,
+        alias,
+        attachments
+      } = req.body || {};
+
+      if (!text) {
+        return res.status(400).json({
+          success: false,
+          error: "text is required"
+        });
+      }
+
+      const payload = {
+        text
+      };
+
+      if (channel) payload.channel = channel;
+      if (username) payload.username = username;
+      if (alias) payload.alias = alias;
+      if (emoji) payload.emoji = emoji;
+      if (avatar) payload.avatar = avatar;
+      if (attachments) {
+        payload.attachments = attachments;
+      }
+
+      const response = await fetch(
+        ROCKETCHAT_WEBHOOK_URL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        }
+      );
+
+      const result =
+        await parseResponse(response);
+
+      if (!result.ok) {
+        return res
+          .status(result.status)
+          .json({
+            success: false,
+            error:
+              "Rocket.Chat rejected the request",
+            details: result.body
+          });
+      }
+
+      return res.json({
+        success: true,
+        rocketchat: result.body
+      });
+    } catch (error) {
+      console.error(
+        "Rocket.Chat error:",
+        error.message
+      );
+
       return res.status(500).json({
         success: false,
-        error: "ROCKETCHAT_WEBHOOK_URL is not configured"
+        error:
+          error.message ||
+          "Rocket.Chat message could not be sent"
       });
     }
-
-    const {
-      text,
-      channel,
-      username,
-      emoji,
-      avatar,
-      alias,
-      attachments
-    } = req.body || {};
-
-    if (!text) {
-      return res.status(400).json({
-        success: false,
-        error: "text is required"
-      });
-    }
-
-    const payload = {
-      text
-    };
-
-    if (channel) payload.channel = channel;
-    if (username) payload.username = username;
-    if (alias) payload.alias = alias;
-    if (emoji) payload.emoji = emoji;
-    if (avatar) payload.avatar = avatar;
-    if (attachments) payload.attachments = attachments;
-
-    const response = await fetch(ROCKETCHAT_WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const result = await parseResponse(response);
-
-    if (!result.ok) {
-      return res.status(result.status).json({
-        success: false,
-        error: "Rocket.Chat rejected the request",
-        details: result.body
-      });
-    }
-
-    return res.json({
-      success: true,
-      rocketchat: result.body
-    });
-  } catch (error) {
-    console.error("Rocket.Chat error:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message || "Rocket.Chat message could not be sent"
-    });
   }
-});
+);
 
 /**
  * List available AI models.
  *
  * Alibaba:
- * returns current local Token Plan allowlist.
+ * returns the current local Token Plan discovery list.
  *
  * OpenAI:
  * dynamically queries GET /v1/models.
+ *
+ * BridgeMind may use its database catalog as the
+ * authoritative list for Settings.
  */
-app.post("/ai/models", requireApiKey, async (req, res) => {
-  try {
-    const { provider, config } = req.body || {};
+app.post(
+  "/ai/models",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const {
+        provider,
+        config
+      } = req.body || {};
 
-    if (provider === "alibaba") {
-      return res.json({
-        success: true,
-        provider: "alibaba",
-        source: "local-token-plan-list",
-        models: ALIBABA_TOKEN_PLAN_MODELS
-      });
-    }
-
-    if (provider === "openai") {
-      if (!config?.apiKey) {
-        return res.status(400).json({
-          success: false,
-          error: "OpenAI apiKey is required"
+      if (provider === "alibaba") {
+        return res.json({
+          success: true,
+          provider: "alibaba",
+          source:
+            "local-token-plan-list",
+          models:
+            ALIBABA_TOKEN_PLAN_MODELS
         });
       }
 
-      const result = await callOpenAI(
-        config,
-        "/models",
-        {
-          method: "GET"
+      if (provider === "openai") {
+        if (!config?.apiKey) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "OpenAI apiKey is required"
+          });
         }
+
+        const result = await callOpenAI(
+          config,
+          "/models",
+          {
+            method: "GET"
+          }
+        );
+
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .json({
+              success: false,
+              provider: "openai",
+              error:
+                "OpenAI model discovery failed",
+              details: result.body
+            });
+        }
+
+        const models =
+          Array.isArray(
+            result.body?.data
+          )
+            ? result.body.data
+                .map((model) => ({
+                  id: model.id,
+                  name: model.id,
+                  created:
+                    model.created || null,
+                  ownedBy:
+                    model.owned_by || null
+                }))
+                .filter(
+                  (model) => model.id
+                )
+                .sort((a, b) =>
+                  a.id.localeCompare(b.id)
+                )
+            : [];
+
+        return res.json({
+          success: true,
+          provider: "openai",
+          source: "openai-api",
+          total: models.length,
+          models
+        });
+      }
+
+      return res.status(400).json({
+        success: false,
+        error:
+          "Unsupported AI provider"
+      });
+    } catch (error) {
+      console.error(
+        "AI models error:",
+        error.message
       );
 
-      if (!result.ok) {
-        return res.status(result.status).json({
-          success: false,
-          provider: "openai",
-          error: "OpenAI model discovery failed",
-          details: result.body
-        });
-      }
-
-      const models = Array.isArray(result.body?.data)
-        ? result.body.data
-            .map((model) => ({
-              id: model.id,
-              name: model.id,
-              created: model.created || null,
-              ownedBy: model.owned_by || null
-            }))
-            .filter((model) => model.id)
-            .sort((a, b) => a.id.localeCompare(b.id))
-        : [];
-
-      return res.json({
-        success: true,
-        provider: "openai",
-        source: "openai-api",
-        total: models.length,
-        models
+      return res.status(500).json({
+        success: false,
+        error:
+          error.message ||
+          "AI model discovery failed"
       });
     }
-
-    return res.status(400).json({
-      success: false,
-      error: "Unsupported AI provider"
-    });
-  } catch (error) {
-    console.error("AI models error:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message || "AI model discovery failed"
-    });
   }
-});
+);
 
 /**
  * Test AI connection and selected model.
+ *
+ * IMPORTANT:
+ * NodeSend does NOT invent model-specific options.
+ *
+ * The app may optionally send extra provider parameters,
+ * such as:
+ *
+ * reasoning_effort
+ * temperature
+ * max_tokens
+ * max_completion_tokens
+ *
+ * If supplied, they are passed through.
+ *
+ * If omitted, NodeSend does not create them.
  */
-app.post("/ai/test", requireApiKey, async (req, res) => {
-  try {
-    const {
-      provider,
-      config,
-      model
-    } = req.body || {};
+app.post(
+  "/ai/test",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const {
+        provider,
+        config,
+        model
+      } = req.body || {};
 
-    if (!model) {
-      return res.status(400).json({
-        success: false,
-        error: "model is required"
-      });
-    }
-
-    if (provider === "alibaba") {
-      if (!config?.apiKey || !config?.baseUrl) {
+      if (!model) {
         return res.status(400).json({
           success: false,
-          error: "Alibaba apiKey and baseUrl are required"
+          error: "model is required"
         });
       }
 
-      const result = await callAlibaba(
-        config,
-        "/chat/completions",
-        {
+      if (provider === "alibaba") {
+        if (
+          !config?.apiKey ||
+          !config?.baseUrl
+        ) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "Alibaba apiKey and baseUrl are required"
+          });
+        }
+
+        /**
+         * Build a minimal test body.
+         *
+         * Any optional parameters supplied by the app
+         * are preserved.
+         */
+        const extraBody =
+          buildProviderBody(
+            req.body
+          );
+
+        delete extraBody.model;
+        delete extraBody.messages;
+
+        const body = {
           model: String(model),
           messages: [
             {
               role: "user",
-              content: "Reply only with OK"
+              content:
+                "Reply only with OK"
             }
           ],
-          max_tokens: 10,
-          temperature: 0,
-          enable_thinking: false
-        }
-      );
+          ...extraBody
+        };
 
-      if (!result.ok) {
-        return res.status(result.status).json({
-          success: false,
+        const result =
+          await callAlibaba(
+            config,
+            "/chat/completions",
+            body
+          );
+
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .json({
+              success: false,
+              provider:
+                "alibaba",
+              model,
+              error:
+                "Alibaba model test failed",
+              details:
+                result.body
+            });
+        }
+
+        return res.json({
+          success: true,
           provider: "alibaba",
           model,
-          error: "Alibaba model test failed",
-          details: result.body
+          response:
+            result.body
+              ?.choices?.[0]
+              ?.message?.content ??
+            null
         });
       }
 
-      return res.json({
-        success: true,
-        provider: "alibaba",
-        model,
-        response:
-          result.body?.choices?.[0]?.message?.content ?? null
-      });
-    }
-
-    if (provider === "openai") {
-      if (!config?.apiKey) {
-        return res.status(400).json({
-          success: false,
-          error: "OpenAI apiKey is required"
-        });
-      }
-
-      const result = await callOpenAI(
-        config,
-        "/chat/completions",
-        {
-          body: {
-            model: String(model),
-            messages: [
-              {
-                role: "user",
-                content: "Reply only with OK"
-              }
-            ],
-            max_completion_tokens: 20,
-            reasoning_effort: "none"
-          }
+      if (provider === "openai") {
+        if (!config?.apiKey) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "OpenAI apiKey is required"
+          });
         }
-      );
 
-      if (!result.ok) {
-        return res.status(result.status).json({
-          success: false,
+        /**
+         * Start with whatever optional provider
+         * parameters the APP supplied.
+         *
+         * NodeSend does NOT add:
+         *
+         * reasoning_effort
+         * temperature
+         * max_tokens
+         * max_completion_tokens
+         *
+         * unless the app sent them.
+         */
+        const extraBody =
+          buildProviderBody(
+            req.body
+          );
+
+        delete extraBody.model;
+        delete extraBody.messages;
+
+        const body = {
+          model: String(model),
+          messages: [
+            {
+              role: "user",
+              content:
+                "Reply only with OK"
+            }
+          ],
+          ...extraBody
+        };
+
+        /**
+         * Safe diagnostic:
+         * logs parameter names only.
+         *
+         * No credentials or prompts.
+         */
+        console.log(
+          "[OpenAI /ai/test body keys]",
+          Object.keys(body)
+        );
+
+        const result =
+          await callOpenAI(
+            config,
+            "/chat/completions",
+            {
+              body
+            }
+          );
+
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .json({
+              success: false,
+              provider: "openai",
+              model,
+              error:
+                "OpenAI model test failed",
+              details:
+                result.body
+            });
+        }
+
+        return res.json({
+          success: true,
           provider: "openai",
           model,
-          error: "OpenAI model test failed",
-          details: result.body
+          response:
+            result.body
+              ?.choices?.[0]
+              ?.message?.content ??
+            null
         });
       }
 
-      return res.json({
-        success: true,
-        provider: "openai",
-        model,
-        response:
-          result.body?.choices?.[0]?.message?.content ?? null
+      return res.status(400).json({
+        success: false,
+        error:
+          "Unsupported AI provider"
+      });
+    } catch (error) {
+      console.error(
+        "AI test error:",
+        error.message
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error.message ||
+          "AI model test failed"
       });
     }
-
-    return res.status(400).json({
-      success: false,
-      error: "Unsupported AI provider"
-    });
-  } catch (error) {
-    console.error("AI test error:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message || "AI model test failed"
-    });
   }
-});
+);
 
 /**
  * Generic AI chat proxy.
  *
- * Alibaba example:
+ * IMPORTANT ARCHITECTURE:
+ *
+ * NodeSend is deliberately a thin transport layer.
+ *
+ * The BridgeMind app decides which provider parameters
+ * to send.
+ *
+ * Examples:
+ *
+ * Alibaba:
  *
  * {
  *   "provider": "alibaba",
  *   "config": {
  *     "apiKey": "...",
- *     "baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+ *     "baseUrl": "https://..."
  *   },
  *   "model": "qwen3.8-flash",
  *   "messages": [...],
  *   "temperature": 0,
- *   "max_tokens": 40,
+ *   "max_tokens": 20,
  *   "enable_thinking": false
  * }
  *
- * OpenAI example:
+ * OpenAI without reasoning:
  *
  * {
  *   "provider": "openai",
  *   "config": {
- *     "apiKey": "sk-..."
+ *     "apiKey": "..."
  *   },
- *   "model": "gpt-5.6-luna",
+ *   "model": "gpt-4",
  *   "messages": [...],
- *   "max_tokens": 40,
- *   "reasoning_effort": "none"
+ *   "max_tokens": 20
  * }
+ *
+ * OpenAI with reasoning:
+ *
+ * {
+ *   "provider": "openai",
+ *   "config": {
+ *     "apiKey": "..."
+ *   },
+ *   "model": "some-reasoning-model",
+ *   "messages": [...],
+ *   "max_completion_tokens": 1000,
+ *   "reasoning_effort": "low"
+ * }
+ *
+ * NodeSend passes these provider parameters through.
  */
-app.post("/ai/chat", requireApiKey, async (req, res) => {
-  try {
-    const {
-      provider,
-      config,
-      model,
-      messages,
-      temperature = 0.2,
-      max_tokens = 1000,
-      enable_thinking = false,
-      reasoning_effort = "none"
-    } = req.body || {};
+app.post(
+  "/ai/chat",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const {
+        provider,
+        config,
+        model,
+        messages
+      } = req.body || {};
 
-    if (!model) {
-      return res.status(400).json({
-        success: false,
-        error: "model is required"
-      });
-    }
-
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "messages must be a non-empty array"
-      });
-    }
-
-    if (messages.length > 100) {
-      return res.status(400).json({
-        success: false,
-        error: "Too many messages"
-      });
-    }
-
-    const safeMaxTokens = normalizeMaxTokens(
-      max_tokens,
-      1000
-    );
-
-    const safeTemperature = normalizeTemperature(
-      temperature,
-      0.2
-    );
-
-    if (provider === "alibaba") {
-      if (!config?.apiKey || !config?.baseUrl) {
+      if (!model) {
         return res.status(400).json({
           success: false,
-          error: "Alibaba apiKey and baseUrl are required"
+          error: "model is required"
         });
       }
 
-      const body = {
-        model: String(model),
-        messages,
-        temperature: safeTemperature,
-        max_tokens: safeMaxTokens
-      };
-
-      if (typeof enable_thinking === "boolean") {
-        body.enable_thinking = enable_thinking;
+      if (
+        !Array.isArray(messages) ||
+        messages.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "messages must be a non-empty array"
+        });
       }
 
-      let result = await callAlibaba(
-        config,
-        "/chat/completions",
-        body
-      );
+      if (messages.length > 100) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Too many messages"
+        });
+      }
 
       /**
-       * Some Alibaba-compatible models may reject
-       * enable_thinking. Retry once without it.
+       * Strip only NodeSend's proxy envelope.
+       *
+       * Everything else is passed to the
+       * selected provider.
        */
-      if (
-        !result.ok &&
-        Object.prototype.hasOwnProperty.call(
-          body,
-          "enable_thinking"
-        )
-      ) {
-        const retryBody = {
-          ...body
-        };
+      const providerBody =
+        buildProviderBody(req.body);
 
-        delete retryBody.enable_thinking;
+      providerBody.model =
+        String(model);
 
-        result = await callAlibaba(
-          config,
-          "/chat/completions",
-          retryBody
+      providerBody.messages =
+        messages;
+
+      if (provider === "alibaba") {
+        if (
+          !config?.apiKey ||
+          !config?.baseUrl
+        ) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "Alibaba apiKey and baseUrl are required"
+          });
+        }
+
+        console.log(
+          "[Alibaba /ai/chat body keys]",
+          Object.keys(providerBody)
         );
-      }
 
-      if (!result.ok) {
-        return res.status(result.status).json({
-          success: false,
+        const result =
+          await callAlibaba(
+            config,
+            "/chat/completions",
+            providerBody
+          );
+
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .json({
+              success: false,
+              provider:
+                "alibaba",
+              model,
+              error:
+                "Alibaba AI request failed",
+              details:
+                result.body
+            });
+        }
+
+        return res.json({
+          success: true,
           provider: "alibaba",
           model,
-          error: "Alibaba AI request failed",
-          details: result.body
+          response: result.body
         });
       }
 
-      return res.json({
-        success: true,
-        provider: "alibaba",
-        model,
-        response: result.body
-      });
-    }
-
-    if (provider === "openai") {
-      if (!config?.apiKey) {
-        return res.status(400).json({
-          success: false,
-          error: "OpenAI apiKey is required"
-        });
-      }
-
-      const allowedReasoningEfforts = new Set([
-        "none",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]);
-
-      const safeReasoningEffort =
-        allowedReasoningEfforts.has(reasoning_effort)
-          ? reasoning_effort
-          : "none";
-
-      /**
-       * Current OpenAI reasoning-capable models use
-       * max_completion_tokens and reasoning_effort.
-       *
-       * We deliberately omit temperature here because
-       * current flagship reasoning-model guidance says
-       * unsupported sampling parameters should be removed.
-       */
-      const openAIBody = {
-        model: String(model),
-        messages,
-        max_completion_tokens: safeMaxTokens,
-        reasoning_effort: safeReasoningEffort
-      };
-
-      let result = await callOpenAI(
-        config,
-        "/chat/completions",
-        {
-          body: openAIBody
+      if (provider === "openai") {
+        if (!config?.apiKey) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "OpenAI apiKey is required"
+          });
         }
-      );
 
-      /**
-       * Compatibility fallback for older/non-reasoning
-       * OpenAI models that may reject reasoning_effort.
-       */
-      if (
-        !result.ok &&
-        result.status === 400
-      ) {
-        const fallbackBody = {
-          model: String(model),
-          messages,
-          max_completion_tokens: safeMaxTokens
-        };
-
-        result = await callOpenAI(
-          config,
-          "/chat/completions",
-          {
-            body: fallbackBody
-          }
+        /**
+         * CRITICAL:
+         *
+         * No reasoning_effort is created here.
+         *
+         * If the application supplied it,
+         * it remains in providerBody.
+         *
+         * If the application omitted it,
+         * it does not exist.
+         */
+        console.log(
+          "[OpenAI /ai/chat body keys]",
+          Object.keys(providerBody)
         );
-      }
 
-      if (!result.ok) {
-        return res.status(result.status).json({
-          success: false,
+        const result =
+          await callOpenAI(
+            config,
+            "/chat/completions",
+            {
+              body: providerBody
+            }
+          );
+
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .json({
+              success: false,
+              provider: "openai",
+              model,
+              error:
+                "OpenAI AI request failed",
+              details:
+                result.body
+            });
+        }
+
+        return res.json({
+          success: true,
           provider: "openai",
           model,
-          error: "OpenAI AI request failed",
-          details: result.body
+          response: result.body
         });
       }
 
-      return res.json({
-        success: true,
-        provider: "openai",
-        model,
-        response: result.body
+      return res.status(400).json({
+        success: false,
+        error:
+          "Unsupported AI provider"
+      });
+    } catch (error) {
+      console.error(
+        "AI chat error:",
+        error.message
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error.message ||
+          "AI request failed"
       });
     }
-
-    return res.status(400).json({
-      success: false,
-      error: "Unsupported AI provider"
-    });
-  } catch (error) {
-    console.error("AI chat error:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message || "AI request failed"
-    });
   }
-});
+);
 
 /**
  * Fallback 404.
@@ -841,6 +994,12 @@ app.use((req, res) => {
   });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`NodeSend listening on 0.0.0.0:${PORT}`);
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `NodeSend listening on 0.0.0.0:${PORT}`
+    );
+  }
+);
