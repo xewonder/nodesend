@@ -17,54 +17,133 @@ const ROCKETCHAT_WEBHOOK_URL =
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 /**
- * RSA private key used ONLY for decrypting AI provider
- * credentials sent by BridgeMind.
- *
- * Supports either:
- *
- * 1. A true multiline PEM environment variable
- *
- * or
- *
- * 2. A single-line value containing literal \n characters
+ * ========================================================
+ * NODESEND VERSION
+ * ========================================================
  */
-const NODESEND_PRIVATE_KEY_PEM = String(
-  process.env.NODESEND_PRIVATE_KEY_PEM || ""
-)
-  .replace(/\\n/g, "\n")
-  .trim();
+
+const NODESEND_VERSION =
+  "bridge-encrypted-credentials-v2";
 
 /**
- * TEMPORARY migration switch.
+ * ========================================================
+ * AI CREDENTIAL ENCRYPTION CONFIGURATION
+ * ========================================================
  *
- * Recommended migration procedure:
+ * Preferred:
  *
- * 1. Set ALLOW_PLAINTEXT_AI_KEYS=true
- * 2. Deploy this NodeSend version
- * 3. Update Greta/BridgeMind to send encryptedApiKey
- * 4. Verify encrypted requests work
- * 5. Change ALLOW_PLAINTEXT_AI_KEYS=false
- * 6. Redeploy
+ * NODESEND_PRIVATE_KEY_B64
  *
- * Once migration is complete, plaintext AI provider
- * credentials will be rejected.
+ * This should contain the BASE64 encoding of the entire
+ * RSA private PEM file.
+ *
+ * Example generation:
+ *
+ * Linux:
+ *
+ * base64 -w 0 nodesend-private.pem
+ *
+ * macOS:
+ *
+ * base64 < nodesend-private.pem | tr -d '\n'
+ *
+ *
+ * Legacy fallback:
+ *
+ * NODESEND_PRIVATE_KEY_PEM
+ *
+ * This supports either:
+ *
+ * - real multiline PEM
+ * - literal \n sequences
+ *
+ * B64 takes priority when both exist.
+ */
+
+const NODESEND_PRIVATE_KEY_B64 = String(
+  process.env.NODESEND_PRIVATE_KEY_B64 || ""
+).trim();
+
+const NODESEND_PRIVATE_KEY_PEM_RAW = String(
+  process.env.NODESEND_PRIVATE_KEY_PEM || ""
+).trim();
+
+/**
+ * Decode the configured private key.
+ */
+function loadPrivateKeyPem() {
+  if (NODESEND_PRIVATE_KEY_B64) {
+    try {
+      const pem = Buffer.from(
+        NODESEND_PRIVATE_KEY_B64,
+        "base64"
+      )
+        .toString("utf8")
+        .trim();
+
+      if (!pem) {
+        throw new Error(
+          "Decoded private key is empty"
+        );
+      }
+
+      return pem;
+    } catch (error) {
+      console.error(
+        "[NodeSend] Failed to decode NODESEND_PRIVATE_KEY_B64:",
+        error.message
+      );
+
+      return "";
+    }
+  }
+
+  if (NODESEND_PRIVATE_KEY_PEM_RAW) {
+    return NODESEND_PRIVATE_KEY_PEM_RAW
+      .replace(/\\n/g, "\n")
+      .trim();
+  }
+
+  return "";
+}
+
+const NODESEND_PRIVATE_KEY_PEM =
+  loadPrivateKeyPem();
+
+/**
+ * Temporary migration switch.
+ *
+ * true:
+ * NodeSend can temporarily accept config.apiKey
+ *
+ * false:
+ * NodeSend accepts only config.encryptedApiKey
+ *
+ * After Greta/BridgeMind has been migrated successfully,
+ * set this to false in Coolify.
  *
  * IMPORTANT:
- * This affects AI provider credentials ONLY.
- * It does NOT affect SMTP passwords.
+ * This affects AI provider keys ONLY.
+ * SMTP email passwords are completely separate.
  */
 const ALLOW_PLAINTEXT_AI_KEYS =
   String(
-    process.env.ALLOW_PLAINTEXT_AI_KEYS || "false"
+    process.env.ALLOW_PLAINTEXT_AI_KEYS ||
+      "false"
   ).toLowerCase() === "true";
 
 /**
- * Hard-coded Alibaba Token Plan discovery list.
+ * ========================================================
+ * ALIBABA MODEL DISCOVERY
+ * ========================================================
  *
- * BridgeMind may maintain its own database-driven
- * provider/model catalog. This list remains only for
- * the NodeSend /ai/models Alibaba discovery endpoint.
+ * BridgeMind may use its database catalog as the
+ * authoritative model list.
+ *
+ * This list remains for the existing NodeSend
+ * Alibaba /ai/models behavior.
  */
+
 const ALIBABA_TOKEN_PLAN_MODELS = [
   {
     id: "qwen3.8-flash",
@@ -77,17 +156,23 @@ const ALIBABA_TOKEN_PLAN_MODELS = [
 ];
 
 /**
- * Checks the NodeSend API key supplied by the caller.
- *
- * This is separate from OpenAI/Alibaba credentials.
+ * ========================================================
+ * AUTHENTICATION
+ * ========================================================
+ */
+
+/**
+ * Validate BridgeMind -> NodeSend x-api-key.
  */
 function requireApiKey(req, res, next) {
-  const providedKey = req.get("x-api-key");
+  const providedKey =
+    req.get("x-api-key");
 
   if (!BRIDGE_API_KEY) {
     return res.status(500).json({
       success: false,
-      error: "BRIDGE_API_KEY is not configured"
+      error:
+        "BRIDGE_API_KEY is not configured"
     });
   }
 
@@ -105,8 +190,11 @@ function requireApiKey(req, res, next) {
 }
 
 /**
- * Normalize provider base URL.
+ * ========================================================
+ * COMMON HELPERS
+ * ========================================================
  */
+
 function sanitizeBaseUrl(value) {
   return String(value || "")
     .trim()
@@ -114,10 +202,12 @@ function sanitizeBaseUrl(value) {
 }
 
 /**
- * Restrict Alibaba proxy calls to Alibaba/DashScope
- * hosts.
+ * Restrict Alibaba proxy calls to known Alibaba /
+ * DashScope hosts.
  */
-function isAllowedAlibabaBaseUrl(baseUrl) {
+function isAllowedAlibabaBaseUrl(
+  baseUrl
+) {
   try {
     const url = new URL(baseUrl);
 
@@ -147,9 +237,11 @@ function isAllowedAlibabaBaseUrl(baseUrl) {
 }
 
 /**
- * Safely parse an HTTP response.
+ * Parse provider HTTP response safely.
  */
-async function parseResponse(response) {
+async function parseResponse(
+  response
+) {
   const responseText =
     await response.text();
 
@@ -171,25 +263,69 @@ async function parseResponse(response) {
 }
 
 /**
- * Verify the configured NodeSend RSA private key.
+ * Remove NodeSend-only envelope fields.
+ *
+ * Everything else is passed to the provider unchanged.
+ *
+ * NodeSend does NOT invent or normalize:
+ *
+ * reasoning_effort
+ * max_tokens
+ * max_completion_tokens
+ * temperature
+ * enable_thinking
+ * top_p
+ * verbosity
+ * etc.
+ *
+ * BridgeMind owns AI request policy.
+ */
+function buildProviderBody(
+  input = {}
+) {
+  const {
+    provider,
+    config,
+    ...providerBody
+  } = input;
+
+  return providerBody;
+}
+
+/**
+ * ========================================================
+ * RSA KEY HELPERS
+ * ========================================================
+ */
+
+/**
+ * Parse and validate the configured RSA private key.
  */
 function getNodeSendPrivateKey() {
   if (!NODESEND_PRIVATE_KEY_PEM) {
     throw new Error(
-      "NODESEND_PRIVATE_KEY_PEM is not configured"
+      "NodeSend RSA private key is not configured"
     );
   }
 
-  return crypto.createPrivateKey({
-    key: NODESEND_PRIVATE_KEY_PEM,
-    format: "pem"
-  });
+  try {
+    return crypto.createPrivateKey({
+      key:
+        NODESEND_PRIVATE_KEY_PEM,
+      format: "pem"
+    });
+  } catch (error) {
+    throw new Error(
+      `NodeSend RSA private key is invalid: ${error.message}`
+    );
+  }
 }
 
 /**
- * Derive the public RSA key from the private key.
+ * Derive the corresponding PUBLIC key from the
+ * PRIVATE key stored in Coolify.
  *
- * The public key is safe to expose to the browser.
+ * The public key is safe to expose.
  */
 function getNodeSendPublicKeyPem() {
   const privateKey =
@@ -207,16 +343,34 @@ function getNodeSendPublicKeyPem() {
 }
 
 /**
- * Decrypt a BridgeMind provider API key.
+ * Check whether RSA encryption is correctly configured.
+ */
+function isEncryptionConfigured() {
+  try {
+    const privateKey =
+      getNodeSendPrivateKey();
+
+    crypto.createPublicKey(
+      privateKey
+    );
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decrypt a provider API key encrypted by the browser.
  *
- * Expected browser encryption:
+ * Browser must use:
  *
  * RSA-OAEP
  * SHA-256
  *
- * Expected transport encoding:
+ * Ciphertext transport:
  *
- * base64
+ * Base64
  */
 function decryptProviderApiKey(
   encryptedApiKey
@@ -233,10 +387,13 @@ function decryptProviderApiKey(
   let encryptedBuffer;
 
   try {
-    encryptedBuffer = Buffer.from(
-      String(encryptedApiKey),
-      "base64"
-    );
+    encryptedBuffer =
+      Buffer.from(
+        String(
+          encryptedApiKey
+        ).trim(),
+        "base64"
+      );
   } catch {
     throw new Error(
       "encryptedApiKey is not valid base64"
@@ -284,40 +441,47 @@ function decryptProviderApiKey(
 }
 
 /**
- * Resolve an AI provider credential.
+ * Resolve provider credential.
  *
  * Preferred:
  *
  * config.encryptedApiKey
  *
- * Temporary migration fallback:
+ * Migration-only fallback:
  *
  * config.apiKey
- *
- * Plaintext fallback works ONLY when:
- *
- * ALLOW_PLAINTEXT_AI_KEYS=true
- *
- * SMTP credentials are NOT handled by this function.
  */
-function resolveProviderApiKey(config) {
-  if (config?.encryptedApiKey) {
+function resolveProviderApiKey(
+  config
+) {
+  if (
+    config?.encryptedApiKey
+  ) {
     return decryptProviderApiKey(
       config.encryptedApiKey
     );
   }
 
   if (
-    ALLOW_PLAINTEXT_AI_KEYS &&
-    config?.apiKey
+    config?.apiKey &&
+    ALLOW_PLAINTEXT_AI_KEYS
   ) {
     console.warn(
-      "[SECURITY] Legacy plaintext AI provider API key received"
+      "[SECURITY] Legacy plaintext AI provider key received"
     );
 
-    return String(
-      config.apiKey
-    ).trim();
+    const apiKey =
+      String(
+        config.apiKey
+      ).trim();
+
+    if (!apiKey) {
+      throw new Error(
+        "Plaintext AI provider API key is empty"
+      );
+    }
+
+    return apiKey;
   }
 
   if (
@@ -335,47 +499,20 @@ function resolveProviderApiKey(config) {
 }
 
 /**
- * Remove NodeSend-only proxy envelope fields.
- *
- * Everything else is intended for the selected provider.
- *
- * IMPORTANT:
- *
- * NodeSend does NOT invent:
- *
- * reasoning_effort
- * temperature
- * max_tokens
- * max_completion_tokens
- * enable_thinking
- *
- * Those are BridgeMind/provider policy decisions.
+ * ========================================================
+ * ALIBABA PROVIDER
+ * ========================================================
  */
-function buildProviderBody(
-  input = {}
-) {
-  const {
-    provider,
-    config,
-    ...providerBody
-  } = input;
 
-  return providerBody;
-}
-
-/**
- * Call Alibaba OpenAI-compatible endpoint.
- *
- * Provider credential is decrypted only in memory.
- * NodeSend never persists it.
- */
 async function callAlibaba(
   config,
   path,
   body
 ) {
   const apiKey =
-    resolveProviderApiKey(config);
+    resolveProviderApiKey(
+      config
+    );
 
   const baseUrl =
     sanitizeBaseUrl(
@@ -398,7 +535,8 @@ async function callAlibaba(
     );
   }
 
-  const startedAt = Date.now();
+  const startedAt =
+    Date.now();
 
   console.log(
     "[Alibaba fetch started]",
@@ -406,28 +544,29 @@ async function callAlibaba(
       path,
       fields:
         body &&
-        typeof body === "object"
+        typeof body ===
+          "object"
           ? Object.keys(body)
           : []
     }
   );
 
   try {
-    const response = await fetch(
-      `${baseUrl}${path}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization:
-            `Bearer ${apiKey}`,
-          "Content-Type":
-            "application/json"
-        },
-        body: JSON.stringify(
-          body
-        )
-      }
-    );
+    const response =
+      await fetch(
+        `${baseUrl}${path}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization:
+              `Bearer ${apiKey}`,
+            "Content-Type":
+              "application/json"
+          },
+          body:
+            JSON.stringify(body)
+        }
+      );
 
     console.log(
       "[Alibaba response]",
@@ -464,20 +603,23 @@ async function callAlibaba(
 }
 
 /**
- * Call OpenAI API.
- *
- * Provider credential is decrypted only in memory.
- * NodeSend never persists it.
+ * ========================================================
+ * OPENAI PROVIDER
+ * ========================================================
  */
+
 async function callOpenAI(
   config,
   path,
   options = {}
 ) {
   const apiKey =
-    resolveProviderApiKey(config);
+    resolveProviderApiKey(
+      config
+    );
 
-  const startedAt = Date.now();
+  const startedAt =
+    Date.now();
 
   console.log(
     "[OpenAI fetch started]",
@@ -498,31 +640,36 @@ async function callOpenAI(
   );
 
   try {
-    const response = await fetch(
-      `${OPENAI_BASE_URL}${path}`,
-      {
-        method:
-          options.method ||
-          "POST",
-        headers: {
-          Authorization:
-            `Bearer ${apiKey}`,
-          "Content-Type":
-            "application/json",
-          ...(options.headers ||
-            {})
-        },
-        ...(options.body !==
-        undefined
-          ? {
-              body:
-                JSON.stringify(
-                  options.body
-                )
-            }
-          : {})
-      }
-    );
+    const response =
+      await fetch(
+        `${OPENAI_BASE_URL}${path}`,
+        {
+          method:
+            options.method ||
+            "POST",
+
+          headers: {
+            Authorization:
+              `Bearer ${apiKey}`,
+
+            "Content-Type":
+              "application/json",
+
+            ...(options.headers ||
+              {})
+          },
+
+          ...(options.body !==
+          undefined
+            ? {
+                body:
+                  JSON.stringify(
+                    options.body
+                  )
+              }
+            : {})
+        }
+      );
 
     console.log(
       "[OpenAI response]",
@@ -559,73 +706,81 @@ async function callOpenAI(
 }
 
 /**
- * Root information.
+ * ========================================================
+ * ROOT
+ * ========================================================
  */
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    service: "NodeSend",
-    version:
-      "bridge-encrypted-credentials-v1",
-    endpoints: {
-      health:
-        "GET /health",
-      publicKey:
-        "GET /crypto/public-key",
-      email:
-        "POST /send",
-      rocketchat:
-        "POST /rocketchat",
-      aiModels:
-        "POST /ai/models",
-      aiTest:
-        "POST /ai/test",
-      aiChat:
-        "POST /ai/chat"
-    },
-    providers: [
-      "alibaba",
-      "openai"
-    ]
-  });
-});
 
-/**
- * Health check.
- *
- * Does NOT expose private or public key material.
- */
 app.get(
-  "/health",
+  "/",
   (req, res) => {
-    let encryptionConfigured =
-      Boolean(
-        NODESEND_PRIVATE_KEY_PEM
-      );
-
-    /**
-     * Also check whether Node can
-     * successfully parse the PEM.
-     */
-    if (
-      encryptionConfigured
-    ) {
-      try {
-        getNodeSendPrivateKey();
-      } catch {
-        encryptionConfigured =
-          false;
-      }
-    }
-
     res.json({
       success: true,
       service: "NodeSend",
       version:
-        "bridge-encrypted-credentials-v1",
-      status: "healthy",
+        NODESEND_VERSION,
 
-      encryptionConfigured,
+      endpoints: {
+        health:
+          "GET /health",
+
+        publicKey:
+          "GET /crypto/public-key",
+
+        email:
+          "POST /send",
+
+        rocketchat:
+          "POST /rocketchat",
+
+        aiModels:
+          "POST /ai/models",
+
+        aiTest:
+          "POST /ai/test",
+
+        aiChat:
+          "POST /ai/chat"
+      },
+
+      providers: [
+        "alibaba",
+        "openai"
+      ]
+    });
+  }
+);
+
+/**
+ * ========================================================
+ * HEALTH
+ * ========================================================
+ */
+
+app.get(
+  "/health",
+  (req, res) => {
+    res.json({
+      success: true,
+
+      service:
+        "NodeSend",
+
+      version:
+        NODESEND_VERSION,
+
+      status:
+        "healthy",
+
+      encryptionConfigured:
+        isEncryptionConfigured(),
+
+      privateKeySource:
+        NODESEND_PRIVATE_KEY_B64
+          ? "base64"
+          : NODESEND_PRIVATE_KEY_PEM_RAW
+            ? "pem"
+            : "none",
 
       plaintextAIKeysAllowed:
         ALLOW_PLAINTEXT_AI_KEYS,
@@ -647,15 +802,17 @@ app.get(
 );
 
 /**
- * Public encryption key.
+ * ========================================================
+ * PUBLIC RSA KEY
+ * ========================================================
  *
- * This route intentionally does NOT require x-api-key.
+ * Public key intentionally does NOT require x-api-key.
  *
- * A public encryption key is not secret.
+ * It is public by definition.
  *
- * The corresponding PRIVATE key remains only inside
- * NodeSend/Coolify.
+ * Browser uses it to encrypt provider credentials.
  */
+
 app.get(
   "/crypto/public-key",
   (req, res) => {
@@ -665,16 +822,21 @@ app.get(
 
       return res.json({
         success: true,
+
         algorithm:
           "RSA-OAEP",
-        hash: "SHA-256",
+
+        hash:
+          "SHA-256",
+
         encoding:
           "PEM-SPKI",
+
         publicKey
       });
     } catch (error) {
       console.error(
-        "Public key error:",
+        "[NodeSend public key error]",
         error.message
       );
 
@@ -696,18 +858,18 @@ app.get(
  *
  * IMPORTANT:
  *
- * SMTP is deliberately NOT changed by the AI credential
- * encryption work.
+ * EMAIL HAS NOT BEEN CHANGED.
  *
- * Existing fields remain:
+ * SMTP still uses:
  *
  * config.host
  * config.port
  * config.username
  * config.password
  *
- * This keeps existing email behavior intact.
+ * AI encryption does NOT touch this endpoint.
  */
+
 app.post(
   "/send",
   requireApiKey,
@@ -743,12 +905,14 @@ app.post(
 
       const username =
         String(
-          config.username || ""
+          config.username ||
+            ""
         ).trim();
 
       const password =
         String(
-          config.password || ""
+          config.password ||
+            ""
         );
 
       const from =
@@ -761,7 +925,8 @@ app.post(
 
       const subject =
         String(
-          email.subject || ""
+          email.subject ||
+            ""
         );
 
       const text =
@@ -819,40 +984,44 @@ app.post(
       }
 
       const transporter =
-        nodemailer
-          .createTransport({
-            host,
-            port,
-            secure:
-              port === 465,
-            auth: {
-              user:
-                username,
-              pass:
-                password
-            }
-          });
+        nodemailer.createTransport({
+          host,
+          port,
+
+          secure:
+            port === 465,
+
+          auth: {
+            user:
+              username,
+
+            pass:
+              password
+          }
+        });
 
       await transporter.verify();
 
       const result =
-        await transporter
-          .sendMail({
-            from,
-            to,
-            cc,
-            bcc,
-            subject,
-            text,
-            html
-          });
+        await transporter.sendMail({
+          from,
+          to,
+          cc,
+          bcc,
+          subject,
+          text,
+          html
+        });
 
       return res.json({
         success: true,
+
         messageId:
           result.messageId,
+
         accepted:
           result.accepted,
+
         rejected:
           result.rejected
       });
@@ -866,6 +1035,7 @@ app.post(
         .status(500)
         .json({
           success: false,
+
           error:
             error.message ||
             "Email could not be sent"
@@ -879,8 +1049,9 @@ app.post(
  * ROCKET.CHAT
  * ========================================================
  *
- * Existing Rocket.Chat behavior is unchanged.
+ * Existing behavior unchanged.
  */
+
 app.post(
   "/rocketchat",
   requireApiKey,
@@ -893,6 +1064,7 @@ app.post(
           .status(500)
           .json({
             success: false,
+
             error:
               "ROCKETCHAT_WEBHOOK_URL is not configured"
           });
@@ -957,10 +1129,12 @@ app.post(
           ROCKETCHAT_WEBHOOK_URL,
           {
             method: "POST",
+
             headers: {
               "Content-Type":
                 "application/json"
             },
+
             body:
               JSON.stringify(
                 payload
@@ -980,8 +1154,10 @@ app.post(
           )
           .json({
             success: false,
+
             error:
               "Rocket.Chat rejected the request",
+
             details:
               result.body
           });
@@ -1002,6 +1178,7 @@ app.post(
         .status(500)
         .json({
           success: false,
+
           error:
             error.message ||
             "Rocket.Chat message could not be sent"
@@ -1014,20 +1191,8 @@ app.post(
  * ========================================================
  * AI MODEL DISCOVERY
  * ========================================================
- *
- * Alibaba:
- * returns local Token Plan discovery list.
- *
- * OpenAI:
- * dynamically calls GET /v1/models.
- *
- * AI credentials may be supplied as:
- *
- * config.encryptedApiKey
- *
- * During migration ONLY, plaintext config.apiKey can be
- * accepted when ALLOW_PLAINTEXT_AI_KEYS=true.
  */
+
 app.post(
   "/ai/models",
   requireApiKey,
@@ -1038,41 +1203,44 @@ app.post(
         config
       } = req.body || {};
 
+      /**
+       * Alibaba currently uses local discovery,
+       * so provider credentials are not needed here.
+       */
       if (
         provider ===
         "alibaba"
       ) {
-        /**
-         * Alibaba discovery currently uses the local
-         * Token Plan allowlist, so there is no need to
-         * decrypt the provider credential here.
-         */
         return res.json({
           success: true,
+
           provider:
             "alibaba",
+
           source:
             "local-token-plan-list",
+
           models:
             ALIBABA_TOKEN_PLAN_MODELS
         });
       }
 
+      /**
+       * OpenAI dynamically queries /v1/models.
+       *
+       * Credential is resolved/decrypted inside
+       * callOpenAI().
+       */
       if (
         provider ===
         "openai"
       ) {
-        /**
-         * resolveProviderApiKey() is called inside
-         * callOpenAI().
-         */
         const result =
           await callOpenAI(
             config,
             "/models",
             {
-              method:
-                "GET"
+              method: "GET"
             }
           );
 
@@ -1083,10 +1251,13 @@ app.post(
             )
             .json({
               success: false,
+
               provider:
                 "openai",
+
               error:
                 "OpenAI model discovery failed",
+
               details:
                 result.body
             });
@@ -1101,11 +1272,14 @@ app.post(
                   (model) => ({
                     id:
                       model.id,
+
                     name:
                       model.id,
+
                     created:
                       model.created ||
                       null,
+
                     ownedBy:
                       model.owned_by ||
                       null
@@ -1125,12 +1299,16 @@ app.post(
 
         return res.json({
           success: true,
+
           provider:
             "openai",
+
           source:
             "openai-api",
+
           total:
             models.length,
+
           models
         });
       }
@@ -1152,6 +1330,7 @@ app.post(
         .status(500)
         .json({
           success: false,
+
           error:
             error.message ||
             "AI model discovery failed"
@@ -1162,24 +1341,23 @@ app.post(
 
 /**
  * ========================================================
- * AI CONNECTION TEST
+ * AI TEST
  * ========================================================
  *
- * NodeSend deliberately does NOT invent model-specific
- * parameters here.
+ * NodeSend adds only the small test message.
  *
- * BridgeMind can send optional provider parameters if
- * required.
+ * Any optional provider parameters deliberately sent by
+ * BridgeMind are passed through.
  *
- * For most Test Connection operations, BridgeMind should
- * send only:
+ * NodeSend does NOT invent:
  *
- * provider
- * config
- * model
- *
- * NodeSend adds only the minimal test message.
+ * reasoning_effort
+ * max_tokens
+ * max_completion_tokens
+ * temperature
+ * etc.
  */
+
 app.post(
   "/ai/test",
   requireApiKey,
@@ -1201,20 +1379,13 @@ app.post(
           });
       }
 
-      /**
-       * Strip the NodeSend proxy envelope.
-       *
-       * Any explicit provider-specific parameters sent
-       * by BridgeMind remain.
-       */
       const extraBody =
         buildProviderBody(
           req.body
         );
 
       /**
-       * NodeSend controls the model and test message
-       * for this endpoint.
+       * NodeSend owns these fields for the test.
        */
       delete extraBody.model;
       delete extraBody.messages;
@@ -1225,7 +1396,9 @@ app.post(
 
         messages: [
           {
-            role: "user",
+            role:
+              "user",
+
             content:
               "Reply only with OK"
           }
@@ -1234,6 +1407,9 @@ app.post(
         ...extraBody
       };
 
+      /**
+       * Alibaba
+       */
       if (
         provider ===
         "alibaba"
@@ -1245,6 +1421,7 @@ app.post(
             .status(400)
             .json({
               success: false,
+
               error:
                 "Alibaba baseUrl is required"
             });
@@ -1255,10 +1432,9 @@ app.post(
           {
             model:
               String(model),
+
             fields:
-              Object.keys(
-                body
-              )
+              Object.keys(body)
           }
         );
 
@@ -1276,11 +1452,15 @@ app.post(
             )
             .json({
               success: false,
+
               provider:
                 "alibaba",
+
               model,
+
               error:
                 "Alibaba model test failed",
+
               details:
                 result.body
             });
@@ -1288,9 +1468,12 @@ app.post(
 
         return res.json({
           success: true,
+
           provider:
             "alibaba",
+
           model,
+
           response:
             result.body
               ?.choices?.[0]
@@ -1300,6 +1483,9 @@ app.post(
         });
       }
 
+      /**
+       * OpenAI
+       */
       if (
         provider ===
         "openai"
@@ -1309,10 +1495,9 @@ app.post(
           {
             model:
               String(model),
+
             fields:
-              Object.keys(
-                body
-              )
+              Object.keys(body)
           }
         );
 
@@ -1332,11 +1517,15 @@ app.post(
             )
             .json({
               success: false,
+
               provider:
                 "openai",
+
               model,
+
               error:
                 "OpenAI model test failed",
+
               details:
                 result.body
             });
@@ -1344,9 +1533,12 @@ app.post(
 
         return res.json({
           success: true,
+
           provider:
             "openai",
+
           model,
+
           response:
             result.body
               ?.choices?.[0]
@@ -1373,6 +1565,7 @@ app.post(
         .status(500)
         .json({
           success: false,
+
           error:
             error.message ||
             "AI model test failed"
@@ -1386,35 +1579,24 @@ app.post(
  * GENERIC AI CHAT PROXY
  * ========================================================
  *
- * NODE SEND ARCHITECTURE
- * ----------------------
- *
  * BridgeMind owns AI request policy.
  *
  * NodeSend owns:
  *
- * - authentication
- * - encrypted provider credential decryption
+ * - BridgeMind authentication
+ * - provider credential decryption
  * - provider routing
- * - transport
- * - returning the provider response
+ * - HTTP transport
+ * - returning provider responses
  *
- * NodeSend does NOT decide:
- *
- * - reasoning_effort
- * - max_tokens
- * - max_completion_tokens
- * - temperature
- * - enable_thinking
- * - model capability
- *
- * Everything except:
+ * NodeSend strips only:
  *
  * provider
  * config
  *
- * is passed through to the selected AI provider.
+ * All other provider fields are passed through unchanged.
  */
+
 app.post(
   "/ai/chat",
   requireApiKey,
@@ -1447,6 +1629,7 @@ app.post(
           .status(400)
           .json({
             success: false,
+
             error:
               "messages must be a non-empty array"
           });
@@ -1464,11 +1647,6 @@ app.post(
           });
       }
 
-      /**
-       * Remove ONLY NodeSend's proxy envelope.
-       *
-       * Provider-specific options remain untouched.
-       */
       const providerBody =
         buildProviderBody(
           req.body
@@ -1480,6 +1658,9 @@ app.post(
       providerBody.messages =
         messages;
 
+      /**
+       * Alibaba
+       */
       if (
         provider ===
         "alibaba"
@@ -1491,6 +1672,7 @@ app.post(
             .status(400)
             .json({
               success: false,
+
               error:
                 "Alibaba baseUrl is required"
             });
@@ -1501,6 +1683,7 @@ app.post(
           {
             model:
               String(model),
+
             fields:
               Object.keys(
                 providerBody
@@ -1522,11 +1705,15 @@ app.post(
             )
             .json({
               success: false,
+
               provider:
                 "alibaba",
+
               model,
+
               error:
                 "Alibaba AI request failed",
+
               details:
                 result.body
             });
@@ -1534,14 +1721,20 @@ app.post(
 
         return res.json({
           success: true,
+
           provider:
             "alibaba",
+
           model,
+
           response:
             result.body
         });
       }
 
+      /**
+       * OpenAI
+       */
       if (
         provider ===
         "openai"
@@ -1551,6 +1744,7 @@ app.post(
           {
             model:
               String(model),
+
             fields:
               Object.keys(
                 providerBody
@@ -1575,11 +1769,15 @@ app.post(
             )
             .json({
               success: false,
+
               provider:
                 "openai",
+
               model,
+
               error:
                 "OpenAI AI request failed",
+
               details:
                 result.body
             });
@@ -1587,9 +1785,12 @@ app.post(
 
         return res.json({
           success: true,
+
           provider:
             "openai",
+
           model,
+
           response:
             result.body
         });
@@ -1599,6 +1800,7 @@ app.post(
         .status(400)
         .json({
           success: false,
+
           error:
             "Unsupported AI provider"
         });
@@ -1612,6 +1814,7 @@ app.post(
         .status(500)
         .json({
           success: false,
+
           error:
             error.message ||
             "AI request failed"
@@ -1621,15 +1824,28 @@ app.post(
 );
 
 /**
- * Fallback 404.
+ * ========================================================
+ * 404
+ * ========================================================
  */
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error:
-      "Endpoint not found"
-  });
-});
+
+app.use(
+  (req, res) => {
+    res
+      .status(404)
+      .json({
+        success: false,
+        error:
+          "Endpoint not found"
+      });
+  }
+);
+
+/**
+ * ========================================================
+ * START SERVER
+ * ========================================================
+ */
 
 app.listen(
   PORT,
@@ -1640,15 +1856,20 @@ app.listen(
     );
 
     console.log(
-      "[NodeSend]",
+      "[NodeSend startup]",
       {
         version:
-          "bridge-encrypted-credentials-v1",
+          NODESEND_VERSION,
+
+        privateKeySource:
+          NODESEND_PRIVATE_KEY_B64
+            ? "base64"
+            : NODESEND_PRIVATE_KEY_PEM_RAW
+              ? "pem"
+              : "none",
 
         encryptionConfigured:
-          Boolean(
-            NODESEND_PRIVATE_KEY_PEM
-          ),
+          isEncryptionConfigured(),
 
         plaintextAIKeysAllowed:
           ALLOW_PLAINTEXT_AI_KEYS
