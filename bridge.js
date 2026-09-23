@@ -1,1879 +1,584 @@
+/**
+ * NodeSend / BridgeMind relay — bridge.js
+ *
+ * Preserves the existing /send, /rocketchat, /ai/models, /ai/test and /ai/chat
+ * request/response contracts. Adds cancellable AI upstream requests,
+ * sanitized request-level timing and an optional authoritative /quota adapter.
+ *
+ * Runtime: Node.js >= 18 (native fetch, AbortController).
+ * Dependencies: express, cors, nodemailer.
+ *
+ * IMPORTANT QUOTA CONTRACT:
+ * There is no inferred/estimated provider balance here. To make /quota work,
+ * configure NODESEND_QUOTA_URL as a trusted HTTPS service returning:
+ *   {"available":true,"remaining":123,"limit":1000,"unit":"credits",
+ *    "resetAt":"2026-10-01T00:00:00Z","scope":"server-account"}
+ * NODESEND_QUOTA_BEARER_TOKEN is an optional server-side credential.
+ * If absent, unreachable or malformed, /quota fails closed with HTTP 503.
+ * An account-specific balance must not be used as proof of another user's quota.
+ */
+
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
 const app = express();
-
-app.use(cors());
+app.use(cors({ exposedHeaders: ["X-Request-Id", "Server-Timing"] }));
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = Number(process.env.PORT || 3001);
-
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
-const ROCKETCHAT_WEBHOOK_URL =
-  process.env.ROCKETCHAT_WEBHOOK_URL;
-
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || "";
+const ROCKETCHAT_WEBHOOK_URL = process.env.ROCKETCHAT_WEBHOOK_URL || "";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
-
-/**
- * ========================================================
- * NODESEND VERSION
- * ========================================================
- */
-
-const NODESEND_VERSION =
-  "bridge-encrypted-credentials-v2";
-
-/**
- * ========================================================
- * AI CREDENTIAL ENCRYPTION CONFIGURATION
- * ========================================================
- *
- * Preferred:
- *
- * NODESEND_PRIVATE_KEY_B64
- *
- * This should contain the BASE64 encoding of the entire
- * RSA private PEM file.
- *
- * Example generation:
- *
- * Linux:
- *
- * base64 -w 0 nodesend-private.pem
- *
- * macOS:
- *
- * base64 < nodesend-private.pem | tr -d '\n'
- *
- *
- * Legacy fallback:
- *
- * NODESEND_PRIVATE_KEY_PEM
- *
- * This supports either:
- *
- * - real multiline PEM
- * - literal \n sequences
- *
- * B64 takes priority when both exist.
- */
-
-const NODESEND_PRIVATE_KEY_B64 = String(
-  process.env.NODESEND_PRIVATE_KEY_B64 || ""
-).trim();
-
-const NODESEND_PRIVATE_KEY_PEM_RAW = String(
-  process.env.NODESEND_PRIVATE_KEY_PEM || ""
-).trim();
-
-/**
- * Decode the configured private key.
- */
-function loadPrivateKeyPem() {
-  if (NODESEND_PRIVATE_KEY_B64) {
-    try {
-      const pem = Buffer.from(
-        NODESEND_PRIVATE_KEY_B64,
-        "base64"
-      )
-        .toString("utf8")
-        .trim();
-
-      if (!pem) {
-        throw new Error(
-          "Decoded private key is empty"
-        );
-      }
-
-      return pem;
-    } catch (error) {
-      console.error(
-        "[NodeSend] Failed to decode NODESEND_PRIVATE_KEY_B64:",
-        error.message
-      );
-
-      return "";
-    }
-  }
-
-  if (NODESEND_PRIVATE_KEY_PEM_RAW) {
-    return NODESEND_PRIVATE_KEY_PEM_RAW
-      .replace(/\\n/g, "\n")
-      .trim();
-  }
-
-  return "";
-}
-
-const NODESEND_PRIVATE_KEY_PEM =
-  loadPrivateKeyPem();
-
-/**
- * Temporary migration switch.
- *
- * true:
- * NodeSend can temporarily accept config.apiKey
- *
- * false:
- * NodeSend accepts only config.encryptedApiKey
- *
- * After Greta/BridgeMind has been migrated successfully,
- * set this to false in Coolify.
- *
- * IMPORTANT:
- * This affects AI provider keys ONLY.
- * SMTP email passwords are completely separate.
- */
+const NODESEND_VERSION = "bridge-cancel-timing-quota-v3";
 const ALLOW_PLAINTEXT_AI_KEYS =
-  String(
-    process.env.ALLOW_PLAINTEXT_AI_KEYS ||
-      "false"
-  ).toLowerCase() === "true";
+  String(process.env.ALLOW_PLAINTEXT_AI_KEYS || "false").toLowerCase() === "true";
 
-/**
- * ========================================================
- * ALIBABA MODEL DISCOVERY
- * ========================================================
- *
- * BridgeMind may use its database catalog as the
- * authoritative model list.
- *
- * This list remains for the existing NodeSend
- * Alibaba /ai/models behavior.
- */
+// Separate upstream timeout, not a generation-parameter override.
+// Set higher than BridgeMind's own client timeout when desired; the disconnect
+// handler should abort earlier if the proxy conveys the client's disconnect.
+const UPSTREAM_TIMEOUT_MS = boundedInt(
+  process.env.NODESEND_UPSTREAM_TIMEOUT_MS,
+  90000, 1000, 600000
+);
+const QUOTA_TIMEOUT_MS = boundedInt(
+  process.env.NODESEND_QUOTA_TIMEOUT_MS,
+  5000, 500, 30000
+);
+const NODESEND_QUOTA_URL = String(process.env.NODESEND_QUOTA_URL || "").trim();
+const NODESEND_QUOTA_BEARER_TOKEN = process.env.NODESEND_QUOTA_BEARER_TOKEN || "";
+const PRIVATE_KEY_B64 = String(process.env.NODESEND_PRIVATE_KEY_B64 || "").trim();
+const PRIVATE_KEY_PEM_RAW = String(process.env.NODESEND_PRIVATE_KEY_PEM || "").trim();
+
+const ALIBABA_ALLOWED_HOSTS = String(process.env.ALIBABA_ALLOWED_HOSTS || "")
+  .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
 
 const ALIBABA_TOKEN_PLAN_MODELS = [
-  {
-    id: "qwen3.8-flash",
-    name: "Qwen 3.8 Flash"
-  },
-  {
-    id: "qwen3.8-max",
-    name: "Qwen 3.8 Max"
-  }
+  { id: "qwen3.8-flash", name: "Qwen 3.8 Flash" },
+  { id: "qwen3.8-max", name: "Qwen 3.8 Max" }
 ];
 
-/**
- * ========================================================
- * AUTHENTICATION
- * ========================================================
- */
+function boundedInt(value, fallback, min, max) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : fallback;
+}
 
-/**
- * Validate BridgeMind -> NodeSend x-api-key.
- */
 function requireApiKey(req, res, next) {
-  const providedKey =
-    req.get("x-api-key");
-
   if (!BRIDGE_API_KEY) {
-    return res.status(500).json({
-      success: false,
-      error:
-        "BRIDGE_API_KEY is not configured"
-    });
+    return res.status(500).json({ success: false, error: "BRIDGE_API_KEY is not configured" });
   }
-
-  if (
-    !providedKey ||
-    providedKey !== BRIDGE_API_KEY
-  ) {
-    return res.status(403).json({
-      success: false,
-      error: "Forbidden"
-    });
+  const supplied = req.get("x-api-key") || "";
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(BRIDGE_API_KEY);
+  if (!a.length || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
   }
-
   next();
 }
 
-/**
- * ========================================================
- * COMMON HELPERS
- * ========================================================
- */
-
-function sanitizeBaseUrl(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\/+$/, "");
-}
-
-/**
- * Restrict Alibaba proxy calls to known Alibaba /
- * DashScope hosts.
- */
-function isAllowedAlibabaBaseUrl(
-  baseUrl
-) {
-  try {
-    const url = new URL(baseUrl);
-
-    if (url.protocol !== "https:") {
-      return false;
+function loadPrivateKeyPem() {
+  if (PRIVATE_KEY_B64) {
+    const pem = Buffer.from(PRIVATE_KEY_B64, "base64").toString("utf8").trim();
+    if (!pem.includes("-----BEGIN") || !pem.includes("PRIVATE KEY-----")) {
+      throw new Error("NODESEND_PRIVATE_KEY_B64 does not decode to a private PEM key");
     }
-
-    const host =
-      url.hostname.toLowerCase();
-
-    return (
-      host.endsWith(
-        ".maas.aliyuncs.com"
-      ) ||
-      host ===
-        "dashscope-intl.aliyuncs.com" ||
-      host ===
-        "dashscope.aliyuncs.com" ||
-      host ===
-        "dashscope-us.aliyuncs.com" ||
-      host ===
-        "cn-hongkong.dashscope.aliyuncs.com"
-    );
-  } catch {
-    return false;
+    return pem;
   }
+  return PRIVATE_KEY_PEM_RAW.replace(/\\n/g, "\n").trim();
 }
 
-/**
- * Parse provider HTTP response safely.
- */
-async function parseResponse(
-  response
-) {
-  const responseText =
-    await response.text();
-
-  let responseBody;
-
-  try {
-    responseBody =
-      JSON.parse(responseText);
-  } catch {
-    responseBody =
-      responseText;
-  }
-
-  return {
-    ok: response.ok,
-    status: response.status,
-    body: responseBody
-  };
-}
-
-/**
- * Remove NodeSend-only envelope fields.
- *
- * Everything else is passed to the provider unchanged.
- *
- * NodeSend does NOT invent or normalize:
- *
- * reasoning_effort
- * max_tokens
- * max_completion_tokens
- * temperature
- * enable_thinking
- * top_p
- * verbosity
- * etc.
- *
- * BridgeMind owns AI request policy.
- */
-function buildProviderBody(
-  input = {}
-) {
-  const {
-    provider,
-    config,
-    ...providerBody
-  } = input;
-
-  return providerBody;
-}
-
-/**
- * ========================================================
- * RSA KEY HELPERS
- * ========================================================
- */
-
-/**
- * Parse and validate the configured RSA private key.
- */
 function getNodeSendPrivateKey() {
-  if (!NODESEND_PRIVATE_KEY_PEM) {
-    throw new Error(
-      "NodeSend RSA private key is not configured"
-    );
-  }
-
-  try {
-    return crypto.createPrivateKey({
-      key:
-        NODESEND_PRIVATE_KEY_PEM,
-      format: "pem"
-    });
-  } catch (error) {
-    throw new Error(
-      `NodeSend RSA private key is invalid: ${error.message}`
-    );
-  }
+  const pem = loadPrivateKeyPem();
+  if (!pem) throw new Error("NodeSend RSA private key is not configured");
+  try { return crypto.createPrivateKey({ key: pem, format: "pem" }); }
+  catch { throw new Error("NodeSend RSA private key is invalid"); }
 }
 
-/**
- * Derive the corresponding PUBLIC key from the
- * PRIVATE key stored in Coolify.
- *
- * The public key is safe to expose.
- */
-function getNodeSendPublicKeyPem() {
-  const privateKey =
-    getNodeSendPrivateKey();
-
-  const publicKey =
-    crypto.createPublicKey(
-      privateKey
-    );
-
-  return publicKey.export({
-    type: "spki",
-    format: "pem"
-  });
-}
-
-/**
- * Check whether RSA encryption is correctly configured.
- */
 function isEncryptionConfigured() {
-  try {
-    const privateKey =
-      getNodeSendPrivateKey();
-
-    crypto.createPublicKey(
-      privateKey
-    );
-
-    return true;
-  } catch {
-    return false;
-  }
+  try { crypto.createPublicKey(getNodeSendPrivateKey()); return true; }
+  catch { return false; }
 }
 
-/**
- * Decrypt a provider API key encrypted by the browser.
- *
- * Browser must use:
- *
- * RSA-OAEP
- * SHA-256
- *
- * Ciphertext transport:
- *
- * Base64
- */
-function decryptProviderApiKey(
-  encryptedApiKey
-) {
-  if (!encryptedApiKey) {
-    throw new Error(
-      "encryptedApiKey is required"
-    );
+function decryptProviderApiKey(encryptedApiKey) {
+  if (typeof encryptedApiKey !== "string" || !encryptedApiKey.trim()) {
+    throw new Error("encryptedApiKey is required");
   }
-
-  const privateKey =
-    getNodeSendPrivateKey();
-
-  let encryptedBuffer;
-
+  // Buffer.from(..., 'base64') is permissive. Reject malformed ciphertext.
+  const encoded = encryptedApiKey.trim();
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new Error("encryptedApiKey is not valid base64");
+  }
+  let plaintext;
   try {
-    encryptedBuffer =
-      Buffer.from(
-        String(
-          encryptedApiKey
-        ).trim(),
-        "base64"
-      );
+    plaintext = crypto.privateDecrypt({
+      key: getNodeSendPrivateKey(),
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256"
+    }, Buffer.from(encoded, "base64"));
   } catch {
-    throw new Error(
-      "encryptedApiKey is not valid base64"
-    );
+    throw new Error("Provider API key decryption failed");
   }
-
-  if (!encryptedBuffer.length) {
-    throw new Error(
-      "encryptedApiKey is empty"
-    );
-  }
-
-  let decryptedBuffer;
-
-  try {
-    decryptedBuffer =
-      crypto.privateDecrypt(
-        {
-          key: privateKey,
-          padding:
-            crypto.constants
-              .RSA_PKCS1_OAEP_PADDING,
-          oaepHash: "sha256"
-        },
-        encryptedBuffer
-      );
-  } catch {
-    throw new Error(
-      "Provider API key decryption failed"
-    );
-  }
-
-  const apiKey =
-    decryptedBuffer
-      .toString("utf8")
-      .trim();
-
-  if (!apiKey) {
-    throw new Error(
-      "Decrypted provider API key is empty"
-    );
-  }
-
+  const apiKey = plaintext.toString("utf8").trim();
+  if (!apiKey) throw new Error("Decrypted provider API key is empty");
   return apiKey;
 }
 
-/**
- * Resolve provider credential.
- *
- * Preferred:
- *
- * config.encryptedApiKey
- *
- * Migration-only fallback:
- *
- * config.apiKey
- */
-function resolveProviderApiKey(
-  config
-) {
-  if (
-    config?.encryptedApiKey
-  ) {
-    return decryptProviderApiKey(
-      config.encryptedApiKey
-    );
+function resolveProviderApiKey(config) {
+  if (config?.encryptedApiKey) return decryptProviderApiKey(config.encryptedApiKey);
+  if (config?.apiKey && ALLOW_PLAINTEXT_AI_KEYS) {
+    const key = String(config.apiKey).trim();
+    if (!key) throw new Error("Plaintext AI provider API key is empty");
+    console.warn("[NodeSend] Legacy plaintext provider key received (never logged)");
+    return key;
   }
-
-  if (
-    config?.apiKey &&
-    ALLOW_PLAINTEXT_AI_KEYS
-  ) {
-    console.warn(
-      "[SECURITY] Legacy plaintext AI provider key received"
-    );
-
-    const apiKey =
-      String(
-        config.apiKey
-      ).trim();
-
-    if (!apiKey) {
-      throw new Error(
-        "Plaintext AI provider API key is empty"
-      );
-    }
-
-    return apiKey;
+  if (config?.apiKey) {
+    throw new Error("Plaintext AI provider API keys are disabled. Send config.encryptedApiKey.");
   }
-
-  if (
-    config?.apiKey &&
-    !ALLOW_PLAINTEXT_AI_KEYS
-  ) {
-    throw new Error(
-      "Plaintext AI provider API keys are disabled. Send config.encryptedApiKey."
-    );
-  }
-
-  throw new Error(
-    "AI provider API key is required"
-  );
+  throw new Error("AI provider API key is required");
 }
 
-/**
- * ========================================================
- * ALIBABA PROVIDER
- * ========================================================
- */
-
-async function callAlibaba(
-  config,
-  path,
-  body
-) {
-  const apiKey =
-    resolveProviderApiKey(
-      config
-    );
-
-  const baseUrl =
-    sanitizeBaseUrl(
-      config?.baseUrl
-    );
-
-  if (!baseUrl) {
-    throw new Error(
-      "Alibaba base URL is required"
-    );
-  }
-
-  if (
-    !isAllowedAlibabaBaseUrl(
-      baseUrl
-    )
-  ) {
-    throw new Error(
-      "Alibaba base URL is not allowed"
-    );
-  }
-
-  const startedAt =
-    Date.now();
-
-  console.log(
-    "[Alibaba fetch started]",
-    {
-      path,
-      fields:
-        body &&
-        typeof body ===
-          "object"
-          ? Object.keys(body)
-          : []
-    }
-  );
-
+function isAllowedAlibabaBaseUrl(baseUrl) {
   try {
-    const response =
-      await fetch(
-        `${baseUrl}${path}`,
-        {
-          method: "POST",
-          headers: {
-            Authorization:
-              `Bearer ${apiKey}`,
-            "Content-Type":
-              "application/json"
-          },
-          body:
-            JSON.stringify(body)
-        }
-      );
-
-    console.log(
-      "[Alibaba response]",
-      {
-        status:
-          response.status,
-        elapsedMs:
-          Date.now() -
-          startedAt
-      }
-    );
-
-    return parseResponse(
-      response
-    );
-  } catch (error) {
-    console.error(
-      "[Alibaba fetch error]",
-      {
-        name:
-          error?.name ||
-          "Error",
-        message:
-          error?.message ||
-          "Unknown error",
-        elapsedMs:
-          Date.now() -
-          startedAt
-      }
-    );
-
-    throw error;
-  }
+    const url = new URL(baseUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false;
+    const hostname = url.hostname.toLowerCase();
+    if (ALIBABA_ALLOWED_HOSTS.length) return ALIBABA_ALLOWED_HOSTS.includes(hostname);
+    return hostname.endsWith(".maas.aliyuncs.com") || [
+      "dashscope-intl.aliyuncs.com",
+      "dashscope.aliyuncs.com",
+      "dashscope-us.aliyuncs.com",
+      "cn-hongkong.dashscope.aliyuncs.com"
+    ].includes(hostname);
+  } catch { return false; }
 }
 
-/**
- * ========================================================
- * OPENAI PROVIDER
- * ========================================================
- */
+function providerEndpoint(provider, config, path) {
+  if (provider === "openai") return `${OPENAI_BASE_URL}${path}`;
+  if (provider !== "alibaba") throw Object.assign(new Error("Unsupported AI provider"), { status: 400 });
+  const baseUrl = String(config?.baseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl) throw Object.assign(new Error("Alibaba baseUrl is required"), { status: 400 });
+  if (!isAllowedAlibabaBaseUrl(baseUrl)) {
+    throw Object.assign(new Error("Alibaba base URL is not allowed"), { status: 400 });
+  }
+  return `${baseUrl}${path}`;
+}
 
-async function callOpenAI(
-  config,
-  path,
-  options = {}
-) {
-  const apiKey =
-    resolveProviderApiKey(
-      config
-    );
+// Only the NodeSend routing envelope is removed. No temperature, token, or
+// reasoning settings are invented or rewritten by this relay.
+function buildProviderBody(input = {}) {
+  const { provider, config, ...providerBody } = input;
+  return providerBody;
+}
 
-  const startedAt =
-    Date.now();
+function requestIdentity(req, res) {
+  // New ID per NodeSend HTTP attempt, even when the caller retries using the
+  // same client correlation ID. The caller may log both for reconciliation.
+  const id = crypto.randomUUID();
+  res.setHeader("X-Request-Id", id);
+  return id;
+}
 
-  console.log(
-    "[OpenAI fetch started]",
-    {
-      path,
-      method:
-        options.method ||
-        "POST",
-      fields:
-        options.body &&
-        typeof options.body ===
-          "object"
-          ? Object.keys(
-              options.body
-            )
-          : []
+function safeEvent(name, data) {
+  // Callers must provide only whitelisted scalar metadata, never bodies,
+  // messages, keys, prompts, hidden hands or upstream errors verbatim.
+  console.info(`[NodeSend] ${name}`, JSON.stringify(data));
+}
+
+function requestLifecycle(req, res, requestId) {
+  const started = performance.now();
+  const controller = new AbortController();
+  let cause = null;
+  const disconnect = () => {
+    if (!res.writableEnded && !controller.signal.aborted) {
+      cause = "client_disconnected";
+      controller.abort(new Error(cause));
+      safeEvent("client_disconnected", { requestId, elapsedMs: Math.round(performance.now() - started) });
     }
-  );
+  };
+  res.once("close", disconnect);
+  req.once("aborted", disconnect);
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      cause = "upstream_timeout";
+      controller.abort(new Error(cause));
+    }
+  }, UPSTREAM_TIMEOUT_MS);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    get cause() { return cause; },
+    elapsed() { return performance.now() - started; },
+    dispose() {
+      clearTimeout(timer);
+      res.off("close", disconnect);
+      req.off("aborted", disconnect);
+    }
+  };
+}
 
+function timeHeader({ upstreamHeadersMs, upstreamBodyMs, relayTotalMs }) {
+  const entries = [];
+  const add = (name, value) => {
+    if (Number.isFinite(value) && value >= 0) entries.push(`${name};dur=${value.toFixed(1)}`);
+  };
+  add("upstream_headers", upstreamHeadersMs);
+  add("upstream_body", upstreamBodyMs);
+  add("relay_total", relayTotalMs);
+  return entries.join(", ");
+}
+
+async function requestProvider({ provider, config, path, method = "POST", body, lifecycle, requestId }) {
+  const url = providerEndpoint(provider, config, path);
+  const apiKey = resolveProviderApiKey(config);
+  const sentAt = performance.now();
+  const sanitized = {
+    requestId, provider, method, path,
+    requestBytes: body === undefined ? 0 : Buffer.byteLength(JSON.stringify(body)),
+    messageCount: Array.isArray(body?.messages) ? body.messages.length : 0,
+    model: typeof body?.model === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(body.model)
+      ? body.model : null,
+    generationSettings: {
+      hasMaxTokens: body?.max_tokens !== undefined,
+      hasMaxCompletionTokens: body?.max_completion_tokens !== undefined,
+      reasoningEffort: ["none", "minimal", "low", "medium", "high", "xhigh"]
+        .includes(body?.reasoning_effort) ? body.reasoning_effort : null,
+      enableThinking: typeof body?.enable_thinking === "boolean" ? body.enable_thinking : null
+    }
+  };
+  safeEvent("upstream_start", sanitized);
+  const response = await fetch(url, {
+    method,
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: lifecycle.signal
+  });
+  const headersAt = performance.now();
+  // Signal stays attached while the body is being received/decoded.
+  const raw = await response.text();
+  const bodyAt = performance.now();
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+  const metrics = {
+    upstreamHeadersMs: headersAt - sentAt,
+    upstreamBodyMs: bodyAt - headersAt,
+    // Relay total is finalized immediately before writing the outer response.
+    relayTotalMs: lifecycle.elapsed()
+  };
+  safeEvent("upstream_complete", {
+    requestId, provider, status: response.status,
+    upstreamHeadersMs: Math.round(metrics.upstreamHeadersMs),
+    upstreamBodyMs: Math.round(metrics.upstreamBodyMs),
+    relayElapsedMs: Math.round(metrics.relayTotalMs),
+    usagePresent: Boolean(parsed && typeof parsed === "object" && parsed.usage)
+  });
+  return { ok: response.ok, status: response.status, body: parsed, metrics };
+}
+
+async function relayAI(req, res, operation) {
+  const requestId = requestIdentity(req, res);
+  const lifecycle = requestLifecycle(req, res, requestId);
   try {
-    const response =
-      await fetch(
-        `${OPENAI_BASE_URL}${path}`,
-        {
-          method:
-            options.method ||
-            "POST",
-
-          headers: {
-            Authorization:
-              `Bearer ${apiKey}`,
-
-            "Content-Type":
-              "application/json",
-
-            ...(options.headers ||
-              {})
-          },
-
-          ...(options.body !==
-          undefined
-            ? {
-                body:
-                  JSON.stringify(
-                    options.body
-                  )
-              }
-            : {})
-        }
-      );
-
-    console.log(
-      "[OpenAI response]",
-      {
-        status:
-          response.status,
-        elapsedMs:
-          Date.now() -
-          startedAt
-      }
-    );
-
-    return parseResponse(
-      response
-    );
-  } catch (error) {
-    console.error(
-      "[OpenAI fetch error]",
-      {
-        name:
-          error?.name ||
-          "Error",
-        message:
-          error?.message ||
-          "Unknown error",
-        elapsedMs:
-          Date.now() -
-          startedAt
-      }
-    );
-
-    throw error;
-  }
-}
-
-/**
- * ========================================================
- * ROOT
- * ========================================================
- */
-
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      success: true,
-      service: "NodeSend",
-      version:
-        NODESEND_VERSION,
-
-      endpoints: {
-        health:
-          "GET /health",
-
-        publicKey:
-          "GET /crypto/public-key",
-
-        email:
-          "POST /send",
-
-        rocketchat:
-          "POST /rocketchat",
-
-        aiModels:
-          "POST /ai/models",
-
-        aiTest:
-          "POST /ai/test",
-
-        aiChat:
-          "POST /ai/chat"
-      },
-
-      providers: [
-        "alibaba",
-        "openai"
-      ]
-    });
-  }
-);
-
-/**
- * ========================================================
- * HEALTH
- * ========================================================
- */
-
-app.get(
-  "/health",
-  (req, res) => {
-    res.json({
-      success: true,
-
-      service:
-        "NodeSend",
-
-      version:
-        NODESEND_VERSION,
-
-      status:
-        "healthy",
-
-      encryptionConfigured:
-        isEncryptionConfigured(),
-
-      privateKeySource:
-        NODESEND_PRIVATE_KEY_B64
-          ? "base64"
-          : NODESEND_PRIVATE_KEY_PEM_RAW
-            ? "pem"
-            : "none",
-
-      plaintextAIKeysAllowed:
-        ALLOW_PLAINTEXT_AI_KEYS,
-
-      rocketchatConfigured:
-        Boolean(
-          ROCKETCHAT_WEBHOOK_URL
-        ),
-
-      aiProxyConfigured:
-        true,
-
-      providers: {
-        alibaba: true,
-        openai: true
-      }
-    });
-  }
-);
-
-/**
- * ========================================================
- * PUBLIC RSA KEY
- * ========================================================
- *
- * Public key intentionally does NOT require x-api-key.
- *
- * It is public by definition.
- *
- * Browser uses it to encrypt provider credentials.
- */
-
-app.get(
-  "/crypto/public-key",
-  (req, res) => {
-    try {
-      const publicKey =
-        getNodeSendPublicKeyPem();
-
-      return res.json({
-        success: true,
-
-        algorithm:
-          "RSA-OAEP",
-
-        hash:
-          "SHA-256",
-
-        encoding:
-          "PEM-SPKI",
-
-        publicKey
-      });
-    } catch (error) {
-      console.error(
-        "[NodeSend public key error]",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-          error:
-            "NodeSend encryption is not configured"
-        });
+    const input = req.body || {};
+    const { provider, config, model, messages } = input;
+    if (!["alibaba", "openai"].includes(provider)) {
+      return res.status(400).json({ success: false, error: "Unsupported AI provider", requestId });
     }
-  }
-);
-
-/**
- * ========================================================
- * EMAIL
- * ========================================================
- *
- * IMPORTANT:
- *
- * EMAIL HAS NOT BEEN CHANGED.
- *
- * SMTP still uses:
- *
- * config.host
- * config.port
- * config.username
- * config.password
- *
- * AI encryption does NOT touch this endpoint.
- */
-
-app.post(
-  "/send",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      const {
-        config,
-        email
-      } = req.body || {};
-
-      if (
-        !config ||
-        !email
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "Both config and email are required"
-          });
-      }
-
-      const host =
-        String(
-          config.host || ""
-        ).trim();
-
-      const port =
-        Number(
-          config.port
-        );
-
-      const username =
-        String(
-          config.username ||
-            ""
-        ).trim();
-
-      const password =
-        String(
-          config.password ||
-            ""
-        );
-
-      const from =
-        String(
-          email.from || ""
-        ).trim();
-
-      const to =
-        email.to;
-
-      const subject =
-        String(
-          email.subject ||
-            ""
-        );
-
-      const text =
-        email.text;
-
-      const html =
-        email.html;
-
-      const cc =
-        email.cc;
-
-      const bcc =
-        email.bcc;
-
-      if (
-        !host ||
-        !port ||
-        !username ||
-        !password
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "SMTP host, port, username and password are required"
-          });
-      }
-
-      if (
-        !from ||
-        !to ||
-        !subject
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "Email from, to and subject are required"
-          });
-      }
-
-      if (
-        !text &&
-        !html
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "Email text or html content is required"
-          });
-      }
-
-      const transporter =
-        nodemailer.createTransport({
-          host,
-          port,
-
-          secure:
-            port === 465,
-
-          auth: {
-            user:
-              username,
-
-            pass:
-              password
-          }
+    let result;
+    if (operation === "models") {
+      if (provider === "alibaba") {
+        return res.json({
+          success: true, provider: "alibaba", source: "local-token-plan-list",
+          models: ALIBABA_TOKEN_PLAN_MODELS
         });
-
-      await transporter.verify();
-
-      const result =
-        await transporter.sendMail({
-          from,
-          to,
-          cc,
-          bcc,
-          subject,
-          text,
-          html
-        });
-
-      return res.json({
-        success: true,
-
-        messageId:
-          result.messageId,
-
-        accepted:
-          result.accepted,
-
-        rejected:
-          result.rejected
+      }
+      result = await requestProvider({
+        provider, config, path: "/models", method: "GET", lifecycle, requestId
       });
-    } catch (error) {
-      console.error(
-        "Email error:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-
-          error:
-            error.message ||
-            "Email could not be sent"
-        });
-    }
-  }
-);
-
-/**
- * ========================================================
- * ROCKET.CHAT
- * ========================================================
- *
- * Existing behavior unchanged.
- */
-
-app.post(
-  "/rocketchat",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      if (
-        !ROCKETCHAT_WEBHOOK_URL
-      ) {
-        return res
-          .status(500)
-          .json({
-            success: false,
-
-            error:
-              "ROCKETCHAT_WEBHOOK_URL is not configured"
-          });
-      }
-
-      const {
-        text,
-        channel,
-        username,
-        emoji,
-        avatar,
-        alias,
-        attachments
-      } = req.body || {};
-
-      if (!text) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "text is required"
-          });
-      }
-
-      const payload = {
-        text
-      };
-
-      if (channel) {
-        payload.channel =
-          channel;
-      }
-
-      if (username) {
-        payload.username =
-          username;
-      }
-
-      if (alias) {
-        payload.alias =
-          alias;
-      }
-
-      if (emoji) {
-        payload.emoji =
-          emoji;
-      }
-
-      if (avatar) {
-        payload.avatar =
-          avatar;
-      }
-
-      if (attachments) {
-        payload.attachments =
-          attachments;
-      }
-
-      const response =
-        await fetch(
-          ROCKETCHAT_WEBHOOK_URL,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-
-            body:
-              JSON.stringify(
-                payload
-              )
-          }
-        );
-
-      const result =
-        await parseResponse(
-          response
-        );
-
       if (!result.ok) {
-        return res
-          .status(
-            result.status
-          )
-          .json({
-            success: false,
-
-            error:
-              "Rocket.Chat rejected the request",
-
-            details:
-              result.body
-          });
-      }
-
-      return res.json({
-        success: true,
-        rocketchat:
-          result.body
-      });
-    } catch (error) {
-      console.error(
-        "Rocket.Chat error:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-
-          error:
-            error.message ||
-            "Rocket.Chat message could not be sent"
+        res.setHeader("Server-Timing", timeHeader({ ...result.metrics, relayTotalMs: lifecycle.elapsed() }));
+        return res.status(result.status).json({
+          success: false, provider, error: "OpenAI model discovery failed", details: result.body
         });
+      }
+      const models = Array.isArray(result.body?.data)
+        ? result.body.data.filter(x => x?.id).map(x => ({
+          id: x.id, name: x.id, created: x.created || null, ownedBy: x.owned_by || null
+        })).sort((a, b) => a.id.localeCompare(b.id)) : [];
+      res.setHeader("Server-Timing", timeHeader({ ...result.metrics, relayTotalMs: lifecycle.elapsed() }));
+      return res.json({ success: true, provider: "openai", source: "openai-api", total: models.length, models });
     }
-  }
-);
-
-/**
- * ========================================================
- * AI MODEL DISCOVERY
- * ========================================================
- */
-
-app.post(
-  "/ai/models",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      const {
-        provider,
-        config
-      } = req.body || {};
-
-      /**
-       * Alibaba currently uses local discovery,
-       * so provider credentials are not needed here.
-       */
-      if (
-        provider ===
-        "alibaba"
-      ) {
-        return res.json({
-          success: true,
-
-          provider:
-            "alibaba",
-
-          source:
-            "local-token-plan-list",
-
-          models:
-            ALIBABA_TOKEN_PLAN_MODELS
-        });
-      }
-
-      /**
-       * OpenAI dynamically queries /v1/models.
-       *
-       * Credential is resolved/decrypted inside
-       * callOpenAI().
-       */
-      if (
-        provider ===
-        "openai"
-      ) {
-        const result =
-          await callOpenAI(
-            config,
-            "/models",
-            {
-              method: "GET"
-            }
-          );
-
-        if (!result.ok) {
-          return res
-            .status(
-              result.status
-            )
-            .json({
-              success: false,
-
-              provider:
-                "openai",
-
-              error:
-                "OpenAI model discovery failed",
-
-              details:
-                result.body
-            });
-        }
-
-        const models =
-          Array.isArray(
-            result.body?.data
-          )
-            ? result.body.data
-                .map(
-                  (model) => ({
-                    id:
-                      model.id,
-
-                    name:
-                      model.id,
-
-                    created:
-                      model.created ||
-                      null,
-
-                    ownedBy:
-                      model.owned_by ||
-                      null
-                  })
-                )
-                .filter(
-                  (model) =>
-                    model.id
-                )
-                .sort(
-                  (a, b) =>
-                    a.id.localeCompare(
-                      b.id
-                    )
-                )
-            : [];
-
-        return res.json({
-          success: true,
-
-          provider:
-            "openai",
-
-          source:
-            "openai-api",
-
-          total:
-            models.length,
-
-          models
-        });
-      }
-
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error:
-            "Unsupported AI provider"
-        });
-    } catch (error) {
-      console.error(
-        "AI models error:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-
-          error:
-            error.message ||
-            "AI model discovery failed"
-        });
+    if (typeof model !== "string" || !model.trim()) {
+      return res.status(400).json({ success: false, error: "model is required" });
     }
-  }
-);
-
-/**
- * ========================================================
- * AI TEST
- * ========================================================
- *
- * NodeSend adds only the small test message.
- *
- * Any optional provider parameters deliberately sent by
- * BridgeMind are passed through.
- *
- * NodeSend does NOT invent:
- *
- * reasoning_effort
- * max_tokens
- * max_completion_tokens
- * temperature
- * etc.
- */
-
-app.post(
-  "/ai/test",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      const {
-        provider,
-        config,
-        model
-      } = req.body || {};
-
-      if (!model) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "model is required"
-          });
-      }
-
-      const extraBody =
-        buildProviderBody(
-          req.body
-        );
-
-      /**
-       * NodeSend owns these fields for the test.
-       */
-      delete extraBody.model;
-      delete extraBody.messages;
-
-      const body = {
-        model:
-          String(model),
-
-        messages: [
-          {
-            role:
-              "user",
-
-            content:
-              "Reply only with OK"
-          }
-        ],
-
-        ...extraBody
+    let providerBody;
+    if (operation === "test") {
+      providerBody = buildProviderBody(input);
+      delete providerBody.model;
+      delete providerBody.messages;
+      providerBody = {
+        model, messages: [{ role: "user", content: "Reply only with OK" }], ...providerBody
       };
-
-      /**
-       * Alibaba
-       */
-      if (
-        provider ===
-        "alibaba"
-      ) {
-        if (
-          !config?.baseUrl
-        ) {
-          return res
-            .status(400)
-            .json({
-              success: false,
-
-              error:
-                "Alibaba baseUrl is required"
-            });
-        }
-
-        console.log(
-          "[Alibaba /ai/test]",
-          {
-            model:
-              String(model),
-
-            fields:
-              Object.keys(body)
-          }
-        );
-
-        const result =
-          await callAlibaba(
-            config,
-            "/chat/completions",
-            body
-          );
-
-        if (!result.ok) {
-          return res
-            .status(
-              result.status
-            )
-            .json({
-              success: false,
-
-              provider:
-                "alibaba",
-
-              model,
-
-              error:
-                "Alibaba model test failed",
-
-              details:
-                result.body
-            });
-        }
-
-        return res.json({
-          success: true,
-
-          provider:
-            "alibaba",
-
-          model,
-
-          response:
-            result.body
-              ?.choices?.[0]
-              ?.message
-              ?.content ??
-            null
-        });
+    } else {
+      if (!Array.isArray(messages) || messages.length === 0 || messages.length > 100) {
+        return res.status(400).json({ success: false, error: "messages must contain 1–100 entries" });
       }
-
-      /**
-       * OpenAI
-       */
-      if (
-        provider ===
-        "openai"
-      ) {
-        console.log(
-          "[OpenAI /ai/test]",
-          {
-            model:
-              String(model),
-
-            fields:
-              Object.keys(body)
-          }
-        );
-
-        const result =
-          await callOpenAI(
-            config,
-            "/chat/completions",
-            {
-              body
-            }
-          );
-
-        if (!result.ok) {
-          return res
-            .status(
-              result.status
-            )
-            .json({
-              success: false,
-
-              provider:
-                "openai",
-
-              model,
-
-              error:
-                "OpenAI model test failed",
-
-              details:
-                result.body
-            });
-        }
-
-        return res.json({
-          success: true,
-
-          provider:
-            "openai",
-
-          model,
-
-          response:
-            result.body
-              ?.choices?.[0]
-              ?.message
-              ?.content ??
-            null
-        });
-      }
-
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error:
-            "Unsupported AI provider"
-        });
-    } catch (error) {
-      console.error(
-        "AI test error:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-
-          error:
-            error.message ||
-            "AI model test failed"
-        });
+      providerBody = buildProviderBody(input);
+      providerBody.model = model;
+      providerBody.messages = messages;
     }
-  }
-);
-
-/**
- * ========================================================
- * GENERIC AI CHAT PROXY
- * ========================================================
- *
- * BridgeMind owns AI request policy.
- *
- * NodeSend owns:
- *
- * - BridgeMind authentication
- * - provider credential decryption
- * - provider routing
- * - HTTP transport
- * - returning provider responses
- *
- * NodeSend strips only:
- *
- * provider
- * config
- *
- * All other provider fields are passed through unchanged.
- */
-
-app.post(
-  "/ai/chat",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      const {
-        provider,
-        config,
-        model,
-        messages
-      } = req.body || {};
-
-      if (!model) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "model is required"
-          });
-      }
-
-      if (
-        !Array.isArray(
-          messages
-        ) ||
-        messages.length === 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-
-            error:
-              "messages must be a non-empty array"
-          });
-      }
-
-      if (
-        messages.length > 100
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error:
-              "Too many messages"
-          });
-      }
-
-      const providerBody =
-        buildProviderBody(
-          req.body
-        );
-
-      providerBody.model =
-        String(model);
-
-      providerBody.messages =
-        messages;
-
-      /**
-       * Alibaba
-       */
-      if (
-        provider ===
-        "alibaba"
-      ) {
-        if (
-          !config?.baseUrl
-        ) {
-          return res
-            .status(400)
-            .json({
-              success: false,
-
-              error:
-                "Alibaba baseUrl is required"
-            });
-        }
-
-        console.log(
-          "[Alibaba /ai/chat]",
-          {
-            model:
-              String(model),
-
-            fields:
-              Object.keys(
-                providerBody
-              )
-          }
-        );
-
-        const result =
-          await callAlibaba(
-            config,
-            "/chat/completions",
-            providerBody
-          );
-
-        if (!result.ok) {
-          return res
-            .status(
-              result.status
-            )
-            .json({
-              success: false,
-
-              provider:
-                "alibaba",
-
-              model,
-
-              error:
-                "Alibaba AI request failed",
-
-              details:
-                result.body
-            });
-        }
-
-        return res.json({
-          success: true,
-
-          provider:
-            "alibaba",
-
-          model,
-
-          response:
-            result.body
-        });
-      }
-
-      /**
-       * OpenAI
-       */
-      if (
-        provider ===
-        "openai"
-      ) {
-        console.log(
-          "[OpenAI /ai/chat]",
-          {
-            model:
-              String(model),
-
-            fields:
-              Object.keys(
-                providerBody
-              )
-          }
-        );
-
-        const result =
-          await callOpenAI(
-            config,
-            "/chat/completions",
-            {
-              body:
-                providerBody
-            }
-          );
-
-        if (!result.ok) {
-          return res
-            .status(
-              result.status
-            )
-            .json({
-              success: false,
-
-              provider:
-                "openai",
-
-              model,
-
-              error:
-                "OpenAI AI request failed",
-
-              details:
-                result.body
-            });
-        }
-
-        return res.json({
-          success: true,
-
-          provider:
-            "openai",
-
-          model,
-
-          response:
-            result.body
-        });
-      }
-
-      return res
-        .status(400)
-        .json({
-          success: false,
-
-          error:
-            "Unsupported AI provider"
-        });
-    } catch (error) {
-      console.error(
-        "AI chat error:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          success: false,
-
-          error:
-            error.message ||
-            "AI request failed"
-        });
-    }
-  }
-);
-
-/**
- * ========================================================
- * 404
- * ========================================================
- */
-
-app.use(
-  (req, res) => {
-    res
-      .status(404)
-      .json({
-        success: false,
-        error:
-          "Endpoint not found"
+    result = await requestProvider({
+      provider, config,
+      path: "/chat/completions", body: providerBody, lifecycle, requestId
+    });
+    // Browser callers can inspect these headers if the request completes.
+    res.setHeader("Server-Timing", timeHeader({ ...result.metrics, relayTotalMs: lifecycle.elapsed() }));
+    if (!result.ok) {
+      return res.status(result.status).json({
+        success: false, provider, model,
+        error: `${provider === "alibaba" ? "Alibaba" : "OpenAI"} ${operation === "test" ? "model test" : "AI request"} failed`,
+        details: result.body
       });
+    }
+    if (operation === "test") {
+      return res.json({
+        success: true, provider, model, response: result.body?.choices?.[0]?.message?.content ?? null
+      });
+    }
+    // Complete provider body is preserved, including usage when supplied.
+    return res.json({ success: true, provider, model, response: result.body });
+  } catch (error) {
+    if (lifecycle.cause === "client_disconnected" || res.destroyed) {
+      // There is no connected caller left to receive a JSON response.
+      return;
+    }
+    const timeout = lifecycle.cause === "upstream_timeout";
+    const invalid = error?.status === 400 || (/required|disabled|invalid|decryption|not allowed|not configured/i).test(error?.message || "");
+    safeEvent("request_failed", {
+      requestId, operation, provider: req.body?.provider || null,
+      cause: timeout ? "upstream_timeout" : invalid ? "validation" : "upstream_or_network_error",
+      elapsedMs: Math.round(lifecycle.elapsed())
+    });
+    if (res.headersSent) return;
+    return res.status(timeout ? 504 : invalid ? 400 : 502).json({
+      success: false,
+      error: timeout ? "NodeSend upstream timeout" : invalid ? error.message : "AI upstream request failed",
+      code: timeout ? "UPSTREAM_TIMEOUT" : invalid ? "INVALID_REQUEST" : "UPSTREAM_ERROR",
+      requestId
+    });
+  } finally {
+    lifecycle.dispose();
   }
-);
+}
 
-/**
- * ========================================================
- * START SERVER
- * ========================================================
- */
-
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `NodeSend listening on 0.0.0.0:${PORT}`
-    );
-
-    console.log(
-      "[NodeSend startup]",
-      {
-        version:
-          NODESEND_VERSION,
-
-        privateKeySource:
-          NODESEND_PRIVATE_KEY_B64
-            ? "base64"
-            : NODESEND_PRIVATE_KEY_PEM_RAW
-              ? "pem"
-              : "none",
-
-        encryptionConfigured:
-          isEncryptionConfigured(),
-
-        plaintextAIKeysAllowed:
-          ALLOW_PLAINTEXT_AI_KEYS
-      }
-    );
+// /quota is a verified-service adapter, NOT a made-up credit counter.
+// Both GET and POST are supported; client-supplied provider credentials are
+// neither required nor forwarded. Every lookup is fresh, without a cache.
+async function quotaHandler(req, res) {
+  const requestId = requestIdentity(req, res);
+  if (!NODESEND_QUOTA_URL) {
+    return res.status(503).json({
+      success: false, available: false, code: "QUOTA_SERVICE_UNAVAILABLE",
+      error: "An authoritative quota service is not configured", requestId
+    });
   }
-);
+  let quotaUrl;
+  try {
+    quotaUrl = new URL(NODESEND_QUOTA_URL);
+    if (quotaUrl.protocol !== "https:" || quotaUrl.username || quotaUrl.password || quotaUrl.hash) {
+      throw new Error("Invalid quota URL");
+    }
+  } catch {
+    return res.status(503).json({ success: false, available: false,
+      code: "QUOTA_SERVICE_UNAVAILABLE", requestId });
+  }
+  const started = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), QUOTA_TIMEOUT_MS);
+  timer.unref?.();
+  const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+  res.once("close", disconnect);
+  try {
+    const headers = { Accept: "application/json" };
+    if (NODESEND_QUOTA_BEARER_TOKEN) {
+      headers.Authorization = `Bearer ${NODESEND_QUOTA_BEARER_TOKEN}`;
+    }
+    const upstream = await fetch(quotaUrl.href, { method: "GET", headers, signal: controller.signal });
+    if (!upstream.ok) throw new Error("Quota service returned a non-success response");
+    const data = await upstream.json();
+    if (!data || typeof data !== "object" ||
+        typeof data.available !== "boolean" ||
+        (data.remaining !== undefined && (!Number.isFinite(data.remaining) || data.remaining < 0)) ||
+        (data.limit !== undefined && (!Number.isFinite(data.limit) || data.limit < 0))) {
+      throw new Error("Quota response does not meet contract");
+    }
+    if (data.available === false || data.remaining === 0) {
+      res.setHeader("Server-Timing", timeHeader({ relayTotalMs: performance.now() - started }));
+      return res.status(429).json({
+        success: false, available: false, code: "QUOTA_EXHAUSTED", requestId,
+        ...(Number.isFinite(data.remaining) ? { remaining: data.remaining } : {}),
+        ...(typeof data.resetAt === "string" ? { resetAt: data.resetAt } : {})
+      });
+    }
+    if (data.remaining === undefined) {
+      // A mere 'available' boolean alone is not enough to enforce a numerical
+      // limit for every app. Return the availability without inventing balance.
+      safeEvent("quota_available_without_balance", { requestId });
+    }
+    const result = {
+      success: true, available: true, source: "configured-authoritative-quota-service",
+      requestId,
+      ...(Number.isFinite(data.remaining) ? { remaining: data.remaining } : {}),
+      ...(Number.isFinite(data.limit) ? { limit: data.limit } : {}),
+      ...(typeof data.unit === "string" ? { unit: data.unit } : {}),
+      ...(typeof data.resetAt === "string" ? { resetAt: data.resetAt } : {}),
+      ...(typeof data.scope === "string" ? { scope: data.scope } : {})
+    };
+    res.setHeader("Server-Timing", timeHeader({ relayTotalMs: performance.now() - started }));
+    safeEvent("quota_checked", { requestId, available: true, elapsedMs: Math.round(performance.now() - started) });
+    return res.json(result);
+  } catch {
+    safeEvent("quota_unavailable", { requestId, elapsedMs: Math.round(performance.now() - started) });
+    if (res.destroyed) return;
+    return res.status(503).json({
+      success: false, available: false, code: "QUOTA_SERVICE_UNAVAILABLE",
+      error: "Quota could not be verified", requestId
+    });
+  } finally {
+    clearTimeout(timer);
+    res.off("close", disconnect);
+  }
+}
+
+app.get("/", (req, res) => res.json({
+  success: true, service: "NodeSend", version: NODESEND_VERSION,
+  endpoints: {
+    health: "GET /health", publicKey: "GET /crypto/public-key",
+    email: "POST /send", rocketchat: "POST /rocketchat",
+    aiModels: "POST /ai/models", aiTest: "POST /ai/test",
+    aiChat: "POST /ai/chat", quota: "GET|POST /quota"
+  }, providers: ["alibaba", "openai"]
+}));
+
+app.get("/health", (req, res) => res.json({
+  success: true, service: "NodeSend", version: NODESEND_VERSION,
+  status: "healthy", encryptionConfigured: isEncryptionConfigured(),
+  privateKeySource: PRIVATE_KEY_B64 ? "base64" : PRIVATE_KEY_PEM_RAW ? "pem" : "none",
+  plaintextAIKeysAllowed: ALLOW_PLAINTEXT_AI_KEYS,
+  rocketchatConfigured: Boolean(ROCKETCHAT_WEBHOOK_URL),
+  aiProxyConfigured: true, quotaConfigured: Boolean(NODESEND_QUOTA_URL),
+  providers: { alibaba: true, openai: true }
+}));
+
+// Public RSA key is intentionally accessible without the private x-api-key.
+app.get("/crypto/public-key", (req, res) => {
+  try {
+    const publicKey = crypto.createPublicKey(getNodeSendPrivateKey()).export({
+      type: "spki", format: "pem"
+    });
+    return res.json({
+      success: true, algorithm: "RSA-OAEP", hash: "SHA-256", encoding: "PEM-SPKI", publicKey
+    });
+  } catch {
+    return res.status(500).json({ success: false, error: "NodeSend encryption is not configured" });
+  }
+});
+
+// Existing SMTP contract preserved; AI-key encryption does not affect SMTP.
+app.post("/send", requireApiKey, async (req, res) => {
+  try {
+    const { config, email } = req.body || {};
+    if (!config || !email) {
+      return res.status(400).json({ success: false, error: "Both config and email are required" });
+    }
+    const host = String(config.host || "").trim();
+    const port = Number(config.port);
+    const username = String(config.username || "").trim();
+    const password = String(config.password || "");
+    const from = String(email.from || "").trim();
+    const to = email.to;
+    const subject = String(email.subject || "");
+    if (!host || !port || !username || !password) {
+      return res.status(400).json({ success: false,
+        error: "SMTP host, port, username and password are required" });
+    }
+    if (!from || !to || !subject) {
+      return res.status(400).json({ success: false, error: "Email from, to and subject are required" });
+    }
+    if (!email.text && !email.html) {
+      return res.status(400).json({ success: false, error: "Email text or html content is required" });
+    }
+    const transporter = nodemailer.createTransport({
+      host, port, secure: port === 465, auth: { user: username, pass: password }
+    });
+    await transporter.verify();
+    const sent = await transporter.sendMail({
+      from, to, cc: email.cc, bcc: email.bcc,
+      subject, text: email.text, html: email.html
+    });
+    return res.json({
+      success: true, messageId: sent.messageId,
+      accepted: sent.accepted, rejected: sent.rejected
+    });
+  } catch (error) {
+    // Existing SMTP response contract; do not log passwords/config/body.
+    console.error("[NodeSend] SMTP request failed", error?.name || "Error");
+    return res.status(500).json({ success: false, error: "Email could not be sent" });
+  }
+});
+
+app.post("/rocketchat", requireApiKey, async (req, res) => {
+  if (!ROCKETCHAT_WEBHOOK_URL) {
+    return res.status(500).json({ success: false,
+      error: "ROCKETCHAT_WEBHOOK_URL is not configured" });
+  }
+  const { text, channel, username, emoji, avatar, alias, attachments } = req.body || {};
+  if (!text) return res.status(400).json({ success: false, error: "text is required" });
+  const payload = { text };
+  for (const [key, value] of Object.entries({ channel, username, emoji, avatar, alias, attachments })) {
+    if (value) payload[key] = value;
+  }
+  try {
+    const upstream = await fetch(ROCKETCHAT_WEBHOOK_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const raw = await upstream.text();
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+    if (!upstream.ok) return res.status(upstream.status).json({
+      success: false, error: "Rocket.Chat rejected the request", details: parsed
+    });
+    return res.json({ success: true, rocketchat: parsed });
+  } catch {
+    return res.status(500).json({ success: false, error: "Rocket.Chat message could not be sent" });
+  }
+});
+
+app.post("/ai/models", requireApiKey, (req, res) => relayAI(req, res, "models"));
+app.post("/ai/test", requireApiKey, (req, res) => relayAI(req, res, "test"));
+app.post("/ai/chat", requireApiKey, (req, res) => relayAI(req, res, "chat"));
+app.get("/quota", requireApiKey, quotaHandler);
+app.post("/quota", requireApiKey, quotaHandler);
+
+app.use((req, res) => res.status(404).json({ success: false, error: "Endpoint not found" }));
+
+if (require.main === module) {
+  app.listen(PORT, "0.0.0.0", () => {
+    safeEvent("startup", {
+      version: NODESEND_VERSION, port: PORT,
+      encryptionConfigured: isEncryptionConfigured(),
+      privateKeySource: PRIVATE_KEY_B64 ? "base64" : PRIVATE_KEY_PEM_RAW ? "pem" : "none",
+      plaintextAIKeysAllowed: ALLOW_PLAINTEXT_AI_KEYS,
+      quotaConfigured: Boolean(NODESEND_QUOTA_URL)
+    });
+  });
+}
+
+// Exported to permit local mock-provider/disconnect tests without binding a port.
+module.exports = {
+  app, requestLifecycle, timeHeader, isAllowedAlibabaBaseUrl,
+  buildProviderBody, NODESEND_VERSION
+};
