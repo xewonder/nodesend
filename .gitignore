@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Local environment files (never commit secrets; keep the template available)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
