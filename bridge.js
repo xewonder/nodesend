@@ -13,15 +13,17 @@
  * GET|PUT /ai/quota/config) are authenticated by the caller's BridgeMind Bearer
  * session, validated server-side against the NCB proxy (/auth/get-session). The
  * identity used for quota comes from that validated session, NEVER from a
- * user_id in the request body or query string. The counter itself lives in a
- * dedicated PostgreSQL (quota_config, quota_user_override, quota_usage) that
- * only NodeSend can reach, reserved atomically BEFORE the provider is contacted
- * by a single INSERT ... ON CONFLICT ... DO UPDATE ... WHERE guard; a denial or
- * an unreachable quota store returns 429/503 and the provider is not called.
- * NCB is no longer consulted for any ai_quota_* table.
+ * user_id in the request body or query string. The counter lives in the NCB
+ * instance's own ai_quota_* tables (ai_quota_config, ai_quota_user_override,
+ * ai_quota_usage), reached through the same data API BridgeMind's client uses,
+ * with the caller's own session bearer. The counter is reserved BEFORE the
+ * provider is contacted; a denial or an unreachable quota store returns
+ * 429/503 and the provider is not called.
  *
- * The two authorities are deliberately separate: the NCB session proves WHO the
- * caller is, Postgres proves HOW MANY calls they have left.
+ * One authority, two jobs: the NCB session proves WHO the caller is and its
+ * ai_quota_* rows prove HOW MANY calls they have left. Because every quota read
+ * and write is made as the caller with the caller's token, there is no second
+ * store and no service credential anywhere on this path.
  *
  * GET|PUT /ai/quota/config additionally require the validated session's admin
  * role; an ordinary user gets 403 and no database detail is ever returned.
@@ -54,7 +56,7 @@ const PORT = Number(process.env.PORT || 3001);
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || "";
 const ROCKETCHAT_WEBHOOK_URL = process.env.ROCKETCHAT_WEBHOOK_URL || "";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
-const NODESEND_VERSION = "bridge-postgres-quota-v5";
+const NODESEND_VERSION = "bridge-ncb-quota-v6";
 const ALLOW_PLAINTEXT_AI_KEYS =
   String(process.env.ALLOW_PLAINTEXT_AI_KEYS || "false").toLowerCase() === "true";
 
@@ -77,27 +79,12 @@ const PRIVATE_KEY_PEM_RAW = String(process.env.NODESEND_PRIVATE_KEY_PEM || "").t
 // BridgeMind session authority. AI endpoints are authenticated by the caller's
 // BridgeMind Bearer session, validated here against NCB — never by a shared
 // browser-visible key. These default to the same proxy/instance BridgeMind uses.
+// NCB is also the per-user quota store: the same two values address it, so the
+// quota path adds no configuration and no credential of its own.
 const NCB_PROXY_BASE = String(process.env.NCB_PROXY_BASE ||
   "https://rmvzorxcl35mttidiexhtp5g2m0hpsqo.lambda-url.us-east-2.on.aws").trim();
 const NCB_INSTANCE = String(process.env.NCB_INSTANCE || "55954_bridgemind").trim();
 const NCB_TIMEOUT_MS = boundedInt(process.env.NODESEND_NCB_TIMEOUT_MS, 8000, 500, 30000);
-
-// Authoritative per-user quota storage. NCB proves WHO the caller is; this
-// Postgres proves HOW MANY calls they have left, and is reachable only from
-// NodeSend — that separation is what makes the quota unforgable. Either name is
-// accepted; the quota-specific one wins. Never expose either as a VITE_* value.
-const QUOTA_DATABASE_URL = String(
-  process.env.BRIDGEMIND_QUOTA_DATABASE_URL || process.env.DATABASE_URL || ""
-).trim();
-const QUOTA_DB_TIMEOUT_MS = boundedInt(
-  process.env.NODESEND_QUOTA_DB_TIMEOUT_MS, 5000, 250, 30000
-);
-const QUOTA_DB_POOL_MAX = boundedInt(
-  process.env.NODESEND_QUOTA_DB_POOL_MAX, 5, 1, 50
-);
-const QUOTA_DB_RETRY_BACKOFF_MS = boundedInt(
-  process.env.NODESEND_QUOTA_DB_RETRY_BACKOFF_MS, 5000, 250, 60000
-);
 
 const ALIBABA_ALLOWED_HOSTS = String(process.env.ALIBABA_ALLOWED_HOSTS || "")
   .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -462,7 +449,7 @@ async function relayAI(req, res, operation) {
     let resolvedApiKey = null;
     if (operation === "chat") {
       resolvedApiKey = resolveProviderApiKey(config);
-      reservation = await reserveAiCall(req.bridgeUser?.id);
+      reservation = await reserveAiCall(req);
       if (!reservation.allowed) {
         const status = reservation.reason === "quota_service_unavailable" ? 503 : 429;
         safeEvent("quota_denied", {
@@ -528,152 +515,151 @@ async function relayAI(req, res, operation) {
   }
 }
 
-// ── BRIDGEMIND PER-USER MONTHLY QUOTA (Postgres-authoritative) ─────────────
-// Identity comes from the validated NCB session; the counter comes from a
-// Postgres that only NodeSend can reach, so neither half can be forged by the
-// caller. Semantics carried over from BridgeMind: calendar-month UTC period
-// key, per-user override > global default, quota disabled = unlimited, and
-// fail CLOSED whenever the authoritative store cannot be read or written.
+// ── BRIDGEMIND PER-USER MONTHLY QUOTA (NCB-authoritative) ──────────────
+// Identity and the counter come from the same place: the caller's validated NCB
+// session proves WHO they are, and the NCB instance's own ai_quota_* rows prove
+// HOW MANY calls they have left. Every quota read and write is made as the
+// caller, with the caller's session bearer, so there is no second database and
+// no service credential to leak. The user id is always `req.bridgeUser.id` from
+// /auth/get-session — never a user_id in the request body or query string.
 //
-// There is no in-process mutex and no read-check-write any more. The increment
-// and the limit test happen inside one UPSERT, under the lock Postgres takes on
-// the row matched by the ON CONFLICT arbiter, so two NodeSend replicas cannot
-// both push a user past a limit.
+// The three tables already exist in NCB and were deliberately kept through the
+// historical-game reset. NodeSend issues no DDL of any kind: nothing here
+// creates, alters, drops or truncates a table or an index.
+//
+// Semantics preserved: calendar-month UTC period key, per-user override >
+// global default, quota disabled = unlimited, and fail CLOSED whenever the
+// authoritative state is missing, ambiguous, out of range or unreadable.
 const QUOTA_MIN_CALL_LIMIT = 1;
 const QUOTA_MAX_CALL_LIMIT = 100000;
 
-// Idempotent and non-destructive: nothing here drops, truncates, deletes or
-// recreates a table, so running the relay against live quota data is a no-op
-// after the first time. The config row is seeded, never overwritten.
-const QUOTA_SCHEMA_SQL = [
-  `CREATE TABLE IF NOT EXISTS quota_config (
-     id integer PRIMARY KEY CHECK (id = 1),
-     quota_enabled boolean NOT NULL DEFAULT true,
-     default_call_limit integer NOT NULL DEFAULT 100
-       CHECK (default_call_limit BETWEEN 1 AND ${QUOTA_MAX_CALL_LIMIT}),
-     period_type text NOT NULL DEFAULT 'monthly' CHECK (period_type = 'monthly'),
-     updated_at timestamptz NOT NULL DEFAULT now()
-   )`,
-  `CREATE TABLE IF NOT EXISTS quota_user_override (
-     user_id text PRIMARY KEY CHECK (user_id <> ''),
-     enabled boolean NOT NULL DEFAULT true,
-     call_limit integer NOT NULL CHECK (call_limit BETWEEN 1 AND ${QUOTA_MAX_CALL_LIMIT}),
-     updated_at timestamptz NOT NULL DEFAULT now()
-   )`,
-  `CREATE TABLE IF NOT EXISTS quota_usage (
-     id bigserial PRIMARY KEY,
-     user_id text NOT NULL CHECK (user_id <> ''),
-     period_key text NOT NULL CHECK (period_key ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-     calls_used integer NOT NULL DEFAULT 0 CHECK (calls_used >= 0),
-     applied_limit integer NOT NULL CHECK (applied_limit BETWEEN 1 AND ${QUOTA_MAX_CALL_LIMIT}),
-     updated_at timestamptz NOT NULL DEFAULT now()
-   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS quota_usage_user_period_uk
-     ON quota_usage (user_id, period_key)`,
-  `INSERT INTO quota_config (id, quota_enabled, default_call_limit, period_type, updated_at)
-     VALUES (1, true, 100, 'monthly', now())
-     ON CONFLICT (id) DO NOTHING`
-];
+// The API name of each table is what the /data/ route accepts. Note that NCB's
+// physical storage name may carry an instance suffix (the provider-credentials
+// table's API name literally does), so these strings are route segments only —
+// they are never used as SQL identifiers anywhere in this file.
+const AI_QUOTA_CONFIG_TABLE = "ai_quota_config";
+const AI_QUOTA_OVERRIDE_TABLE = "ai_quota_user_override";
+const AI_QUOTA_USAGE_TABLE = "ai_quota_usage";
 
-// The whole reservation is this one statement. `q` is the existing row and
-// `EXCLUDED` the proposed one, so the guard is evaluated against the value the
-// increment would produce, under the row lock. Zero rows back means the guard
-// rejected it: the allowance is spent.
-const RESERVE_QUOTA_SQL = `
-  INSERT INTO quota_usage AS q (user_id, period_key, calls_used, applied_limit, updated_at)
-  VALUES ($1::text, $2::text, 1, $3::integer, now())
-  ON CONFLICT (user_id, period_key) DO UPDATE
-    SET calls_used = q.calls_used + 1,
-        applied_limit = EXCLUDED.applied_limit,
-        updated_at = now()
-    WHERE q.calls_used < EXCLUDED.applied_limit
-  RETURNING q.calls_used AS calls_used, q.applied_limit AS applied_limit`;
+// ── NCB DATA API ───────────────────────────────────────────────────────
+// Not invented: this is the surface BridgeMind's own client uses today
+// (src/api.js `dataFetch`, server/quotaService.js, server/index.js
+// `PUT /api/ai/quota/config`). The operation is the first segment after
+// `/data/`, the table the second. Filters are plain equality query-string
+// column names — the only operators anywhere in the app are `col[gte]` and
+// `col[lte]`, and nothing else is expressible. A row is addressed by id in the
+// URL for update/delete; `/data/read/{table}/{id}` is recorded by the app itself
+// as answering HTTP 500, so a single row comes from a filtered list read, which
+// is what `fetchRecordedHandById` does too. Create and update bodies are FLAT
+// top-level column maps with no envelope. Reads answer
+// `{status:"success", data:[…]}`; an empty result is HTTP 200 with no rows, and
+// no caller anywhere distinguishes a 404 from an empty list.
+//
+// There is no atomic primitive on this surface: no `$inc`, no upsert, no
+// ON CONFLICT analogue, no transaction, no batch, no row version and no
+// conditional write. That is a measured absence, not an assumption — see the
+// concurrency note above `withUserQuotaLock`.
 
-const READ_QUOTA_USAGE_SQL =
-  "SELECT calls_used FROM quota_usage WHERE user_id = $1::text AND period_key = $2::text";
+// The only thing ever reported about the store is this label — no host, no
+// table listing, no NCB error text. "pending" until the first quota round trip
+// answers, because a quota call is only ever made as a signed-in caller: there
+// is no boot-time probe, and inventing one would mean a credential this
+// architecture deliberately does not have.
+let quotaStorageStatus = ncbQuotaConfigured() ? "pending" : "unconfigured";
 
-// One round trip for the read surface: the config singleton, this user's
-// override and this period's counter. A missing usage row is zero usage, not a
-// missing user. The user id always comes from the validated session.
-const READ_QUOTA_STATE_SQL = `
-  SELECT c.quota_enabled, c.default_call_limit, c.period_type,
-         o.enabled AS override_enabled, o.call_limit AS override_call_limit,
-         u.calls_used AS calls_used
-    FROM quota_config c
-    LEFT JOIN quota_user_override o ON o.user_id = $1::text
-    LEFT JOIN quota_usage u ON u.user_id = $1::text AND u.period_key = $2::text
-   WHERE c.id = 1`;
-
-const READ_QUOTA_CONFIG_SQL =
-  "SELECT quota_enabled, default_call_limit, period_type, updated_at FROM quota_config WHERE id = 1";
-
-const WRITE_QUOTA_CONFIG_SQL = `
-  UPDATE quota_config
-     SET quota_enabled = COALESCE($1::boolean, quota_enabled),
-         default_call_limit = COALESCE($2::integer, default_call_limit),
-         updated_at = now()
-   WHERE id = 1
-  RETURNING quota_enabled, default_call_limit, period_type, updated_at`;
-
-let quotaPool = null;
-let quotaBootstrap = null;
-let quotaLastFailureAt = 0;
-// The only thing ever reported about the store is this label. The connection
-// string, its host, its user and its database name never leave the process.
-let quotaStorageStatus = QUOTA_DATABASE_URL ? "pending" : "unconfigured";
-
-function quotaStorageState() {
-  return { configured: Boolean(QUOTA_DATABASE_URL), status: quotaStorageStatus };
+function ncbQuotaConfigured() {
+  return Boolean(NCB_PROXY_BASE && NCB_INSTANCE);
 }
 
-// Lazily connects and applies the schema once. A store that cannot be reached
-// yields null, which every quota caller fails closed on; a backoff keeps an
-// outage from turning each AI request into a fresh DDL round trip.
-async function ensureQuotaPool() {
-  if (quotaStorageStatus === "ready") return quotaPool;
-  if (!QUOTA_DATABASE_URL) {
-    quotaStorageStatus = "unconfigured";
-    return null;
+function markQuotaReachable() {
+  if (ncbQuotaConfigured()) quotaStorageStatus = "ready";
+}
+
+// "invalid" and "unreachable" both mean every quota surface fails closed; the
+// distinction is for the operator only, so an outage is not mistaken for a
+// corrupted row and vice versa.
+function markQuotaFailure(kind) {
+  quotaStorageStatus = kind === "invalid" ? "invalid" : "unreachable";
+}
+
+function quotaStorageState() {
+  return { configured: ncbQuotaConfigured(), status: quotaStorageStatus };
+}
+
+// A read that answers anything other than a row list is an unreadable store, not
+// an empty one. `data: null` is the app's own spelling for "no rows"
+// (quotaService.js tests `!body?.data?.length`), so it is empty, not invalid.
+function ncbRowList(body) {
+  if (!body || typeof body !== "object" || !("data" in body)) return null;
+  const data = body.data;
+  if (data === null || data === undefined) return [];
+  if (Array.isArray(data)) return data.filter((row) => row && typeof row === "object");
+  return typeof data === "object" ? [data] : null;
+}
+
+async function ncbDataRead(req, table, filters = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
   }
-  if (quotaStorageStatus === "driver_missing") return null;
-  if (quotaStorageStatus === "unreachable" &&
-      Date.now() - quotaLastFailureAt < QUOTA_DB_RETRY_BACKOFF_MS) {
-    return null;
+  const query = params.toString();
+  const path = `/data/read/${encodeURIComponent(table)}${query ? `?${query}` : ""}`;
+  let response;
+  try {
+    response = await ncbRequest(req, path);
+  } catch {
+    markQuotaFailure("transport");
+    return { ok: false, reason: "transport" };
   }
-  if (!quotaPool) {
-    let pg;
-    try { pg = require("pg"); }
-    catch {
-      quotaStorageStatus = "driver_missing";
-      return null;
-    }
-    quotaPool = new pg.Pool({
-      connectionString: QUOTA_DATABASE_URL,
-      max: QUOTA_DB_POOL_MAX,
-      connectionTimeoutMillis: QUOTA_DB_TIMEOUT_MS,
-      idleTimeoutMillis: 30000,
-      statement_timeout: QUOTA_DB_TIMEOUT_MS
-    });
-    // A backend that dies and comes back must not poison the relay for good.
-    quotaPool.on("error", () => {
-      quotaStorageStatus = "unreachable";
-      quotaLastFailureAt = Date.now();
-      quotaBootstrap = null;
-    });
+  if (!response.ok) {
+    markQuotaFailure("http");
+    return { ok: false, reason: `http_${Number(response.status) || 0}` };
   }
-  if (!quotaBootstrap) {
-    quotaBootstrap = (async () => {
-      for (const statement of QUOTA_SCHEMA_SQL) await quotaPool.query(statement);
-      quotaStorageStatus = "ready";
-      return quotaPool;
-    })().catch(() => {
-      quotaStorageStatus = "unreachable";
-      quotaLastFailureAt = Date.now();
-      quotaBootstrap = null;
-      return null;
-    });
+  const body = await response.json().catch(() => null);
+  if (body && typeof body === "object" && body.status === "error") {
+    markQuotaFailure("rejected");
+    return { ok: false, reason: "rejected" };
   }
-  return quotaBootstrap;
+  const rows = ncbRowList(body);
+  if (!rows) {
+    markQuotaFailure("invalid");
+    return { ok: false, reason: "envelope" };
+  }
+  markQuotaReachable();
+  return { ok: true, rows };
+}
+
+async function ncbDataWrite(req, path, values, method) {
+  let response;
+  try {
+    response = await ncbRequest(req, path, { method, body: JSON.stringify(values) });
+  } catch {
+    markQuotaFailure("transport");
+    return { ok: false, reason: "transport" };
+  }
+  if (!response.ok) {
+    markQuotaFailure("http");
+    return { ok: false, reason: `http_${Number(response.status) || 0}` };
+  }
+  // A 200 whose body says `status:"error"` is a rejected write. Counting it as a
+  // spend would charge the user for a call that did not happen; ignoring it would
+  // let the counter run ahead of the truth in the other direction.
+  const body = await response.json().catch(() => null);
+  if (body && typeof body === "object" && body.status === "error") {
+    markQuotaFailure("rejected");
+    return { ok: false, reason: "rejected" };
+  }
+  markQuotaReachable();
+  return { ok: true };
+}
+
+function ncbDataCreate(req, table, values) {
+  return ncbDataWrite(req, `/data/create/${encodeURIComponent(table)}`, values, "POST");
+}
+
+function ncbDataUpdate(req, table, id, values) {
+  return ncbDataWrite(req,
+    `/data/update/${encodeURIComponent(table)}/${encodeURIComponent(id)}`, values, "PUT");
 }
 
 function getCurrentPeriodKey(now = new Date()) {
@@ -688,8 +674,8 @@ function getNextResetAt(periodKey) {
 }
 
 // The effective allowance for one user: an enabled per-user override beats the
-// global default. Kept separate from the SQL so the precedence rule is testable
-// without a database.
+// global default. Kept as a pure function of the row pair so the precedence rule
+// is testable without any store at all.
 function resolveQuotaLimit(row) {
   const defaultLimit = Number(row.default_call_limit);
   if (row.override_enabled === true && Number.isSafeInteger(Number(row.override_call_limit))) {
@@ -704,6 +690,174 @@ function resolveQuotaLimit(row) {
 function isSensibleQuotaLimit(limit) {
   return Number.isSafeInteger(limit) &&
     limit >= QUOTA_MIN_CALL_LIMIT && limit <= QUOTA_MAX_CALL_LIMIT;
+}
+
+// NCB's flag columns are 0/1 integers, not booleans — the app's own reader does
+// `Number(row.quota_enabled ?? 1)` and `Number(row.enabled) === 1` — but a MySQL
+// driver can hand back a real boolean too. Both spellings are accepted here so
+// the store's response format is never a reason to misread an allowance; the
+// caller supplies the fallback for a value that is neither. The safe fallback for
+// `quota_enabled` is true: enabled means ENFORCED, so an unreadable flag cannot
+// turn into unlimited calls.
+function ncbFlag(value, fallback) {
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === 0 || value === "1" || value === "0") return Number(value) === 1;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return fallback;
+}
+
+function ncbInt(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// NCB DATETIME columns reject the ISO form with 'Z' and milliseconds — recorded
+// in the app as an HTTP 500 "Error creating record." on a sibling table — so
+// timestamps go out as 'YYYY-MM-DD HH:MM:SS' in UTC, the same conversion the
+// app's own writers use.
+function ncbDateTime(date = new Date()) {
+  return date.toISOString().replace("T", " ").slice(0, 19);
+}
+
+// The quota counter for one user, read as it actually is rather than as it was
+// configured to be. Three independent filtered reads go out in parallel because
+// the data API has no join and no batch endpoint.
+//
+// Every row the store hands back is re-checked against the session identity this
+// request is about: an equality filter is never assumed to have been applied,
+// because enforcing against another user's counter — or writing to another
+// user's row — is worse than a 503.
+async function readNcbQuotaState(req, userId, periodKey) {
+  if (!userId || !periodKey) return { ok: false, reason: "auth_required" };
+  const ownedBy = (rows) => rows.filter((row) => String(row.user_id ?? "") === String(userId));
+
+  const [config, override, usage] = await Promise.all([
+    ncbDataRead(req, AI_QUOTA_CONFIG_TABLE, {}),
+    ncbDataRead(req, AI_QUOTA_OVERRIDE_TABLE, { user_id: userId }),
+    ncbDataRead(req, AI_QUOTA_USAGE_TABLE, { user_id: userId, period_key: periodKey })
+  ]);
+  for (const part of [config, override, usage]) {
+    if (!part.ok) return { ok: false, reason: part.reason };
+  }
+
+  // The config singleton is enforced against, never invented: no row means there
+  // is nothing to hold the user to, and fabricating a default would hand out
+  // unbounded usage the moment the table is cleared. Two rows means two
+  // conflicting allowances, so neither can be trusted.
+  if (config.rows.length !== 1) {
+    return { ok: false, reason: config.rows.length ? "config_ambiguous" : "config_missing" };
+  }
+  const configRow = config.rows[0];
+  if (String(configRow.period_type || "monthly").trim().toLowerCase() !== "monthly") {
+    // Only the calendar-month period is implemented. Counting a week's usage
+    // against a month's reset would over-grant, so an unexpected period is an
+    // invalid state, not a hint to guess.
+    return { ok: false, reason: "period_type_unsupported" };
+  }
+  const defaultCallLimit = ncbInt(configRow.default_call_limit);
+  if (defaultCallLimit === null) return { ok: false, reason: "config_limit_missing" };
+
+  const overrideRow = ownedBy(override.rows)[0] || null;
+  if (ownedBy(override.rows).length > 1) return { ok: false, reason: "override_ambiguous" };
+  const overrideEnabled = overrideRow ? ncbFlag(overrideRow.enabled, false) : false;
+  const overrideCallLimit = overrideRow ? ncbInt(overrideRow.call_limit) : null;
+  if (overrideEnabled && overrideCallLimit === null) {
+    // An enabled override whose limit cannot be read is not a licence to fall
+    // back to the (possibly larger) default.
+    return { ok: false, reason: "override_limit_missing" };
+  }
+
+  const usageRows = ownedBy(usage.rows).filter(
+    (row) => String(row.period_key ?? "") === String(periodKey)
+  );
+  if (usageRows.length > 1) return { ok: false, reason: "usage_ambiguous" };
+  const usageRow = usageRows[0] || null;
+  // A missing usage row is zero usage, not a missing user. A present row whose
+  // counter is not a non-negative integer is a broken counter, and is not coerced.
+  const callsUsed = usageRow ? ncbInt(usageRow.calls_used ?? 0) : 0;
+  if (callsUsed === null || callsUsed < 0) return { ok: false, reason: "usage_counter_invalid" };
+
+  return {
+    ok: true,
+    configId: configRow.id,
+    quotaEnabled: ncbFlag(configRow.quota_enabled, true),
+    defaultCallLimit,
+    periodType: "monthly",
+    overrideEnabled,
+    overrideCallLimit,
+    usageId: usageRow ? usageRow.id : null,
+    callsUsed
+  };
+}
+
+function quotaDisabledSummary(periodKey) {
+  return {
+    enabled: false, unlimited: true, period: periodKey,
+    used: 0, limit: null, remaining: null, percentage: 0,
+    resetAt: getNextResetAt(periodKey)
+  };
+}
+
+function quotaExhaustedSummary(periodKey, used, limit) {
+  return {
+    ...buildQuotaSummary(periodKey, Math.min(used, limit), limit),
+    percentage: 100
+  };
+}
+
+// CONCURRENCY — the honest statement of what this can and cannot guarantee.
+//
+// The retired Postgres path reserved with one atomic UPSERT: the increment and
+// the `calls_used < applied_limit` test happened inside a single statement, under
+// the row lock, so no number of replicas could push a user past a limit. NCB
+// offers nothing equivalent. Its data API is read / create / update / delete over
+// HTTP with equality filters and no envelope; there is no increment operator, no
+// upsert, no ON CONFLICT analogue, no transaction, no batch, no row version, no
+// ETag and no conditional write. That was established by reading every call site
+// in BridgeMind's own client, not assumed.
+//
+// So the reservation is a read-check-write, and the safest thing available is to
+// make it ONE critical section per user for the lifetime of this NodeSend
+// process. Requests from the same session are then serialised end to end: two
+// racing calls cannot both observe used=4 against a limit of 5.
+//
+// What that does NOT cover, and cannot without a primitive NCB does not have:
+//   - More than one NodeSend replica. Each replica holds its own locks, so two
+//     replicas serving one user can both pass the check and both write, and the
+//     counter can land below the number of calls actually granted.
+//   - A `create` racing a `create`: the tables carry no unique constraint that
+//     HTTP can rely on, so two rows for one (user, period) are possible. The
+//     next read sees the ambiguity and fails closed with 503 rather than picking
+//     a winner, which turns the race into a visible outage instead of a silent
+//     miscount.
+//   - The store itself: NCB does not verify that the `user_id` being written
+//     matches the session making the write (recorded in the app as
+//     "client_verified_session, NOT server-enforced billing-grade ownership").
+//     NodeSend always stamps `req.bridgeUser.id` and re-checks every row it reads
+//     against it, but a caller who talks to NCB directly with their own token is
+//     outside this relay's reach. Per-user quota here is enforced honestly, not
+//     cryptographically.
+// Deployment assumption: a single NodeSend process. If that changes, the counter
+// needs a store with a real atomic primitive, not a bigger lock.
+const quotaUserLocks = new Map();
+
+function withUserQuotaLock(userId, task) {
+  const key = String(userId);
+  const previous = quotaUserLocks.get(key) || Promise.resolve();
+  // The chain stores only a never-rejecting promise, so one failed reservation
+  // cannot poison every later request from the same user.
+  const run = previous.then(task, task);
+  const settled = run.then(() => undefined, () => undefined);
+  quotaUserLocks.set(key, settled);
+  settled.then(() => {
+    if (quotaUserLocks.get(key) === settled) quotaUserLocks.delete(key);
+  });
+  return run;
 }
 
 function buildQuotaSummary(periodKey, used, limit) {
@@ -724,106 +878,95 @@ function unavailableQuotaSummary(periodKey) {
 }
 
 // Called BEFORE provider dispatch. A denial must never reach the provider.
-// Two statements: one to read the allowance this user is held to, one atomic
-// UPSERT that both increments and enforces it. Only the second one is allowed to
-// change the counter, and it re-tests the limit under the row lock, so the
-// counter can never pass the limit no matter how many replicas are racing.
-async function reserveAiCall(userId) {
+// The whole reservation — read the allowance, test it, increment it — runs inside
+// one per-user critical section, because NCB cannot do it in one statement. See
+// the concurrency note above withUserQuotaLock for exactly what that guarantees
+// and what it does not.
+async function reserveAiCall(req) {
+  const userId = req.bridgeUser?.id;
   if (!userId) return { allowed: false, reason: "auth_required", quota: null };
+  return withUserQuotaLock(userId, () => reserveQuotaLocked(req, userId, getCurrentPeriodKey()));
+}
 
-  const pool = await ensureQuotaPool();
-  if (!pool) return { allowed: false, reason: "quota_service_unavailable", quota: null };
-
-  const periodKey = getCurrentPeriodKey();
-  let state;
-  try {
-    const result = await pool.query(READ_QUOTA_STATE_SQL, [userId, periodKey]);
-    // No row means the config singleton is gone: nothing to enforce against, so
-    // nothing is allowed. Fabricating a default would be unbounded usage.
-    state = result.rows[0] || null;
-  } catch {
+async function reserveQuotaLocked(req, userId, periodKey) {
+  const state = await readNcbQuotaState(req, userId, periodKey);
+  if (!state.ok) {
+    // The reason is a stable code, never an NCB body or message.
+    safeEvent("quota_state_unavailable", { userId, reason: state.reason });
     return { allowed: false, reason: "quota_service_unavailable", quota: null };
   }
-  if (!state) return { allowed: false, reason: "quota_service_unavailable", quota: null };
 
-  if (state.quota_enabled !== true) {
+  // Quota disabled is unlimited and spends nothing: no write is attempted, so a
+  // disabled quota cannot grow a usage row or overwrite one.
+  if (!state.quotaEnabled) {
+    return { allowed: true, reason: "quota_disabled", quota: quotaDisabledSummary(periodKey) };
+  }
+
+  const limit = resolveQuotaLimit({
+    default_call_limit: state.defaultCallLimit,
+    override_enabled: state.overrideEnabled,
+    override_call_limit: state.overrideCallLimit
+  });
+  if (!isSensibleQuotaLimit(limit)) {
+    safeEvent("quota_state_unavailable", { userId, reason: "limit_out_of_range" });
+    return { allowed: false, reason: "quota_service_unavailable", quota: null };
+  }
+
+  // Tested inside the lock against the value just read, which is the closest
+  // analogue the data API allows to the old UPSERT's WHERE guard.
+  if (state.callsUsed >= limit) {
     return {
-      allowed: true, reason: "quota_disabled",
-      quota: {
-        enabled: false, unlimited: true, period: periodKey,
-        used: 0, limit: null, remaining: null, percentage: 0,
-        resetAt: getNextResetAt(periodKey)
-      }
+      allowed: false, reason: "quota_exhausted",
+      quota: quotaExhaustedSummary(periodKey, state.callsUsed, limit)
     };
   }
 
-  const limit = resolveQuotaLimit(state);
-  if (!isSensibleQuotaLimit(limit)) {
-    return { allowed: false, reason: "quota_service_unavailable", quota: null };
-  }
-
-  try {
-    const reserved = await pool.query(RESERVE_QUOTA_SQL, [userId, periodKey, limit]);
-    if (reserved.rows.length) {
-      return {
-        allowed: true,
-        quota: buildQuotaSummary(periodKey, Number(reserved.rows[0].calls_used), limit)
-      };
-    }
-  } catch {
-    return { allowed: false, reason: "quota_service_unavailable", quota: null };
-  }
-
-  // The guard rejected the increment: the allowance was already spent. The
-  // follow-up read only makes the 429 payload more precise; if it fails too, the
-  // call is refused either way, at the limit the guard applied.
-  let used = limit;
-  try {
-    const current = await pool.query(READ_QUOTA_USAGE_SQL, [userId, periodKey]);
-    if (current.rows.length) used = Number(current.rows[0].calls_used);
-  } catch { /* exhaustion holds regardless of this read */ }
-  return {
-    allowed: false, reason: "quota_exhausted",
-    quota: {
-      ...buildQuotaSummary(periodKey, Math.min(used, limit), limit),
-      percentage: 100
-    }
+  const values = {
+    calls_used: state.callsUsed + 1,
+    applied_limit: limit,
+    updated_at: ncbDateTime()
   };
+  // A period's first call creates the row, so user_id and period_key go
+  // explicitly: omitting a NOT NULL column is a documented HTTP 500 on this API.
+  // The user id is always the validated session's — never a value from the request.
+  const written = state.usageId === null || state.usageId === undefined
+    ? await ncbDataCreate(req, AI_QUOTA_USAGE_TABLE, {
+      user_id: userId, period_key: periodKey, ...values
+    })
+    : await ncbDataUpdate(req, AI_QUOTA_USAGE_TABLE, state.usageId, values);
+  if (!written.ok) {
+    safeEvent("quota_reserve_failed", { userId, reason: written.reason });
+    return { allowed: false, reason: "quota_service_unavailable", quota: null };
+  }
+
+  return { allowed: true, quota: buildQuotaSummary(periodKey, state.callsUsed + 1, limit) };
 }
 
-// Read-only status for GET /ai/quota, always for the validated session's own
-// user id. Fails closed: an unreachable store is reported as unavailable with
-// nulls, never as a fabricated used=0 with a plausible limit.
-async function getQuotaStatus(userId) {
+// Read-only status for GET /ai/quota, always for the validated session's own user
+// id, and never a lock or a write. Fails closed: an unreadable or ambiguous store
+// is reported as unavailable with nulls, never as a fabricated used=0 with a
+// plausible limit.
+async function getQuotaStatus(req) {
+  const userId = req.bridgeUser?.id;
   if (!userId) return { enabled: false, unlimited: false, error: "auth_required" };
 
   const periodKey = getCurrentPeriodKey();
-  const pool = await ensureQuotaPool();
-  if (!pool) return unavailableQuotaSummary(periodKey);
+  const state = await readNcbQuotaState(req, userId, periodKey);
+  if (!state.ok) return unavailableQuotaSummary(periodKey);
 
-  let state;
-  try {
-    const result = await pool.query(READ_QUOTA_STATE_SQL, [userId, periodKey]);
-    state = result.rows[0] || null;
-  } catch {
-    return unavailableQuotaSummary(periodKey);
-  }
-  if (!state) return unavailableQuotaSummary(periodKey);
+  if (!state.quotaEnabled) return quotaDisabledSummary(periodKey);
 
-  if (state.quota_enabled !== true) {
-    return {
-      enabled: false, unlimited: true, period: periodKey, used: 0, limit: null,
-      remaining: null, percentage: 0, resetAt: getNextResetAt(periodKey)
-    };
-  }
-
-  const limit = resolveQuotaLimit(state);
+  const limit = resolveQuotaLimit({
+    default_call_limit: state.defaultCallLimit,
+    override_enabled: state.overrideEnabled,
+    override_call_limit: state.overrideCallLimit
+  });
   if (!isSensibleQuotaLimit(limit)) return unavailableQuotaSummary(periodKey);
 
-  return buildQuotaSummary(periodKey, Number(state.calls_used ?? 0), limit);
+  return buildQuotaSummary(periodKey, state.callsUsed, limit);
 }
 
-// ── ADMIN QUOTA CONFIG (Postgres-authoritative, admin-role gated) ───────────
+// ── ADMIN QUOTA CONFIG (NCB-authoritative, admin-role gated) ────────────
 // The role comes from the validated session only. Both spellings the app's own
 // isAdministrator() accepts are honoured, so a user the admin UI shows as an
 // administrator is never locked out of the panel by the relay.
@@ -863,20 +1006,40 @@ function normalizeQuotaLimit(value) {
   return isSensibleQuotaLimit(limit) ? limit : undefined;
 }
 
+// The stored flag is a 0/1 integer; the response contract the admin UI already
+// consumes is a JSON boolean. The conversion happens here and nowhere else, so
+// neither the caller's spelling nor the column's ever leaks into a comparison.
 function serializeQuotaConfig(row) {
-  const updatedAt = row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at ?? "");
   return {
-    quota_enabled: row.quota_enabled === true,
+    quota_enabled: ncbFlag(row.quota_enabled, true),
     default_call_limit: Number(row.default_call_limit),
     period_type: String(row.period_type || "monthly"),
-    updated_at: updatedAt
+    // NCB hands a DATETIME column back as a string already; nothing is re-based
+    // onto a timezone the store never claimed.
+    updated_at: String(row.updated_at ?? "")
   };
 }
 
-// A quota store that cannot be reached is an outage, and the admin has to see
-// that as one. No host, user, database name or driver message is ever returned.
-function quotaConfigUnavailable(res, requestId) {
-  safeEvent("quota_config_unavailable", { requestId });
+// The config singleton, read through the data API. `reason` is always a stable
+// code: the store's own body, status text and table layout never travel with it.
+async function readNcbQuotaConfig(req) {
+  const read = await ncbDataRead(req, AI_QUOTA_CONFIG_TABLE, {});
+  if (!read.ok) return { ok: false, reason: read.reason };
+  if (read.rows.length === 0) return { ok: false, reason: "config_missing" };
+  if (read.rows.length > 1) return { ok: false, reason: "config_ambiguous" };
+  const row = read.rows[0];
+  const limit = ncbInt(row.default_call_limit);
+  if (limit === null || !isSensibleQuotaLimit(limit)) {
+    return { ok: false, reason: "config_limit_invalid" };
+  }
+  return { ok: true, row };
+}
+
+// A quota store that cannot be reached, or that answers with something unusable,
+// is an outage — and the admin has to see it as one rather than as a config with
+// blank fields. The reason is logged as a code and never returned.
+function quotaConfigUnavailable(res, requestId, reason) {
+  safeEvent("quota_config_unavailable", { requestId, reason: String(reason || "unknown") });
   return res.status(503).json({
     success: false, status: "quota_service_unavailable",
     error: "Quota configuration unavailable", requestId
@@ -885,15 +1048,9 @@ function quotaConfigUnavailable(res, requestId) {
 
 async function readQuotaConfigHandler(req, res) {
   const requestId = requestIdentity(req, res);
-  try {
-    const pool = await ensureQuotaPool();
-    if (!pool) return quotaConfigUnavailable(res, requestId);
-    const result = await pool.query(READ_QUOTA_CONFIG_SQL);
-    if (!result.rows.length) return quotaConfigUnavailable(res, requestId);
-    return res.json({ success: true, ...serializeQuotaConfig(result.rows[0]), requestId });
-  } catch {
-    return quotaConfigUnavailable(res, requestId);
-  }
+  const config = await readNcbQuotaConfig(req);
+  if (!config.ok) return quotaConfigUnavailable(res, requestId, config.reason);
+  return res.json({ success: true, ...serializeQuotaConfig(config.row), requestId });
 }
 
 async function writeQuotaConfigHandler(req, res) {
@@ -924,22 +1081,54 @@ async function writeQuotaConfigHandler(req, res) {
     });
   }
 
-  try {
-    const pool = await ensureQuotaPool();
-    if (!pool) return quotaConfigUnavailable(res, requestId);
-    const result = await pool.query(WRITE_QUOTA_CONFIG_SQL, [quotaEnabled, defaultLimit]);
-    if (!result.rows.length) return quotaConfigUnavailable(res, requestId);
-    const saved = serializeQuotaConfig(result.rows[0]);
-    // Identity and the two scalar values only — never the SQL, the row id or
-    // anything that describes the store.
-    safeEvent("quota_config_updated", {
-      requestId, userId: req.bridgeUser.id,
-      quota_enabled: saved.quota_enabled, default_call_limit: saved.default_call_limit
+  const read = await ncbDataRead(req, AI_QUOTA_CONFIG_TABLE, {});
+  if (!read.ok) return quotaConfigUnavailable(res, requestId, read.reason);
+  if (read.rows.length > 1) return quotaConfigUnavailable(res, requestId, "config_ambiguous");
+  const existing = read.rows[0] || null;
+
+  // The data API has no COALESCE-style partial update, so "not sent" is honoured
+  // by merging the unset half from the row just read — never by defaulting it.
+  // With no row to merge into, a partial PUT could only be answered by inventing
+  // an allowance, so it is refused instead of guessed at.
+  const enabled = quotaEnabled !== null ? quotaEnabled : ncbFlag(existing?.quota_enabled, null);
+  const limit = defaultLimit !== null ? defaultLimit : ncbInt(existing?.default_call_limit);
+  if (enabled === null || enabled === undefined || limit === null || !isSensibleQuotaLimit(limit)) {
+    safeEvent("quota_config_incomplete", { requestId, userId: req.bridgeUser.id });
+    return res.status(400).json({
+      success: false, status: "quota_config_missing",
+      error: "There is no quota configuration row to update; send both quota_enabled and default_call_limit",
+      requestId
     });
-    return res.json({ success: true, saved: true, ...saved, requestId });
-  } catch {
-    return quotaConfigUnavailable(res, requestId);
   }
+
+  // 0/1 going back, because that is the column's type; period_type travels only
+  // on create, where omitting a NOT NULL column is a documented HTTP 500.
+  const payload = {
+    quota_enabled: enabled ? 1 : 0,
+    default_call_limit: limit,
+    updated_at: ncbDateTime()
+  };
+  const written = existing && existing.id !== undefined && existing.id !== null
+    ? await ncbDataUpdate(req, AI_QUOTA_CONFIG_TABLE, existing.id, payload)
+    : await ncbDataCreate(req, AI_QUOTA_CONFIG_TABLE, { ...payload, period_type: "monthly" });
+  if (!written.ok) return quotaConfigUnavailable(res, requestId, written.reason);
+
+  // The write is not believed until it reads back. NCB's create/update response is
+  // not a row, and `saved: true` for an update the store accepted and ignored
+  // would be exactly the failure this relay exists to prevent.
+  const verify = await readNcbQuotaConfig(req);
+  if (!verify.ok) {
+    safeEvent("quota_config_unverified", { requestId, reason: verify.reason });
+    return quotaConfigUnavailable(res, requestId, "write_unverified");
+  }
+  const saved = serializeQuotaConfig(verify.row);
+  // Identity and the two scalar values only — never the row id, the request path
+  // or anything else that describes the store.
+  safeEvent("quota_config_updated", {
+    requestId, userId: req.bridgeUser.id,
+    quota_enabled: saved.quota_enabled, default_call_limit: saved.default_call_limit
+  });
+  return res.json({ success: true, saved: true, ...saved, requestId });
 }
 
 // /quota is a verified-service adapter, NOT a made-up credit counter.
@@ -1037,7 +1226,7 @@ app.get("/", (req, res) => res.json({
   },
   auth: { ai: "BridgeMind Bearer session", aiQuotaConfig: "Bearer session + admin role", relay: "x-api-key" },
   trickster: { auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
-  quotaStorage: { authority: "postgres", tables: ["quota_config", "quota_user_override", "quota_usage"] },
+  quotaStorage: { authority: "ncb", tables: [AI_QUOTA_CONFIG_TABLE, AI_QUOTA_OVERRIDE_TABLE, AI_QUOTA_USAGE_TABLE] },
   providers: ["alibaba", "openai"]
 }));
 
@@ -1052,7 +1241,7 @@ app.get("/health", (req, res) => res.json({
   // never a key. The two upstream hosts are public by nature; the API key is
   // reported as configured/not configured and is never read out.
   trickster: { routes: 4, auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
-  quotaAuthority: "postgres", quotaStorage: quotaStorageState(),
+  quotaAuthority: "ncb", quotaStorage: quotaStorageState(),
   providers: { alibaba: true, openai: true }
 }));
 
@@ -1143,7 +1332,8 @@ app.post("/rocketchat", requireApiKey, async (req, res) => {
 
 // AI endpoints authenticate the BridgeMind Bearer session and enforce per-user
 // quota here, because a static frontend has no trusted server of its own. The
-// quota counter is Postgres-only: NCB supplies identity, never the number.
+// quota counter is the same NCB instance's ai_quota_* tables, reached as the
+// caller: one authority supplies both the identity and the number.
 // /send, /rocketchat and the generic /quota adapter keep requireApiKey: they are
 // server-to-server surfaces with no BridgeMind session behind them.
 app.post("/ai/models", requireBridgeSession, (req, res) => relayAI(req, res, "models"));
@@ -1152,7 +1342,7 @@ app.post("/ai/chat", requireBridgeSession, (req, res) => relayAI(req, res, "chat
 app.get("/ai/quota", requireBridgeSession, async (req, res) => {
   const requestId = requestIdentity(req, res);
   try {
-    const status = await getQuotaStatus(req.bridgeUser.id);
+    const status = await getQuotaStatus(req);
     if (status?.error === "quota_service_unavailable") {
       // Fail closed on the read surface too: an unverifiable quota is reported
       // as unavailable rather than as a clean 0 / limit.
@@ -1172,8 +1362,8 @@ app.get("/ai/quota", requireBridgeSession, async (req, res) => {
   }
 });
 // Admin quota configuration is a third surface: session-authenticated AND
-// role-gated, reading/writing only the config singleton in Postgres. An
-// ordinary user gets 403 before any query runs.
+// role-gated, reading and writing only the config row in the NCB instance. An
+// ordinary user gets 403 before any request runs.
 app.get("/ai/quota/config", requireBridgeSession, requireBridgeAdmin, readQuotaConfigHandler);
 app.put("/ai/quota/config", requireBridgeSession, requireBridgeAdmin, writeQuotaConfigHandler);
 app.get("/quota", requireApiKey, quotaHandler);
@@ -1364,30 +1554,29 @@ if (require.main === module) {
       privateKeySource: PRIVATE_KEY_B64 ? "base64" : PRIVATE_KEY_PEM_RAW ? "pem" : "none",
       plaintextAIKeysAllowed: ALLOW_PLAINTEXT_AI_KEYS,
       quotaConfigured: Boolean(NODESEND_QUOTA_URL),
-      quotaAuthority: "postgres", quotaStorage: quotaStorageState().status
+      quotaAuthority: "ncb", quotaStorage: quotaStorageState().status
     });
   });
-  // Warm the schema so the first AI call is not also the one that pays for the
-  // DDL round trips. Fail-soft: an unreachable store here must not stop the
-  // relay from serving /send, /rocketchat or the session-gated reads — those
-  // paths fail closed per request.
-  ensureQuotaPool().then((pool) => {
-    safeEvent("quota_storage_ready", { poolConfigured: Boolean(pool), status: quotaStorageStatus });
-  });
+  // No quota warm-up here, deliberately. Every ai_quota_* access is made as the
+  // caller with the caller's own session bearer, so at boot there is no identity
+  // to make one with — and a boot-time probe would require exactly the service
+  // credential this architecture refuses to have. The store's status therefore
+  // starts "pending" and becomes "ready" or "unreachable" on the first real
+  // quota request; every path fails closed until then.
 }
 
 // Exported to permit local mock-provider/disconnect tests without binding a port.
-// The SQL constants are exported so the real-database harness exercises the exact
-// statements this relay runs, instead of a copy that could drift from them.
+// The quota internals are exported so the harness can exercise the real read/write
+// predicates and the real concurrency queue instead of a copy of them.
 module.exports = {
   app, requestLifecycle, timeHeader, isAllowedAlibabaBaseUrl,
   buildProviderBody, NODESEND_VERSION,
-  QUOTA_SCHEMA_SQL, RESERVE_QUOTA_SQL, READ_QUOTA_STATE_SQL,
-  READ_QUOTA_USAGE_SQL, READ_QUOTA_CONFIG_SQL, WRITE_QUOTA_CONFIG_SQL,
+  AI_QUOTA_CONFIG_TABLE, AI_QUOTA_OVERRIDE_TABLE, AI_QUOTA_USAGE_TABLE,
+  ncbRowList, ncbFlag, ncbInt, ncbDateTime, getCurrentPeriodKey, getNextResetAt,
   // The Trickster gateway's own rules, exported so the harness can test the real
   // predicates instead of a copy of them. The routes themselves are exercised over
   // HTTP through `app`, which is what proves the session guard is attached.
   TRICKSTER_UPSTREAMS, TRICKSTER_RESPONSE_SHAPES, tricksterBaseUrl, tricksterTimeoutMs,
   tricksterUpstreamHeaders, tricksterSafeError, tricksterShapeOk, tricksterConfiguredState,
-  isBridgeAdminRole, resolveQuotaLimit, isSensibleQuotaLimit
+  isBridgeAdminRole, resolveQuotaLimit, isSensibleQuotaLimit, withUserQuotaLock
 };

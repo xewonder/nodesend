@@ -2,17 +2,16 @@
 //
 // Everything runs in-process against a loopback mock of the two upstream services,
 // with the BridgeMind session authority (NCB /auth/get-session) mocked through
-// global.fetch and `pg` stubbed: NO production endpoint is contacted, and no real
-// database is needed. The relay itself is the real exported `app`, served over HTTP,
-// so the routes, the session guard and the body forwarding are exercised exactly as
-// a browser would exercise them.
+// global.fetch: NO production endpoint is contacted, and no real store is needed.
+// The relay itself is the real exported `app`, served over HTTP, so the routes, the
+// session guard and the body forwarding are exercised exactly as a browser would
+// exercise them.
 //
 //   node verify-trickster-gateway.mjs
 import { createRequire } from 'node:module';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import Module from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -22,15 +21,9 @@ const SESSION_SECRET = 'ncb-session-lookup-must-never-appear-in-a-response';
 const UPSTREAM_SECRET = 'TRICKSTER-UPSTREAM-KEY-do-not-leak-8f21';
 const BID_DECOY = 'https://bid.example.invalid';
 
-// The relay needs no real pg here: quota paths are untouched by these routes, and
-// stubbing keeps the harness independent of node_modules.
-const originalLoad = Module._load;
-Module._load = function patchedLoad(request, ...rest) {
-  if (request === 'pg') {
-    return { Pool: class StubPool { async query() { throw new Error('pg is stubbed in this harness'); } end() {} } };
-  }
-  return originalLoad.call(this, request, ...rest);
-};
+// The four Trickster routes never touch the per-user quota store, so this harness
+// needs no store mock at all beyond the session lookup below. (It used to stub the
+// `pg` driver for the retired Postgres quota path; that dependency is gone.)
 
 process.env.BRIDGE_API_KEY = 'relay-key-not-used-by-trickster';
 process.env.NCB_PROXY_BASE = 'https://ncb.test.invalid';
@@ -380,11 +373,11 @@ check('12. existing AI, quota, session and relay behaviour is unchanged',
   && missing.status === 404 && missing.json?.error === 'Endpoint not found'
   && root.json?.endpoints?.aiChat === 'POST /ai/chat'
   && root.json?.auth?.ai === 'BridgeMind Bearer session'
-  && root.json?.quotaStorage?.authority === 'postgres'
-  && health.json?.quotaAuthority === 'postgres' && health.json?.status === 'healthy'
+  && root.json?.quotaStorage?.authority === 'ncb'
+  && health.json?.quotaAuthority === 'ncb' && health.json?.status === 'healthy'
   && root.json?.endpoints?.email === 'POST /send' && root.json?.endpoints?.quota === 'GET|POST /quota'
-  && bridge.NODESEND_VERSION === 'bridge-postgres-quota-v5'
-  && typeof bridge.resolveQuotaLimit === 'function' && typeof bridge.RESERVE_QUOTA_SQL === 'string'
+  && bridge.NODESEND_VERSION === 'bridge-ncb-quota-v6'
+  && typeof bridge.resolveQuotaLimit === 'function' && typeof bridge.withUserQuotaLock === 'function'
   && Object.keys(bridge.TRICKSTER_RESPONSE_SHAPES).join() === 'bid:health,play:health,bid:suggest,play:suggest'
   && !/requireApiKey[\s\S]{0,80}proxyTrickster/.test(sourceOfTruth)
   && (sourceOfTruth.match(/app\.(get|post)\("\/trickster\//g) || []).length === 6,
