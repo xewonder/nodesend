@@ -1,209 +1,285 @@
-// NodeSend session + external BridgeMind quota-decision verification harness.
+// NodeSend session + quota AUTHORITY verification harness.
 //
 //   node verify-session-quota.mjs
+//   node verify-session-quota.mjs --variant=process-only   (run by the parent, not by hand)
 //
-// Architecture under test: NodeSend validates the caller's BridgeMind bearer against
-// NCB /auth/get-session, then asks a BridgeMind-OWNED quota service for a decision
-// and relays it. NodeSend holds no quota data, so the mock of that service is a real
-// loopback HTTP server rather than a fetch stub: the adapter's URL building, header
-// forwarding, status mapping and body parsing are exercised over an actual socket,
-// the way they will run against production BridgeMind.
+// Architecture under test: NodeSend is the ONLY quota backend. It validates the caller's
+// BridgeMind bearer against NCB /auth/get-session and then decides quota ITSELF, reading
+// and writing the four ai_quota_* tables through the same NCB proxy with the same caller
+// bearer. There is no external quota service to talk to, so there is no external-service
+// mock here any more: the mock is of NCB, and it is a real loopback HTTP server rather than
+// a fetch stub, because the thing worth proving is what this process actually puts on the
+// wire — route, verb, filter, bearer, body — and a stub would only prove the stub.
 //
-// Nothing here contacts a real endpoint. global.fetch is replaced for the NCB session
-// authority and the AI provider, and every other URL that is not loopback is refused
-// outright, so an accidental call to a real host fails the run instead of making one.
+// The mock NCB behaves like the measured surface: { status: "success", data: [...],
+// metadata: {...} } envelopes, MySQL-ish string numbers and 0/1 flags, auto-increment ids,
+// and a UNIQUE(user_id, period_key, decision_key) index on the reservation table that
+// answers a duplicate create with 409. Fault knobs inject exactly the failures a real
+// storage can produce (a write that refuses, a duplicate singleton row, a malformed flag, a
+// service that never answers) so fail-closed behaviour is demonstrated rather than argued.
 //
-// Section 1 proves the fail-closed state that matters most: with BRIDGEMIND_QUOTA_URL
-// unset — which is the situation until BridgeMind publishes this endpoint — no quota
-// route guesses, no provider is reached, and every surface says unavailable.
+// Nothing here contacts a real endpoint. global.fetch is replaced for the AI provider and
+// every non-loopback URL that is not the mock is refused outright, so an accidental call to
+// a production host fails the run instead of making one.
+//
+// Section and check names carry the numbering of the refactor spec's required tests where a
+// check answers one of them, so the report can be read against the spec.
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const VARIANT = (process.argv.find((a) => a.startsWith('--variant=')) || '').split('=')[1] || 'durable';
+
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PRIV_B64 = Buffer.from(privateKey.export({ type: 'pkcs1', format: 'pem' })).toString('base64');
 const PROVIDER_SECRET = 'sk-REAL-PROVIDER-KEY-should-never-be-logged-9f3a';
-const NCB_BASE = 'https://ncb.test.invalid';
-const NCB_LAMBDA_HOST = 'rmvzorxcl35mttidiexhtp5g2m0hpsqo.lambda-url';
-// Something a quota service must never put in a decision, used to prove the relay
-// drops fields it was never told about instead of relaying them.
-const INTERNAL_BAIT = 'ai_quota_usage';
-const SERVICE_INTERNAL_TOKEN = 'BRIDGEMIND-SERVICE-SECRET-do-not-relay-4d1c';
-const enc = (s) => crypto.publicEncrypt({ key: publicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, Buffer.from(s)).toString('base64');
+const enc = (s) => crypto.publicEncrypt(
+  { key: publicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+  Buffer.from(s)).toString('base64');
 
 const USERS = {
   'tok-a': { id: 101, role: 'user' },
   'tok-b': { id: 202, role: 'user' },
-  'tok-d': { id: 203, role: 'user' },
+  'tok-c': { id: 204, role: 'user' },
   'tok-admin': { id: 900, role: 'administrator' }
 };
-const PERIOD = '2026-10';
-const RESET_AT = '2026-11-01T00:00:00.000Z';
-// Ordered trace of what the relay actually did, so "reserve happens before the
-// provider" is a measured sequence rather than an assumption.
-const events = [];
-// Every route the NCB mock was asked for, so "NCB is used for the session lookup
-// only" is settled by the traffic of this run rather than by a text search.
-const ncbRoutes = [];
-const world = { providerCalls: 0, providerAuthHeaders: [], seenAuthHeaders: [] };
+// Never hardcode a calendar month into a gate: it would pass today and expire silently.
+const PERIOD = new Date().toISOString().slice(0, 7);
+const RESET_AT = (() => {
+  const [y, m] = PERIOD.split('-').map(Number);
+  return new Date(Date.UTC(y, m, 1)).toISOString();
+})();
+const DEFAULT_LIMIT = 3;
 
-// ── the BridgeMind quota service, as a real HTTP server ───────────────────
-const service = {
-  mode: 'allow',
-  configMode: 'ok',
+// Strings that must never appear in a response body or a log line. Table names are not
+// secrets in themselves, but they are storage internals that the caller has no business
+// learning, and a leak of one is how a storage bug becomes a reconnaissance report.
+const LEAK_STRINGS = [...Object.keys(USERS), PROVIDER_SECRET, 'PRIVATE KEY', 'server-only-bridge-key'];
+const STORAGE_STRINGS = ['ai_quota_config', 'ai_quota_user_override', 'ai_quota_usage', 'ai_quota_reservation'];
+
+// ── the quota store: a real loopback NCB proxy mock ────────────────────────
+const ncb = {
   requests: [],
-  counters: { reserve: 0, status: 0, config: 0 },
-  used: 0
+  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [] },
+  nextId: { ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1 },
+  // One fault at a time: mixing them makes a red check ambiguous about which fired.
+  fault: null,
+  faultHits: {},
+  // Number of upcoming reservation reads that answer "no rows" even though rows exist.
+  // This is how a lost race is simulated: our read committed before the other writer's.
+  hideReservationReads: 0,
+  counts: {}
 };
-const summaryFor = (allowed, extra = {}) => ({
-  allowed, enabled: true, unlimited: false, period: PERIOD,
-  used: service.used, limit: 3, remaining: Math.max(0, 3 - service.used),
-  percentage: Math.round((service.used / 3) * 100), resetAt: RESET_AT, ...extra
-});
+const events = [];
+const world = { providerCalls: 0, providerRequests: [], outboundUrls: [] };
 
-const quotaService = http.createServer((req, res) => {
+const ncbServer = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (chunk) => { raw += chunk; });
   req.on('end', () => {
+    const url = new URL(req.url, 'http://ncb.mock');
+    const pathname = url.pathname;
+    const query = Object.fromEntries(url.searchParams.entries());
+    const auth = String(req.headers.authorization || '');
+    const table = pathname.split('/')[3] || null;
+    const rowId = pathname.split('/')[4] || null;
     let body = null;
-    try { body = raw ? JSON.parse(raw) : null; } catch { body = raw === '' ? null : raw; }
-    const url = req.url;
-    const route = url.replace(/^\//, '');
-    service.requests.push({
-      method: req.method, url, route, body, raw,
-      auth: req.headers.authorization ?? null,
-      apiKey: req.headers['x-api-key'] ?? null,
-      contentType: req.headers['content-type'] ?? null
-    });
-    service.counters[route] = (service.counters[route] || 0) + 1;
-    events.push(route);
+    try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
+    ncb.requests.push({ method: req.method, pathname, table, rowId, query, raw, body, auth, contentType: req.headers['content-type'] || null });
     const send = (status, payload, type = 'application/json') => {
       res.writeHead(status, { 'content-type': type });
       res.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
     };
-    // One table of answers shared by /reserve and /status, so a mode means the same
-    // thing on both surfaces and no branch can quietly disagree with the other.
-    // `status` is the HTTP answer, `body` the payload, `hang` never answers.
-    const answers = {
-      allow: () => ({ status: 200, body: summaryFor(true) }),
-      unlimited: () => ({ status: 200, body: { allowed: true, enabled: false, unlimited: true, used: 0, limit: null, remaining: null, percentage: 0 } }),
-      bare: () => ({ status: 200, body: { allowed: true } }),
-      exhausted: () => ({ status: 200, body: summaryFor(false, { reason: 'quota_exhausted', used: 3, remaining: 0, percentage: 100 }) }),
-      silent429: () => ({ status: 429, body: { allowed: false } }),
-      outageCode: () => ({ status: 200, body: { allowed: false, reason: 'quota_service_unavailable' } }),
-      http500: () => ({ status: 500, body: { message: `database exploded on ${INTERNAL_BAIT} token=${SERVICE_INTERNAL_TOKEN}` } }),
-      html: () => ({ status: 200, body: '<!DOCTYPE html><html><body>quota error</body></html>', type: 'text/html' }),
-      noAllowed: () => ({ status: 200, body: {} }),
-      allowedString: () => ({ status: 200, body: { allowed: 'true' } }),
-      array: () => ({ status: 200, body: [{ allowed: true }] }),
-      // The adversarial pair: a denial STATUS whose body claims permission. Neither
-      // is a decision, and a relay that trusted the body over the status would hand
-      // out a provider call on the strength of an error page.
-      spoofedAllow403: () => ({ status: 403, body: { allowed: true, used: 0, limit: 999, remaining: 999 } }),
-      spoofedAllow500: () => ({ status: 500, body: { allowed: true, used: 0, limit: 999, remaining: 999 } }),
-      // Everything the allowlist must drop: a table name, SQL, a row id, a service
-      // secret and a DSN, riding alongside a valid decision.
-      internals: () => ({ status: 200, body: {
-        allowed: true, enabled: true, unlimited: false, used: 1, limit: 3, remaining: 2,
-        percentage: 33, period: PERIOD, resetAt: RESET_AT,
-        table: INTERNAL_BAIT, sql: `SELECT * FROM ${INTERNAL_BAIT}`, row_id: 4211,
-        service_token: SERVICE_INTERNAL_TOKEN, dsn: 'postgres://svc:pw@db.internal:5432/x', nested: { a: 1 }
-      } }),
-      hang: () => ({ hang: true })
-    };
-    // A granted reservation IS a spend, so the counter moves before the summary is
-    // built: the answer has to report the call it just granted, as the real service
-    // would. Getting this order wrong would make the relay look like it reported a
-    // stale count, so it is stated here rather than left to be inferred.
-    if (route === 'reserve' && service.mode === 'allow') service.used += 1;
-    const answer = (answers[service.mode] || answers.allow)();
-    if (route === 'reserve' || route === 'status') {
-      if (answer.hang) return; // never answers: the relay's timeout must fire
-      return send(answer.status, answer.body, answer.type || 'application/json');
+    const ok = (rows) => send(200, { status: 'success', data: rows, metadata: { page: 1, limit: 10, hasMore: false, hasPrev: false } });
+    const fail = (status, message) => send(status, { status: 'error', message });
+    ncb.faultHits[ncb.fault || 'none'] = (ncb.faultHits[ncb.fault || 'none'] || 0) + 1;
+
+    if (pathname === '/auth/get-session') {
+      events.push('session');
+      if (ncb.fault === 'session_hang') return;
+      // The session envelope is NOT the same shape as a data envelope: /auth/get-session
+      // answers { status:"success", data:{ user:{...} } }, while /data/read answers
+      // data:[rows]. Getting this backwards makes every call 401 and the whole gate blind,
+      // which is exactly what happened on the first run of this harness.
+      const user = USERS[auth.replace('Bearer ', '')];
+      return user ? send(200, { status: 'success', data: { user } }) : fail(401, 'invalid session');
     }
-    if (route === 'config') {
-      service.configHits = (service.configHits || 0) + 1;
-      if (service.configMode === 'forbidden') return send(403, { success: false, error: 'Admin access required' });
-      if (service.configMode === 'reject400') return send(400, { success: false, error: `default_call_limit must be between 1 and 100000 on ${INTERNAL_BAIT}` });
-      if (service.configMode === 'http500') return send(500, { message: `config write failed on ${INTERNAL_BAIT}` });
-      if (service.configMode === 'html') return send(200, '<!DOCTYPE html><html>config</html>', 'text/html');
-      if (service.configMode === 'nullObject') return send(200, 'null');
-      if (req.method === 'PUT' && service.configMode === 'ok' && body && typeof body === 'object') {
-        service.config = { ...(service.config || {}), ...body };
+    if (!pathname.startsWith('/data/')) return fail(404, 'no such route');
+    if (ncb.fault === 'data_hang') return; // never answers: the NCB timeout must fire
+    if (ncb.fault === 'data_html') return send(200, '<!DOCTYPE html><html><body>storage</body></html>', 'text/html');
+    if (ncb.fault === 'data_status_error' && pathname.startsWith('/data/read')) {
+      return send(200, { status: 'error', data: [], message: 'replica lag' });
+    }
+
+    if (pathname.startsWith('/data/read/')) {
+      if (!ncb.rows[table]) return fail(404, `unknown table ${table}`);
+      ncb.counts.read = (ncb.counts.read || 0) + 1;
+      events.push(`read:${table}`);
+      if (table === 'ai_quota_reservation' && ncb.hideReservationReads > 0) {
+        ncb.hideReservationReads -= 1;
+        return ok([]);
       }
-      return send(200, { success: true, quota_enabled: true, default_call_limit: 100, period_type: 'monthly', updated_at: '2026-10-03 10:00:00' });
+      let rows = ncb.rows[table].filter((row) => Object.entries(query).every(([key, value]) =>
+        key === 'Instance' || String(row[key]) === String(value)));
+      if (ncb.fault === 'usage_duplicate' && table === 'ai_quota_usage') {
+        rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
+      }
+      if (ncb.fault === 'usage_malformed' && table === 'ai_quota_usage') rows = rows.map((r) => ({ ...r, calls_used: 'many' }));
+      if (ncb.fault === 'usage_unaddressable' && table === 'ai_quota_usage') rows = rows.map(({ id, ...rest }) => rest);
+      if (ncb.fault === 'config_missing' && table === 'ai_quota_config') rows = [];
+      if (ncb.fault === 'config_duplicate' && table === 'ai_quota_config') {
+        rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
+      }
+      if (ncb.fault === 'config_malformed_flag' && table === 'ai_quota_config') rows = rows.map((r) => ({ ...r, quota_enabled: 'yes' }));
+      if (ncb.fault === 'config_malformed_limit' && table === 'ai_quota_config') rows = rows.map((r) => ({ ...r, default_call_limit: -3 }));
+      if (ncb.fault === 'config_unsupported_period' && table === 'ai_quota_config') rows = rows.map((r) => ({ ...r, period_type: 'weekly' }));
+      if (ncb.fault === 'override_duplicate' && table === 'ai_quota_user_override') {
+        rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
+      }
+      if (ncb.fault === 'override_malformed' && table === 'ai_quota_user_override') rows = rows.map((r) => ({ ...r, enabled: null }));
+      return ok(rows);
     }
-    events.push(`unexpected-route:${route}`);
-    return send(404, { error: 'no such quota route' });
+
+    if (pathname.startsWith('/data/create/')) {
+      if (!ncb.rows[table]) return fail(404, `unknown table ${table}`);
+      if (ncb.fault === 'create_usage_fail' && table === 'ai_quota_usage') return fail(500, 'write rejected');
+      if (ncb.fault === 'create_reservation_fail' && table === 'ai_quota_reservation') return fail(500, 'write rejected');
+      if (table === 'ai_quota_reservation') {
+        const clash = ncb.rows.ai_quota_reservation.some((r) => r.user_id === body.user_id
+          && r.period_key === body.period_key && r.decision_key === body.decision_key);
+        // The UNIQUE index: a duplicate claim is refused, and the row that won exists.
+        if (clash) return fail(409, 'duplicate key on uk_reservation');
+      }
+      const row = { id: ncb.nextId[table]++, ...body };
+      ncb.rows[table].push(row);
+      ncb.counts.create = (ncb.counts.create || 0) + 1;
+      events.push(`create:${table}`);
+      return send(200, { status: 'success', data: [row] });
+    }
+
+    if (pathname.startsWith('/data/update/')) {
+      const rows = ncb.rows[table];
+      if (!rows) return fail(404, `unknown table ${table}`);
+      if (ncb.fault === 'update_usage_fail' && table === 'ai_quota_usage') return fail(500, 'write rejected');
+      if (ncb.fault === 'update_config_fail' && table === 'ai_quota_config') return fail(500, 'write rejected');
+      const target = rows.find((r) => String(r.id) === String(rowId));
+      if (!target) return fail(404, 'no such row');
+      // config_no_persist: the write is ACKNOWLEDGED and then dropped. The only defence
+      // against it is the read-back after the update, which is exactly what this proves.
+      if (ncb.fault !== 'config_no_persist') Object.assign(target, body);
+      ncb.counts.update = (ncb.counts.update || 0) + 1;
+      events.push(`update:${table}`);
+      return send(200, { status: 'success', data: [target] });
+    }
+
+    if (pathname.startsWith('/data/delete/')) {
+      if (ncb.fault === 'delete_reservation_fail' && table === 'ai_quota_reservation') return fail(500, 'delete rejected');
+      const before = ncb.rows[table]?.length ?? 0;
+      ncb.rows[table] = (ncb.rows[table] || []).filter((r) => String(r.id) !== String(rowId));
+      // Nothing removed is a 404 from a real store, and the release path has to be able to
+      // tell "already gone" from "the delete did not work" — so the mock must not flatter it.
+      if ((ncb.rows[table]?.length ?? 0) === before) return fail(404, 'no such row');
+      ncb.counts.delete = (ncb.counts.delete || 0) + 1;
+      events.push(`delete:${table}`);
+      return send(200, { status: 'success', data: [] });
+    }
+    return fail(404, 'no such data route');
   });
 });
-await new Promise((resolve) => quotaService.listen(0, '127.0.0.1', resolve));
-const QUOTA_SERVICE_BASE = `http://127.0.0.1:${quotaService.address().port}`;
+await new Promise((resolve) => ncbServer.listen(0, '127.0.0.1', resolve));
+const NCB_BASE = `http://127.0.0.1:${ncbServer.address().port}`;
 
-// ── mocked NCB session authority and mocked provider ───────────────────────
+// ── store helpers ──────────────────────────────────────────────────────────
+const sqlDate = (d = new Date()) => d.toISOString().replace('T', ' ').slice(0, 19);
+const seed = () => {
+  ncb.rows.ai_quota_config = [{
+    id: ncb.nextId.ai_quota_config++, quota_enabled: 1, default_call_limit: DEFAULT_LIMIT,
+    period_type: 'monthly', updated_at: sqlDate()
+  }];
+  ncb.rows.ai_quota_user_override = [];
+  ncb.rows.ai_quota_usage = [];
+  ncb.rows.ai_quota_reservation = [];
+  ncb.fault = null;
+  ncb.faultHits = {};
+  ncb.hideReservationReads = 0;
+  ncb.requests.length = 0;
+  ncb.counts = {};
+  events.length = 0;
+  mod.resetQuotaProcessLedger();
+};
+const usageRow = (userId) => ncb.rows.ai_quota_usage.find((r) => String(r.user_id) === String(userId) && r.period_key === PERIOD);
+const setUsage = (userId, callsUsed, appliedLimit = DEFAULT_LIMIT) => {
+  const existing = usageRow(userId);
+  if (existing) existing.calls_used = callsUsed;
+  else ncb.rows.ai_quota_usage.push({
+    id: ncb.nextId.ai_quota_usage++, user_id: userId, period_key: PERIOD,
+    calls_used: callsUsed, applied_limit: appliedLimit, created_at: sqlDate(), updated_at: sqlDate()
+  });
+  return existing || usageRow(userId);
+};
+const claim = (userId, decisionKey) => ncb.rows.ai_quota_reservation.find((r) => String(r.user_id) === String(userId) && r.decision_key === decisionKey);
+const dataCalls = () => ncb.requests.filter((q) => q.pathname.startsWith('/data/'));
+
+// ── mocked provider, and a refusal of anything else that is not loopback ────
+const realFetch = globalThis.fetch;
+global.fetch = async (url, opts = {}) => {
+  const u = String(url);
+  // Recorded for the "which machines did this run actually talk to" check: a second quota
+  // backend cannot be added to the source without showing up here as an unexpected host.
+  world.outboundUrls.push(u);
+  if (u.includes('dashscope.aliyuncs.com') || u.includes('api.openai.com')) {
+    world.providerCalls++;
+    events.push('provider');
+    const headers = opts.headers || {};
+    const providerAuth = String(headers.Authorization || headers.authorization || '');
+    let sentBody = null;
+    try { sentBody = JSON.parse(opts.body); } catch { sentBody = opts.body; }
+    world.providerRequests.push({ url: u, auth: providerAuth, body: sentBody, raw: String(opts.body || ''), headers });
+    return new Response(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'P7N' } }],
+      usage: { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (u.startsWith('http://127.0.0.1:') || u.startsWith('http://localhost:')) return realFetch(u, opts);
+  throw new Error(`harness refused an unexpected outbound request to ${u}`);
+};
+
+// Logs are captured so "a decision key never reaches a log line" is an observation about
+// this run rather than a reading of the source. realLog survives for the report itself.
 const logs = [];
 const realLog = console.log.bind(console);
 for (const m of ['log', 'info', 'warn', 'error']) {
   console[m] = (...a) => { logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
 }
 
-const realFetch = globalThis.fetch;
-global.fetch = async (url, opts = {}) => {
-  const u = String(url);
-  if (u.startsWith(NCB_BASE) || u.includes(NCB_LAMBDA_HOST)) {
-    const route = new URL(u).pathname;
-    ncbRoutes.push(route);
-    const auth = String(opts.headers?.Authorization || '');
-    world.seenAuthHeaders.push(auth);
-    const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
-    if (route === '/auth/get-session') {
-      events.push('session');
-      const user = USERS[auth.replace('Bearer ', '')];
-      return user ? json({ status: 'success', data: { user } }) : json({ status: 'error' }, 401);
-    }
-    // Any other NCB route means this relay went back to reading tables directly.
-    events.push(`ncb-data:${route}`);
-    return json({ status: 'error', error: 'NCB data API must not be used by NodeSend' }, 500);
-  }
-  if (u.includes('dashscope.aliyuncs.com')) {
-    world.providerCalls++;
-    events.push('provider');
-    const providerAuth = String(opts.headers?.Authorization || '');
-    world.providerAuthHeaders.push(providerAuth);
-    world.seenAuthHeaders.push(providerAuth);
-    return new Response(JSON.stringify({
-      choices: [{ message: { role: 'assistant', content: 'P7N' } }],
-      usage: { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  }
-  if (u.startsWith('http://127.0.0.1:') || u.startsWith('http://localhost:')) {
-    // The relay itself, and the BridgeMind quota service, over real sockets.
-    return realFetch(u, opts);
-  }
-  throw new Error(`harness refused an unexpected outbound request to ${u}`);
-};
-
 process.env.NODESEND_PRIVATE_KEY_B64 = PRIV_B64;
 process.env.BRIDGE_API_KEY = 'server-only-bridge-key';
 process.env.NCB_PROXY_BASE = NCB_BASE;
 process.env.NCB_INSTANCE = '55954_bridgemind';
-// Low enough that the 'hang' mode proves a timeout, high enough to be a real bound.
-process.env.NODESEND_QUOTA_TIMEOUT_MS = '500';
-// Deliberately NOT set yet: section 1 measures the unconfigured state.
+// Low enough that data_hang proves a timeout, high enough to be a real bound.
+process.env.NODESEND_NCB_TIMEOUT_MS = '600';
+process.env.TRICKSTER_BID_URL = 'http://127.0.0.1:1';
+process.env.TRICKSTER_PLAY_URL = 'http://127.0.0.1:1';
+// The retired external quota service: deliberately never set, in EITHER variant. If any
+// remaining code path read it, the unconfigured state would answer 503 and the charging
+// checks below would go red — which is the point.
 delete process.env.BRIDGEMIND_QUOTA_URL;
-process.env.PORT = '3999';
+if (VARIANT === 'process-only') process.env.AI_QUOTA_RESERVATION_TABLE = '';
+const CHAT_PORT = VARIANT === 'process-only' ? 4111 : 4110;
+process.env.PORT = String(CHAT_PORT);
 
-const mod = await import(pathToFileURL(path.join(ROOT, 'bridge.js')).href);
+const mod = await import(pathToFileURL(path.join(ROOT, 'bridge.js')).href + `?variant=${VARIANT}`);
 const { app, NODESEND_VERSION } = mod;
+await new Promise((r) => app.listen(CHAT_PORT, '127.0.0.1', r));
+const B = `http://127.0.0.1:${CHAT_PORT}`;
 const bodyOf = async (res) => { try { return await res.json(); } catch { return {}; } };
-await new Promise((r) => app.listen(3999, '127.0.0.1', r));
-const B = 'http://127.0.0.1:3999';
-const CHAT = (tok, extra = {}) => ({
+const CHAT = (tok, extra = {}, headers = {}) => ({
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+  headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}), ...headers },
   body: JSON.stringify({
     provider: 'alibaba',
     config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', encryptedApiKey: enc(PROVIDER_SECRET) },
@@ -212,193 +288,881 @@ const CHAT = (tok, extra = {}) => ({
     ...extra
   })
 });
+const AUTH = (tok) => ({ headers: { Authorization: `Bearer ${tok}` } });
+const PUTJSON = (tok, obj, raw) => ({
+  method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+  body: raw ?? JSON.stringify(obj)
+});
+const KEY = (k) => ({ 'x-ai-decision-key': k });
 
 const results = [];
-const check = (name, pass, detail = '') => { results.push({ name, pass: !!pass, detail: String(detail).slice(0, 240) }); };
-const AUTH = (tok) => ({ headers: { Authorization: `Bearer ${tok}` } });
-const PUTJSON = (tok, obj) => ({ method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` }, body: JSON.stringify(obj) });
+const check = (name, pass, detail = '') => {
+  results.push({ name, pass: !!pass, detail: String(typeof pass === 'object' ? JSON.stringify(pass) : detail).slice(0, 240) });
+};
 let r, j, pc;
 
-// ── 1. unconfigured is fail-closed, not a guess ────────────────────────────
-// This is the state production is in until BridgeMind publishes the endpoint.
-r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
-j = await bodyOf(r);
-check('no BRIDGEMIND_QUOTA_URL: /ai/chat -> 503, provider untouched', r.status === 503 && j.status === 'quota_service_unavailable' && world.providerCalls === 0, `status=${r.status} providerCalls=${world.providerCalls}`);
-r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
-j = await bodyOf(r);
-check('no BRIDGEMIND_QUOTA_URL: GET /ai/quota -> 503 with nulls', r.status === 503 && j.used === null && j.limit === null && j.remaining === null && j.percentage === null, JSON.stringify({ s: r.status, u: j.used }));
-check('an unconfigured quota never invents a period or reset date', !('period' in j) && !('resetAt' in j), Object.keys(j).join(','));
-r = await fetch(`${B}/ai/quota/config`, AUTH('tok-admin'));
-check('no BRIDGEMIND_QUOTA_URL: admin GET config -> 503', r.status === 503, `status=${r.status}`);
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 5 }));
-check('no BRIDGEMIND_QUOTA_URL: admin PUT config -> 503, no saved:true', r.status === 503, `status=${r.status}`);
-const h0 = await bodyOf(await fetch(`${B}/health`));
-check('health reports bridgemind authority, unconfigured service', h0.quotaAuthority === 'bridgemind' && h0.quotaServiceConfigured === false && h0.quotaServiceStatus === 'unconfigured' && h0.quotaStorage === undefined, JSON.stringify({ a: h0.quotaAuthority, c: h0.quotaServiceConfigured, s: h0.quotaServiceStatus }));
-check('the quota service received no request at all while unconfigured', service.requests.length === 0 && events.filter((e) => e === 'reserve' || e === 'status' || e === 'config').length === 0, events.join(','));
+// ── 1. the authority's own reported state ──────────────────────────────────
+seed();
+check('T-A version declares NodeSend as the quota authority at v9',
+  NODESEND_VERSION === 'bridge-nodesend-quota-v9', NODESEND_VERSION);
+check('the ledger mode matches the configuration',
+  VARIANT === 'process-only' ? mod.QUOTA_IDEMPOTENCY_MODE === 'process-only' && mod.quotaLedgerDurable === false
+    : mod.QUOTA_IDEMPOTENCY_MODE === 'durable' && mod.quotaLedgerDurable === true,
+  `${mod.QUOTA_IDEMPOTENCY_MODE} / durable=${mod.quotaLedgerDurable}`);
+const rootInfo = await bodyOf(await fetch(`${B}/`));
+check('T25 root reports authority nodesend, storage ncb, the single-replica invariant',
+  rootInfo.quota?.authority === 'nodesend' && rootInfo.quota?.storage === 'ncb'
+  && rootInfo.quota?.replicas === 'exactly-one-quota-service-replica'
+  && rootInfo.quota?.note === 'multi-replica quota counting unsupported'
+  && rootInfo.quota?.idempotency === (VARIANT === 'process-only' ? 'process-only' : 'durable'),
+  JSON.stringify(rootInfo.quota));
+const health0 = await bodyOf(await fetch(`${B}/health`));
+check('T25 health says nodesend/ncb in the flat fields an operator greps for',
+  health0.quotaAuthority === 'nodesend' && health0.quotaStorage === 'ncb'
+  && health0.quotaIdempotency === (VARIANT === 'process-only' ? 'process-only' : 'durable')
+  && health0.quotaReplicas === 'exactly-one-quota-service-replica'
+  && health0.quotaMultiReplica === 'unsupported' && health0.status === 'healthy',
+  JSON.stringify({ a: health0.quotaAuthority, s: health0.quotaStorage, i: health0.quotaIdempotency }));
+// The Trickster block legitimately echoes its own upstream hosts (public by nature), which
+// on this harness is a loopback decoy — so the check names the thing it actually cares
+// about: no quota table and no storage endpoint on a route anyone can call.
+check('the public routes name no quota table and no storage endpoint',
+  !JSON.stringify(rootInfo).includes('ai_quota') && !JSON.stringify(health0).includes('ai_quota')
+  && !JSON.stringify(health0).includes(NCB_BASE) && !JSON.stringify(rootInfo).includes(NCB_BASE),
+  Object.keys(rootInfo).join(','));
+check('T24 the retired remote-adapter surface is gone from the module',
+  mod.bridgemindQuotaEndpoint === undefined && mod.bridgemindQuotaConfigured === undefined
+  && mod.quotaServiceState === undefined && mod.sanitizeQuotaDecision === undefined
+  && mod.isQuotaCount === undefined && mod.QUOTA_PUBLIC_FIELDS === undefined
+  && mod.QUOTA_RESERVE_ROUTE === undefined && mod.QUOTA_STATUS_ROUTE === undefined
+  && mod.QUOTA_CONFIG_ROUTE === undefined,
+  Object.keys(mod).filter((k) => /bridgemind|sanitizeQuota|isQuotaCount|QUOTA_PUBLIC|_ROUTE/.test(k)).join(','));
 
-// ── 2. the session is still the identity authority ─────────────────────────
-process.env.BRIDGEMIND_QUOTA_URL = QUOTA_SERVICE_BASE;
+if (VARIANT === 'process-only') {
+  // ── the fallback branch: same decisions, weaker durability, said out loud ──
+  check('P1 process-only mode still deduplicates within the process', await (async () => {
+    setUsage('101', 0);
+    const first = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('proc-key-1')));
+    const second = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('proc-key-1')));
+    const used = usageRow('101')?.calls_used;
+    return first.status === 200 && second.status === 200 && used === 1 && mod.quotaProcessLedgerSize() === 1;
+  })(), `used=${usageRow('101')?.calls_used} ledgerSize=${mod.quotaProcessLedgerSize()}`);
+  check('P2 process-only mode writes no reservation rows',
+    ncb.rows.ai_quota_reservation.length === 0 && !dataCalls().some((q) => q.table === 'ai_quota_reservation'),
+    dataCalls().map((q) => `${q.method} ${q.pathname}`).join(' | '));
+  check('P3 the process ledger is bounded, so a long-lived relay cannot grow without limit',
+    await (async () => {
+      mod.resetQuotaProcessLedger();
+      // Past the cap: the oldest entry is evicted, so the map size stops at the limit while
+      // the newest key is still deduplicated. An unbounded Map here is a memory leak that
+      // only shows up after a month of traffic, which is exactly when nobody is looking.
+      const keys = [];
+      for (let i = 0; i < mod.QUOTA_PROCESS_LEDGER_LIMIT + 50; i++) keys.push(`k-${i}`);
+      for (const key of keys) await mod.claimReservation({}, '101', PERIOD, key);
+      const sizeAfter = mod.quotaProcessLedgerSize();
+      const newestStillKnown = (await mod.findReservation({}, '101', PERIOD, keys[keys.length - 1])).found === true;
+      const oldestEvicted = (await mod.findReservation({}, '101', PERIOD, keys[0])).found === false;
+      return sizeAfter === mod.QUOTA_PROCESS_LEDGER_LIMIT && newestStillKnown && oldestEvicted;
+    })(), `size=${mod.quotaProcessLedgerSize()} limit=${mod.QUOTA_PROCESS_LEDGER_LIMIT}`);
+  check('P4 a restart of the process forgets the keys, which is the documented gap',
+    (() => {
+      mod.resetQuotaProcessLedger();
+      return mod.quotaProcessLedgerSize() === 0;
+    })(), `size=${mod.quotaProcessLedgerSize()}`);
+  console.log = realLog;
+  const out = results.map((x) => `${x.pass ? 'PASS' : 'FAIL'}  ${x.name}${x.detail ? '   [' + x.detail + ']' : ''}`).join('\n');
+  const failed = results.filter((x) => !x.pass).length;
+  console.log(JSON.stringify({ variant: 'process-only', passed: results.length - failed, total: results.length, failed, out }));
+  process.exit(failed ? 1 : 0);
+}
+
+// ── 2. identity: the session bearer, and nothing else ──────────────────────
+pc = world.providerCalls;
 r = await fetch(`${B}/ai/chat`, CHAT(null));
-check('no session -> 401, no quota call, provider untouched', r.status === 401 && service.counters.reserve === 0 && world.providerCalls === 0, `status=${r.status}`);
+j = await bodyOf(r);
+check('no session -> 401, no storage call at all, provider untouched',
+  r.status === 401 && dataCalls().length === 0 && world.providerCalls === pc, `status=${r.status} dataCalls=${dataCalls().length}`);
 r = await fetch(`${B}/ai/chat`, CHAT('tok-nope'));
-check('invalid session -> 401, no quota call, provider untouched', r.status === 401 && service.counters.reserve === 0 && world.providerCalls === 0, `status=${r.status}`);
-r = await fetch(`${B}/ai/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'server-only-bridge-key' }, body: JSON.stringify({ provider: 'alibaba', messages: [{ role: 'user', content: 'hi' }] }) });
+check('invalid session -> 401 and no reservation is taken', r.status === 401 && dataCalls().length === 0, `status=${r.status}`);
+r = await fetch(`${B}/ai/chat`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'server-only-bridge-key' },
+  body: JSON.stringify({ provider: 'alibaba', messages: [{ role: 'user', content: 'hi' }] })
+});
 check('the relay key cannot unlock an AI endpoint instead of a session', r.status === 401, `status=${r.status}`);
-r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
-j = await bodyOf(r);
-check('valid session accepted with no x-api-key', r.status === 200, `status=${r.status}`);
-check('provider dispatched exactly once', world.providerCalls === 1, `providerCalls=${world.providerCalls}`);
-check('the granted call carries the authoritative summary from the service', j.quota && j.quota.used === 1 && j.quota.limit === 3 && j.quota.remaining === 2 && j.quota.percentage === 33 && j.quota.period === PERIOD, JSON.stringify(j.quota));
-const order1 = events.slice(events.lastIndexOf('session'));
-check('reserve happens AFTER the session lookup and BEFORE the provider', order1.join(',') === 'session,reserve,provider', order1.join(','));
-check('exactly one quota reservation per chat', service.counters.reserve === 1, `reserve calls=${service.counters.reserve}`);
-
-// ── 3. what NodeSend actually sends to the quota service ──────────────────
-const firstReserve = service.requests.find((q) => q.route === 'reserve');
-check('the reservation is POST /reserve on the configured base', firstReserve?.method === 'POST' && firstReserve?.url === '/reserve', JSON.stringify({ m: firstReserve?.method, u: firstReserve?.url }));
-check('the reservation forwards the caller bearer and nothing else', firstReserve?.auth === 'Bearer tok-a' && firstReserve?.apiKey === null && firstReserve?.body !== null, `${firstReserve?.auth} x-api-key=${firstReserve?.apiKey}`);
-check('the reservation body asserts no identity', JSON.stringify(firstReserve?.body) === '{}', firstReserve?.raw ?? 'no reservation request recorded');
-r = await fetch(`${B}/ai/quota`, AUTH('tok-b'));
-const statusCall = service.requests.find((q) => q.route === 'status');
-check('the status read is GET /status with no body', statusCall?.method === 'GET' && statusCall?.raw === '' && statusCall?.auth === 'Bearer tok-b', JSON.stringify({ m: statusCall?.method, raw: statusCall?.raw }));
-check('no request ever names a user_id to the quota service', !service.requests.some((q) => 'user_id' in (q.body || {}) || /user_id=|userId/.test(q.url)), service.requests.map((q) => q.url).join(','));
-
-// ── 4. identity cannot be influenced by the caller ────────────────────────
-const beforeIdentity = service.requests.length;
-r = await fetch(`${B}/ai/quota?user_id=202&period_key=1999-01`, AUTH('tok-a'));
-j = await bodyOf(r);
-check('query-string user_id cannot ask about another user', r.status === 200 && j.used === 1 && j.limit === 3, JSON.stringify({ s: r.status, u: j.used, l: j.limit }));
-r = await fetch(`${B}/ai/chat`, CHAT('tok-a', { user_id: 999, userId: 999, period_key: '1999-01', email: 'someone@example.com' }));
-check('a body user_id is never forwarded to the quota service', r.status === 200 && service.requests.slice(beforeIdentity).every((q) => !/999|1999-01|someone@example/.test(JSON.stringify(q.body) + q.url)), JSON.stringify(service.requests.slice(beforeIdentity).map((q) => q.body)));
-check('identity travels only as the bearer token', service.requests.slice(beforeIdentity).every((q) => q.auth === 'Bearer tok-a'), '');
 r = await fetch(`${B}/ai/quota`);
 check('GET /ai/quota requires a session', r.status === 401, `status=${r.status}`);
 
-// ── 5. exhaustion is a decision, and it stops the provider ────────────────
-service.mode = 'exhausted';
-pc = world.providerCalls;
-r = await fetch(`${B}/ai/chat`, CHAT('tok-d'));
+seed();
+setUsage('101', 0);
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
 j = await bodyOf(r);
-check('exhausted -> 429', r.status === 429 && j.status === 'quota_exhausted', `status=${r.status}`);
-check('exhausted does NOT call provider', world.providerCalls === pc, `before=${pc} after=${world.providerCalls}`);
-check('exhausted relays the service summary, not an invented one', j.quota && j.quota.remaining === 0 && j.quota.limit === 3 && j.quota.percentage === 100 && j.quota.period === PERIOD, JSON.stringify(j.quota));
-r = await fetch(`${B}/ai/quota`, AUTH('tok-d'));
-j = await bodyOf(r);
-check('GET /ai/quota reports exhaustion as a readable answer, not an outage', r.status === 200 && j.allowed === false && j.used === 3 && j.error === undefined, JSON.stringify({ s: r.status, a: j.allowed, e: j.error }));
-service.mode = 'silent429';
-r = await fetch(`${B}/ai/chat`, CHAT('tok-d'));
-check('an HTTP 429 from the service is exhaustion whatever its body says', r.status === 429, `status=${r.status}`);
+check('valid session accepted with no x-api-key', r.status === 200, `status=${r.status} ${JSON.stringify(j).slice(0, 80)}`);
+check('a keyed request carries no key here, so it is charged plainly',
+  usageRow('101')?.calls_used === 1, `calls_used=${usageRow('101')?.calls_used}`);
 
-// ── 6. an unusable service fails closed on every surface ──────────────────
-const outages = [
-  ['http500', 'an HTTP 500 from the quota service'],
-  ['html', 'an HTML body from whatever sits in front of it'],
-  ['noAllowed', 'a body with no decision in it'],
-  ['allowedString', 'a non-boolean allowed field'],
-  ['array', 'a JSON array instead of an object'],
-  ['outageCode', 'an explicit quota_service_unavailable reason'],
-  ['hang', 'a service that never answers (timeout)'],
-  ['spoofedAllow403', 'a 403 whose body claims the call is allowed'],
-  ['spoofedAllow500', "a 500 whose body claims the call is allowed"]
+r = await fetch(`${B}/ai/quota?user_id=202&period_key=1999-01`, AUTH('tok-a'));
+j = await bodyOf(r);
+check('T-identity a query-string user_id cannot ask about another user',
+  r.status === 200 && j.used === 1 && j.limit === DEFAULT_LIMIT, JSON.stringify({ s: r.status, u: j.used, l: j.limit }));
+const beforeSpoof = ncb.requests.length;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', { user_id: 999, userId: 999, period_key: '1999-01', email: 'someone@example.com' }));
+check('T-identity a body user_id never reaches the store',
+  r.status === 200 && ncb.requests.slice(beforeSpoof).every((q) => !/999|1999-01|someone@example/.test(q.pathname + q.raw + JSON.stringify(q.query))),
+  ncb.requests.slice(beforeSpoof).map((q) => q.pathname).join(' | '));
+check('T-identity identity travels only as the caller bearer',
+  dataCalls().every((q) => q.auth === 'Bearer tok-a') && dataCalls().length > 0,
+  [...new Set(dataCalls().map((q) => q.auth))].join(','));
+check('no request ever names a user_id in a body to the store',
+  !dataCalls().some((q) => q.method === 'POST' && q.pathname.startsWith('/data/create/') && /999/.test(JSON.stringify(q.body))), '');
+
+// ── 3. charging and idempotency (T1-T8, T15, T16) ──────────────────────────
+// No counter row is seeded for the first scenarios on purpose: the state "this user has not
+// used the month yet" is the create path, and it has to be the one that is actually taken.
+seed();
+pc = world.providerCalls;
+const chargeOnce = await (async () => {
+  const res = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('decision-1')));
+  return { status: res.status, header: res.headers.get('x-quota-reservation'), body: await bodyOf(res) };
+})();
+check('T1 first decision charges once',
+  chargeOnce.status === 200 && usageRow('101')?.calls_used === 1 && chargeOnce.header === 'created',
+  JSON.stringify({ s: chargeOnce.status, used: usageRow('101')?.calls_used, h: chargeOnce.header }));
+// No row was seeded, so this is the first charge of the period and must be a CREATE — the
+// distinction matters because a create and an update are two different failure modes (T12
+// and T13) and silently landing on the wrong one would leave half the ledger untested.
+check('T1 the charge is a real create of the counter row, not only a header',
+  dataCalls().some((q) => q.pathname === '/data/create/ai_quota_usage' && q.body?.calls_used === 1),
+  dataCalls().map((q) => `${q.method} ${q.pathname}`).join(' | '));
+
+const retry = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('decision-1')));
+const retryHeader = retry.headers.get('x-quota-reservation');
+check('T2 a retry of the same decision does not charge again',
+  retry.status === 200 && usageRow('101')?.calls_used === 1 && retryHeader === 'reused',
+  JSON.stringify({ s: retry.status, used: usageRow('101')?.calls_used, h: retryHeader }));
+check('T2 a reused decision still reaches the provider (dedupe is not a refusal)',
+  world.providerCalls === pc + 2, `providerCalls=${world.providerCalls}`);
+
+seed();
+setUsage('101', 0);
+pc = world.providerCalls;
+for (let i = 0; i < 10; i++) {
+  const res = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('ten-retries')));
+  if (res.status !== 200) break;
+}
+check('T3 ten retries of one decision cost exactly one call',
+  usageRow('101')?.calls_used === 1 && world.providerCalls === pc + 10,
+  `used=${usageRow('101')?.calls_used} providerCalls=${world.providerCalls - pc}`);
+check('T3 only one reservation row exists for the ten attempts',
+  ncb.rows.ai_quota_reservation.filter((row) => row.decision_key === 'ten-retries').length === 1,
+  `rows=${ncb.rows.ai_quota_reservation.length}`);
+check('T3 the store saw one claim and one counter write, not ten',
+  ncb.requests.filter((q) => q.pathname === '/data/create/ai_quota_reservation').length === 1
+  && ncb.requests.filter((q) => /\/data\/(create|update)\/ai_quota_usage/.test(q.pathname)).length === 1,
+  ncb.requests.map((q) => `${q.method} ${q.pathname}`).join(' | '));
+
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('decision-2')));
+check('T4 a second decision costs a second call', r.status === 200 && usageRow('101')?.calls_used === 2,
+  `used=${usageRow('101')?.calls_used}`);
+
+seed();
+setUsage('101', 0);
+setUsage('202', 0);
+const sharedKeyA = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('cross-user')));
+const sharedKeyB = await fetch(`${B}/ai/chat`, CHAT('tok-b', {}, KEY('cross-user')));
+check('T5 one decision key, two users: each is charged once, no sharing',
+  sharedKeyA.status === 200 && sharedKeyB.status === 200
+  && usageRow('101')?.calls_used === 1 && usageRow('202')?.calls_used === 1,
+  JSON.stringify({ a: usageRow('101')?.calls_used, b: usageRow('202')?.calls_used }));
+check('T5 the key is scoped per user in storage, never global',
+  ncb.rows.ai_quota_reservation.filter((row) => row.decision_key === 'cross-user').length === 2
+  && new Set(ncb.rows.ai_quota_reservation.filter((row) => row.decision_key === 'cross-user').map((row) => String(row.user_id))).size === 2,
+  JSON.stringify(ncb.rows.ai_quota_reservation.map((x) => `${x.user_id}/${x.decision_key}`)));
+check('T5 both claims carried the respective caller bearer, never a shared key',
+  ncb.requests.filter((q) => q.pathname === '/data/create/ai_quota_reservation').map((q) => q.auth).join(',') === 'Bearer tok-a,Bearer tok-b',
+  ncb.requests.filter((q) => q.pathname === '/data/create/ai_quota_reservation').map((q) => q.auth).join(','));
+
+// T6: run up to the cap, keyless so each call is a new decision.
+seed();
+setUsage('101', 0);
+const ladderStart = world.providerCalls;
+const ladder = [];
+for (let i = 0; i < 5; i++) {
+  const res = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
+  const body = await bodyOf(res);
+  ladder.push({ s: res.status, used: body.quota?.used, remaining: body.quota?.remaining, reason: body.status });
+}
+check('T6 the cap is reached exactly, on the call that crosses it',
+  ladder.slice(0, 3).every((x) => x.s === 200) && ladder[3].s === 429 && ladder[3].reason === 'quota_exhausted'
+  && ladder[3].used === DEFAULT_LIMIT && usageRow('101')?.calls_used === DEFAULT_LIMIT,
+  JSON.stringify(ladder));
+check('T6 the denied call is not counted and not dispatched',
+  world.providerCalls - ladderStart === DEFAULT_LIMIT && usageRow('101')?.calls_used === DEFAULT_LIMIT,
+  `providerDelta=${world.providerCalls - ladderStart} used=${usageRow('101')?.calls_used}`);
+check('T6 exhaustion reports the real figures, never nulls and never an invented headroom',
+  ladder[3].used === 3 && ladder[3].remaining === 0, JSON.stringify(ladder[3]));
+
+// T7/T8: at the cap, an already-billed decision is still honoured, a new one is refused.
+const atLimitKey = 'billed-at-limit';
+seed();
+setUsage('101', DEFAULT_LIMIT);
+ncb.rows.ai_quota_reservation.push({
+  id: ncb.nextId.ai_quota_reservation++, user_id: '101', period_key: PERIOD,
+  decision_key: atLimitKey, created_at: sqlDate()
+});
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(atLimitKey)));
+const reusedAtLimit = r.headers.get('x-quota-reservation');
+check('T7 a retry of an already-billed decision is allowed at the cap',
+  r.status === 200 && reusedAtLimit === 'reused' && world.providerCalls === pc + 1,
+  JSON.stringify({ s: r.status, h: reusedAtLimit, provider: world.providerCalls - pc }));
+check('T7 the reuse reads the counter, it never writes it',
+  usageRow('101')?.calls_used === DEFAULT_LIMIT
+  && !ncb.requests.some((q) => q.pathname.startsWith('/data/update/ai_quota_usage') || q.pathname.startsWith('/data/create/ai_quota_usage')),
+  ncb.requests.map((q) => `${q.method} ${q.pathname}`).join(' | '));
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('brand-new-at-limit')));
+j = await bodyOf(r);
+check('T8 a NEW decision at the cap is denied and the provider is not called',
+  r.status === 429 && j.status === 'quota_exhausted' && world.providerCalls === pc,
+  JSON.stringify({ s: r.status, provider: world.providerCalls - pc }));
+check('T8 the denial that was not charged leaves no claim behind (claim released)',
+  usageRow('101')?.calls_used === DEFAULT_LIMIT && claim('101', 'brand-new-at-limit') === undefined
+  && ncb.requests.some((q) => q.pathname.startsWith('/data/delete/ai_quota_reservation')),
+  JSON.stringify({ reservations: ncb.rows.ai_quota_reservation.map((x) => x.decision_key) }));
+
+// T15: no key, no ledger, normal charge.
+seed();
+setUsage('101', 0);
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
+const keylessHeader = r.headers.get('x-quota-reservation');
+check('T15 a keyless request is charged normally and reaches the provider',
+  r.status === 200 && usageRow('101')?.calls_used === 1 && world.providerCalls > 0,
+  JSON.stringify({ s: r.status, used: usageRow('101')?.calls_used }));
+check('T15 a keyless request touches the reservation table not at all',
+  !dataCalls().some((q) => q.table === 'ai_quota_reservation'),
+  dataCalls().map((q) => q.pathname).join(' | '));
+check('T15 a keyless charge is still labelled honestly on the outcome header',
+  keylessHeader === 'charged', String(keylessHeader));
+
+// T16: a malformed key must not become a universal free pass. Every value here is refused
+// by the key rule, so each of these calls must be billed as its own new decision — a client
+// that stringifies a missing value into "undefined" must not get one shared free allowance.
+seed();
+setUsage('101', 0);
+// 13 hostile keys must each be billed, so the ceiling has to be above 13 or the cap — not
+// the key rule — decides the outcome of the later iterations.
+ncb.rows.ai_quota_config[0].default_call_limit = 100;
+const hostile = ['undefined', 'null', 'NaN', '{}', '[object Object]', 'string', '', '   ',
+  'x'.repeat(200), 'a'.repeat(129), '$(rm -rf /)', "quote'a", '-leading-dash'];
+const hostileStatuses = [];
+for (const value of hostile) {
+  const res = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(value)));
+  hostileStatuses.push(res.status);
+}
+check('T16 a malformed decision key is charged as a new decision, never deduplicated',
+  usageRow('101')?.calls_used === hostile.length,
+  `used=${usageRow('101')?.calls_used} of ${hostile.length} statuses=${[...new Set(hostileStatuses)].join(',')}`);
+check('T16 no refused key is ever recorded as a claim',
+  ncb.rows.ai_quota_reservation.length === 0,
+  JSON.stringify(ncb.rows.ai_quota_reservation.map((x) => x.decision_key)));
+check('T16 dropping a key costs a dedupe and buys neither a free call nor a refusal',
+  hostileStatuses.every((s) => s === 200), hostileStatuses.join(','));
+check('sanitizeDecisionKey accepts the documented grammar and refuses the rest',
+  mod.sanitizeDecisionKey('abc-123') === 'abc-123' && mod.sanitizeDecisionKey('a b:c+d#e-f') === 'a b:c+d#e-f'
+  && mod.sanitizeDecisionKey('undefined') === null && mod.sanitizeDecisionKey('null') === null
+  && mod.sanitizeDecisionKey('NaN') === null && mod.sanitizeDecisionKey('{}') === null
+  && mod.sanitizeDecisionKey('[object Object]') === null && mod.sanitizeDecisionKey('') === null
+  && mod.sanitizeDecisionKey('   ') === null && mod.sanitizeDecisionKey('x'.repeat(129)) === null
+  && mod.sanitizeDecisionKey('-leading-dash') === null && mod.sanitizeDecisionKey('quote\'a') === null
+  && mod.sanitizeDecisionKey('$(rm)') === null && mod.sanitizeDecisionKey(null) === null
+  && mod.sanitizeDecisionKey(42) === null && mod.sanitizeDecisionKey(undefined) === null,
+  JSON.stringify(['-leading-dash', 'quote\'a', '$(rm)'].map((v) => mod.sanitizeDecisionKey(v))));
+check('the key length bound is a stated constant, not an accident',
+  mod.DECISION_KEY_MAX_LENGTH === 128 && mod.DECISION_KEY_HEADER === 'x-ai-decision-key', '');
+
+// ── 4. the reservation ledger's failure paths (T9-T14) ─────────────────────
+// T9: lost race. Our first read sees nothing, the create is refused by the UNIQUE index
+// because another writer won, the re-read finds the row: REUSED, and the counter is never
+// touched. This is the case a naive implementation turns into a double charge.
+seed();
+setUsage('101', 1);
+ncb.rows.ai_quota_reservation.push({
+  id: ncb.nextId.ai_quota_reservation++, user_id: '101', period_key: PERIOD,
+  decision_key: 'lost-race', created_at: sqlDate()
+});
+ncb.hideReservationReads = 1;
+ncb.fault = null;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('lost-race')));
+j = await bodyOf(r);
+check('T9 a create refused by the unique index is re-read and answered as REUSED',
+  r.status === 200 && r.headers.get('x-quota-reservation') === 'reused' && usageRow('101')?.calls_used === 1,
+  JSON.stringify({ s: r.status, h: r.headers.get('x-quota-reservation'), used: usageRow('101')?.calls_used }));
+check('T9 the exact tuple was re-read after the refusal',
+  dataCalls().filter((q) => q.pathname === '/data/read/ai_quota_reservation').length >= 2
+  && dataCalls().some((q) => q.pathname === '/data/create/ai_quota_reservation'),
+  dataCalls().map((q) => `${q.method} ${q.pathname}`).join(' | '));
+check('T9 no counter write happened on the refused create',
+  !dataCalls().some((q) => q.pathname.startsWith('/data/create/ai_quota_usage') || q.pathname.startsWith('/data/update/ai_quota_usage')),
+  dataCalls().map((q) => q.pathname).join(' | '));
+
+// T10: the ledger is down. 503, and the counter must not be touched: a charge without a
+// recorded claim is the double-bill this whole ordering exists to prevent.
+seed();
+setUsage('101', 1);
+ncb.fault = 'create_reservation_fail';
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('ledger-down')));
+j = await bodyOf(r);
+check('T10 a failed claim with no existing row is 503, not a charge',
+  r.status === 503 && j.status === 'quota_service_unavailable' && world.providerCalls === pc,
+  JSON.stringify({ s: r.status, body: JSON.stringify(j).slice(0, 60) }));
+check('T10 the usage counter was not written while the ledger refused',
+  usageRow('101')?.calls_used === 1
+  && !dataCalls().some((q) => q.pathname.startsWith('/data/create/ai_quota_usage') || q.pathname.startsWith('/data/update/ai_quota_usage')),
+  JSON.stringify({ used: usageRow('101')?.calls_used, routes: dataCalls().map((q) => q.pathname).join(',') }));
+check('T10 the outage is reported as an outage, never as exhaustion, and with no figures',
+  j.status === 'quota_service_unavailable' && j.quota === null, JSON.stringify(j).slice(0, 120));
+ncb.fault = null;
+
+// T11 exhausted after a fresh claim -> released.
+seed();
+setUsage('101', DEFAULT_LIMIT);
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('exhausted-release')));
+j = await bodyOf(r);
+check('T11 exhaustion after a fresh claim releases that claim',
+  r.status === 429 && ncb.rows.ai_quota_reservation.length === 0
+  && ncb.requests.some((q) => q.pathname.startsWith('/data/delete/ai_quota_reservation')),
+  JSON.stringify({ s: r.status, rows: ncb.rows.ai_quota_reservation.length }));
+check('T11 the released claim is the one this request made',
+  ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage' || q.pathname.startsWith('/data/update/ai_quota_usage')) === false
+  && usageRow('101')?.calls_used === DEFAULT_LIMIT, `used=${usageRow('101')?.calls_used}`);
+
+// T12/T13: the charge fails after the claim -> released, and the failure is the answer.
+// No usage row at all, so this is the first-charge CREATE path rather than the increment.
+seed();
+ncb.fault = 'create_usage_fail';
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('create-charge-fails')));
+j = await bodyOf(r);
+check('T12 a failed first-charge write is 503 and the claim is released',
+  r.status === 503 && usageRow('101') === undefined && ncb.rows.ai_quota_reservation.length === 0,
+  JSON.stringify({ s: r.status, rows: ncb.rows.ai_quota_reservation.map((x) => x.decision_key) }));
+check('T12 the refusal is the storage failure, not a fabricated allowance, and no provider call',
+  j.status === 'quota_service_unavailable' && j.quota === null && world.providerCalls === pc,
+  JSON.stringify(j).slice(0, 100));
+check('T12 the released claim was deleted, not left recorded as prepaid',
+  ncb.requests.some((q) => q.pathname.startsWith('/data/delete/ai_quota_reservation')), '');
+ncb.fault = null;
+
+seed();
+setUsage('101', 1);
+ncb.fault = 'update_usage_fail';
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('update-charge-fails')));
+check('T13 a failed increment write is 503 and the claim is released',
+  r.status === 503 && usageRow('101')?.calls_used === 1 && ncb.rows.ai_quota_reservation.length === 0,
+  JSON.stringify({ s: r.status, used: usageRow('101')?.calls_used, rows: ncb.rows.ai_quota_reservation.length }));
+check('T13 the provider is not dispatched on the failed charge',
+  world.providerCalls === pc, `delta=${world.providerCalls - pc}`);
+ncb.fault = null;
+
+// T14: release itself fails. The caller must still get the real failure, and the fact that
+// a claim survived an unbilled decision must be in the log — never a silent success.
+seed();
+setUsage('101', DEFAULT_LIMIT);
+logs.length = 0;
+ncb.fault = 'delete_reservation_fail';
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('release-refused')));
+j = await bodyOf(r);
+const releaseLog = logs.find((l) => /claim_release_refused/.test(l)) || '';
+check('T14 a failed release does not pretend success',
+  r.status === 429 && j.status === 'quota_exhausted', JSON.stringify({ s: r.status, body: JSON.stringify(j).slice(0, 60) }));
+check('T14 the underlying failure is what the caller is told, not a made-up 200',
+  r.status !== 200 && !('reservation' in j), JSON.stringify(Object.keys(j)));
+check('T14 the release failure is logged explicitly', /quota_claim_release_refused/.test(releaseLog), releaseLog.slice(0, 120));
+check('T14 the release-failure log names a reason and nothing else',
+  /reason/.test(releaseLog) && !/ai_quota|Bearer|tok-a|release-refused/.test(releaseLog), releaseLog.slice(0, 160));
+ncb.fault = null;
+check('T14 the abandoned claim is visible in storage for cleanup, and is not silently retried as free',
+  ncb.rows.ai_quota_reservation.filter((x) => x.decision_key === 'release-refused').length === 1, '');
+
+// ── 5. fail closed on every unusable storage answer ────────────────────────
+// Each of these is a shape the real NCB surface can produce. None of them may become a
+// guessed allowance: "we could not read the counter" and "you have 100 calls left" are
+// opposite answers, and only one of them is safe to invent.
+const readFaults = [
+  ['config_missing', 'no configuration row at all'],
+  ['config_duplicate', 'two configuration rows'],
+  ['config_malformed_flag', 'a quota_enabled that is neither flag nor boolean'],
+  ['config_malformed_limit', 'a negative default_call_limit'],
+  ['config_unsupported_period', 'a period_type this build does not implement'],
+  ['usage_duplicate', 'two usage rows for one user and period'],
+  ['usage_malformed', 'a calls_used that is not a count'],
+  ['usage_unaddressable', 'a usage row with no id to update'],
+  ['override_duplicate', 'two override rows for one user'],
+  ['override_malformed', 'an override enabled flag that is neither'],
+  ['data_status_error', 'a 200 whose envelope says status:"error"'],
+  ['data_html', 'an HTML page where JSON was expected'],
+  ['data_hang', 'a storage call that never answers (timeout)']
 ];
-for (const [mode, label] of outages) {
-  service.mode = mode;
+for (const [fault, label] of readFaults) {
+  seed();
+  setUsage('101', 1);
+  // A fault that duplicates or mangles override rows can only fire if there is an override
+  // row to mangle — with none stored, "two rows" is still zero rows and the check would pass
+  // while measuring nothing. Seeded here; the knob's effect is proven by section 5b below.
+  if (fault.startsWith('override_')) ncb.rows.ai_quota_user_override.push({ id: 5100, user_id: '101', enabled: 1, call_limit: 4 });
+  ncb.fault = fault;
   pc = world.providerCalls;
-  r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
+  r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(`fault-${fault}`)));
   j = await bodyOf(r);
-  check(`${label} -> /ai/chat 503 and provider untouched`, r.status === 503 && j.status === 'quota_service_unavailable' && world.providerCalls === pc, `status=${r.status} providerCalls=${world.providerCalls - pc}`);
-  check(`${label} is never relayed as a 429 or as allowed`, r.status !== 429 && !(j.quota && j.quota.allowed === true), JSON.stringify(j).slice(0, 90));
-  service.mode = 'allow';
+  check(`${label} -> /ai/chat 503, provider untouched, no charge`,
+    r.status === 503 && world.providerCalls === pc && usageRow('101')?.calls_used === 1,
+    `status=${r.status} providerDelta=${world.providerCalls - pc} used=${usageRow('101')?.calls_used}`);
+  check(`${label} is never reported as exhaustion or as allowed`,
+    r.status !== 429 && j.status === 'quota_service_unavailable' && !j.quota, JSON.stringify(j).slice(0, 90));
+  const statusRes = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
+  const statusBody = await bodyOf(statusRes);
+  check(`${label} -> GET /ai/quota 503 with nulls, never 0 of limit`,
+    statusRes.status === 503 && statusBody.used === null && statusBody.limit === null
+    && statusBody.remaining === null && statusBody.percentage === null,
+    JSON.stringify({ s: statusRes.status, used: statusBody.used, limit: statusBody.limit }));
+  check(`${label} invents no period or reset date on a failed read`,
+    !('period' in statusBody) || statusBody.period === undefined, Object.keys(statusBody).join(','));
+  ncb.fault = null;
 }
-for (const [mode, label] of [['http500', '500'], ['noAllowed', 'no decision'], ['allowedString', 'non-boolean allowed'], ['hang', 'timeout'], ['spoofedAllow403', 'a 403 claiming permission'], ['spoofedAllow500', 'a 500 claiming permission']]) {
-  service.mode = mode;
-  r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
-  j = await bodyOf(r);
-  check(`${label} -> GET /ai/quota 503 with nulls, never 0/limit`, r.status === 503 && j.used === null && j.limit === null, `status=${r.status}`);
-}
-service.mode = 'allow';
-r = await fetch(`${B}/health`);
-j = await bodyOf(r);
-check('health still serves and reports the outage it observed', r.status === 200 && j.quotaAuthority === 'bridgemind' && j.quotaServiceConfigured === true && ['unreachable', 'invalid'].includes(j.quotaServiceStatus), JSON.stringify({ c: j.quotaServiceConfigured, s: j.quotaServiceStatus }));
-const hReady = await bodyOf(await fetch(`${B}/ai/quota`, AUTH('tok-a')));
-r = await fetch(`${B}/health`);
-j = await bodyOf(r);
-check('health returns to ready once the service answers properly', hReady.allowed === true && j.quotaServiceStatus === 'ready', JSON.stringify(j.quotaServiceStatus));
-check('a successful read did not leak the service body into health', !JSON.stringify(j).includes(INTERNAL_BAIT) && !JSON.stringify(j).includes('127.0.0.1'), JSON.stringify(j.quotaService ?? j.quotaServiceStatus));
-
-// ── 7. the allowlist, not the upstream body, reaches the browser ───────────
-service.mode = 'internals';
+seed();
+setUsage('101', 1);
+ncb.fault = 'session_hang';
 r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
-j = await bodyOf(r);
-const quotaJson = JSON.stringify(j.quota ?? null);
-check('an allowed decision is still honoured when it carries extra fields', r.status === 200 && world.providerCalls > 0, `status=${r.status}`);
-check('table names, SQL, row ids and service secrets are dropped', typeof quotaJson === 'string' && !quotaJson.includes(INTERNAL_BAIT) && !quotaJson.includes('SELECT') && !quotaJson.includes('row_id') && !quotaJson.includes(SERVICE_INTERNAL_TOKEN) && !quotaJson.includes('postgres'), quotaJson);
-check('only the documented decision fields survive', Object.keys(j.quota ?? {}).sort().join(',') === 'enabled,limit,percentage,period,remaining,resetAt,unlimited,used', Object.keys(j.quota ?? {}).sort().join(','));
-service.mode = 'allow';
-service.configMode = 'reject400';
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 25 }));
-j = await bodyOf(r);
-check('a rejected admin write keeps the service status and drops its error text', r.status === 400 && j.status === 'quota_configuration_write_400' && !JSON.stringify(j).includes(INTERNAL_BAIT), JSON.stringify(j).slice(0, 140));
-service.configMode = 'ok';
+check('an unreachable session authority is 503, not "signed out"',
+  r.status === 503 && (await bodyOf(r)).status === 'session_service_unavailable', `status=${r.status}`);
+ncb.fault = null;
 
-// ── 8. quota disabled is the service's call, relayed as unlimited ──────────
-service.mode = 'unlimited';
-pc = world.providerCalls;
-r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
-j = await bodyOf(r);
-check('unlimited decision -> provider allowed', r.status === 200 && world.providerCalls === pc + 1, `status=${r.status}`);
-check('unlimited is relayed as unlimited', j.quota && j.quota.unlimited === true && j.quota.enabled === false && j.quota.limit === null, JSON.stringify(j.quota));
+// ── 5b. the fault knobs themselves are alive ──────────────────────────────
+// A fail-closed test that passes because the injected fault never fired is worse than no
+// test: it says "storage corruption is handled" while measuring the happy path. Each knob is
+// therefore poked directly against the mock, over the same socket the relay uses, and compared
+// with the un-faulted answer.
+const readRaw = async (table, qs = '') => {
+  const res = await realFetch(`${NCB_BASE}/data/read/${table}?${qs}&Instance=55954_bridgemind`,
+    { headers: { Authorization: 'Bearer tok-a' } });
+  return res.json();
+};
+seed();
+setUsage('101', 2);
+ncb.rows.ai_quota_user_override.push({ id: 5200, user_id: '101', enabled: 1, call_limit: 4 });
+const baseline = {
+  config: (await readRaw('ai_quota_config')).data.length,
+  usage: (await readRaw('ai_quota_usage', `user_id=101&period_key=${PERIOD}`)).data.length,
+  override: (await readRaw('ai_quota_user_override', 'user_id=101')).data.length
+};
+const knobFires = async (fault, table, qs, shape) => {
+  ncb.fault = fault;
+  const answer = await readRaw(table, qs);
+  ncb.fault = null;
+  return shape(answer);
+};
+check('the usage_duplicate knob really returns two rows',
+  baseline.usage === 1 && await knobFires('usage_duplicate', 'ai_quota_usage', `user_id=101&period_key=${PERIOD}`, (a) => a.data.length === 2), `baseline=${baseline.usage}`);
+check('the usage_malformed knob really returns a non-count',
+  await knobFires('usage_malformed', 'ai_quota_usage', `user_id=101&period_key=${PERIOD}`, (a) => a.data[0]?.calls_used === 'many'), '');
+check('the usage_unaddressable knob really strips the row id',
+  await knobFires('usage_unaddressable', 'ai_quota_usage', `user_id=101&period_key=${PERIOD}`, (a) => a.data[0]?.id === undefined), '');
+check('the override_duplicate knob really returns two override rows',
+  baseline.override === 1 && await knobFires('override_duplicate', 'ai_quota_user_override', 'user_id=101', (a) => a.data.length === 2), `baseline=${baseline.override}`);
+check('the override_malformed knob really returns a neither-nor flag',
+  await knobFires('override_malformed', 'ai_quota_user_override', 'user_id=101', (a) => a.data[0]?.enabled === null), '');
+check('the config_missing knob really returns no rows',
+  baseline.config === 1 && await knobFires('config_missing', 'ai_quota_config', '', (a) => a.data.length === 0), `baseline=${baseline.config}`);
+check('the config_duplicate knob really returns two configuration rows',
+  await knobFires('config_duplicate', 'ai_quota_config', '', (a) => a.data.length === 2), '');
+check('the config_malformed_flag and config_malformed_limit knobs each change the field they name',
+  await knobFires('config_malformed_flag', 'ai_quota_config', '', (a) => a.data[0]?.quota_enabled === 'yes')
+  && await knobFires('config_malformed_limit', 'ai_quota_config', '', (a) => a.data[0]?.default_call_limit === -3), '');
+check('the config_unsupported_period knob really changes period_type',
+  await knobFires('config_unsupported_period', 'ai_quota_config', '', (a) => a.data[0]?.period_type === 'weekly'), '');
+check('the data_status_error knob really contradicts its own 200',
+  await knobFires('data_status_error', 'ai_quota_config', '', (a) => a.status === 'error'), '');
+const writeKnob = async (fault, path, method, body) => {
+  ncb.fault = fault;
+  const res = await realFetch(`${NCB_BASE}${path}`, {
+    method, headers: { Authorization: 'Bearer tok-a', 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+  ncb.fault = null;
+  return res.status;
+};
+check('the three write-failure knobs really refuse the write they name',
+  await writeKnob('create_usage_fail', '/data/create/ai_quota_usage', 'POST', { user_id: '9', period_key: PERIOD, calls_used: 1, applied_limit: 3 }) >= 500
+  && await writeKnob('update_usage_fail', `/data/update/ai_quota_usage/${ncb.rows.ai_quota_usage[0].id}`, 'PUT', { calls_used: 9 }) >= 500
+  && await writeKnob('create_reservation_fail', '/data/create/ai_quota_reservation', 'POST', { user_id: '9', period_key: PERIOD, decision_key: 'knob' }) >= 500
+  && await writeKnob('delete_reservation_fail', '/data/delete/ai_quota_reservation/1', 'DELETE', undefined) >= 500, '');
+check('the unique index is enforced by the mock, not assumed (positive control for T9)',
+  await (async () => {
+    ncb.rows.ai_quota_reservation.push({ id: 9001, user_id: '101', period_key: PERIOD, decision_key: 'unique-probe', created_at: sqlDate() });
+    ncb.fault = null;
+    const dupe = await realFetch(`${NCB_BASE}/data/create/ai_quota_reservation`, {
+      method: 'POST', headers: { Authorization: 'Bearer tok-a', 'content-type': 'application/json' },
+      body: JSON.stringify({ user_id: '101', period_key: PERIOD, decision_key: 'unique-probe', created_at: sqlDate() })
+    });
+    const other = await realFetch(`${NCB_BASE}/data/create/ai_quota_reservation`, {
+      method: 'POST', headers: { Authorization: 'Bearer tok-a', 'content-type': 'application/json' },
+      body: JSON.stringify({ user_id: '202', period_key: PERIOD, decision_key: 'unique-probe', created_at: sqlDate() })
+    });
+    ncb.rows.ai_quota_reservation = ncb.rows.ai_quota_reservation.filter((x) => x.decision_key !== 'unique-probe');
+    return dupe.status === 409 && other.status === 200;
+  })(), '');
+check('the hideReservationReads knob hides exactly the reads asked for, then stops',
+  await (async () => {
+    ncb.rows.ai_quota_reservation.push({ id: 9002, user_id: '101', period_key: PERIOD, decision_key: 'hidden-probe', created_at: sqlDate() });
+    ncb.hideReservationReads = 1;
+    const hidden = await readRaw('ai_quota_reservation', 'decision_key=hidden-probe');
+    const shown = await readRaw('ai_quota_reservation', 'decision_key=hidden-probe');
+    ncb.rows.ai_quota_reservation = ncb.rows.ai_quota_reservation.filter((x) => x.decision_key !== 'hidden-probe');
+    // The row exists the whole time — only the answer changes — which is what a lost race
+    // looks like from inside this process.
+    return hidden.data.length === 0 && shown.data.length === 1;
+  })(), '');
+check('the view clamps are computed here, not relayed: percentage over 100 is preserved honestly',
+  mod.quotaBoundedView(11, 10).remaining === 0 && mod.quotaBoundedView(11, 10).percentage === 110
+  && mod.quotaBoundedView(0, 10).percentage === 0, JSON.stringify(mod.quotaBoundedView(11, 10)));
+
+// ── 6. limit precedence: global config -> per-user override -> usage ───────
+seed();
+setUsage('101', 1);
+r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
+check('with no override row the default limit applies',
+  r.status === 200 && (await bodyOf(r)).limit === DEFAULT_LIMIT, `status=${r.status}`);
+ncb.rows.ai_quota_user_override.push({ id: 5001, user_id: '101', enabled: 1, call_limit: 5 });
 r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
 j = await bodyOf(r);
-check('GET /ai/quota reports unlimited when the service says so', r.status === 200 && j.unlimited === true && j.enabled === false, JSON.stringify({ e: j.enabled, u: j.unlimited }));
-service.mode = 'bare';
+check('an enabled override wins over the default', j.limit === 5, JSON.stringify({ l: j.limit }));
+ncb.rows.ai_quota_user_override[0].enabled = 0;
+r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
+check('a disabled override falls back to the default, it is not a zero limit',
+  (await bodyOf(r)).limit === DEFAULT_LIMIT, JSON.stringify({ l: (await bodyOf(r)).limit }));
+ncb.rows.ai_quota_user_override[0] = { id: 5001, user_id: '101', enabled: '1', call_limit: '7' };
+r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
+check('an override stored as strings is still read (MySQL returns strings)',
+  r.status === 200 && (await bodyOf(r)).limit === 7, JSON.stringify({ s: r.status, l: (await bodyOf(r)).limit }));
+r = await fetch(`${B}/ai/quota`, AUTH('tok-c'));
+check('another user is unaffected by user 101 override',
+  r.status === 200 && (await bodyOf(r)).limit === DEFAULT_LIMIT, JSON.stringify({ l: (await bodyOf(r)).limit }));
+seed();
+setUsage('101', DEFAULT_LIMIT);
+ncb.rows.ai_quota_user_override.push({ id: 5002, user_id: '101', enabled: 1, call_limit: 5 });
 r = await fetch(`${B}/ai/chat`, CHAT('tok-a'));
+check('the override raises the ceiling for the same stored counter',
+  r.status === 200 && usageRow('101')?.calls_used === 4, JSON.stringify({ s: r.status, used: usageRow('101')?.calls_used }));
+// A clean period and no counter row: with the switch off, the whole point is that nothing is
+// written anywhere — no usage row, no claim.
+seed();
+ncb.rows.ai_quota_config[0].quota_enabled = 0;
+pc = world.providerCalls;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('disabled-key')));
 j = await bodyOf(r);
-check('a bare allowed:true grants the call and adds no invented summary', r.status === 200 && !('quota' in j), JSON.stringify(Object.keys(j)));
-service.mode = 'allow';
+check('quota_enabled false is unlimited, unbilled, and dispatched',
+  r.status === 200 && j.quota.unlimited === true && j.quota.enabled === false && j.quota.limit === null
+  && usageRow('101') === undefined && ncb.rows.ai_quota_reservation.length === 0 && world.providerCalls === pc + 1,
+  JSON.stringify({ s: r.status, quota: j.quota, rows: ncb.rows.ai_quota_reservation.length }));
+r = await fetch(`${B}/ai/quota`, AUTH('tok-a'));
+j = await bodyOf(r);
+check('GET /ai/quota reports unlimited when the configuration says so, with no counter row',
+  r.status === 200 && j.unlimited === true && j.enabled === false && j.used === 0 && j.limit === null,
+  JSON.stringify({ e: j.enabled, u: j.unlimited, used: j.used }));
+check('T3b the same decision key is scoped to the period, not forever',
+  ncb.rows.ai_quota_usage.every((row) => row.period_key === PERIOD)
+  && ncb.rows.ai_quota_reservation.every((row) => row.period_key === PERIOD),
+  JSON.stringify({ u: [...new Set(ncb.rows.ai_quota_usage.map((x) => x.period_key))], r: [...new Set(ncb.rows.ai_quota_reservation.map((x) => x.period_key))] }));
 
-// ── 9. admin config remains admin-only at this relay, then proxies ─────────
+// ── 7. ordering: what is validated before a call is spent ──────────────────
+// Nothing is seeded into the counter here: the claim being tested is that a request the
+// provider would simply reject leaves NO usage row at all, which is only observable from the
+// empty state.
+seed();
+const writesBefore = dataCalls().length;
+r = await fetch(`${B}/ai/chat`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
+  body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKey: PROVIDER_SECRET }, model: 'qwen3.8-flash', messages: [{ role: 'user', content: 'hi' }] })
+});
+j = await bodyOf(r);
+check('a plaintext provider key is refused at 400 and spends no quota',
+  r.status === 400 && usageRow('101') === undefined && !dataCalls().some((q) => /create\/ai_quota_usage/.test(q.pathname)),
+  `status=${r.status} used=${usageRow('101')?.calls_used}`);
+r = await fetch(`${B}/ai/chat`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
+  body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', encryptedApiKey: enc(PROVIDER_SECRET) }, messages: [{ role: 'user', content: 'hi' }] })
+});
+check('a missing model is refused before any reservation',
+  r.status === 400 && usageRow('101') === undefined, `status=${r.status}`);
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', { messages: [] }));
+check('an empty message list is refused before any reservation',
+  r.status === 400 && usageRow('101') === undefined, `status=${r.status}`);
+check('the credential/model validations above made no counter write at all',
+  !dataCalls().slice(writesBefore).some((q) => /create\/ai_quota_usage|update\/ai_quota_usage/.test(q.pathname)),
+  dataCalls().slice(writesBefore).map((q) => q.pathname).join(' | '));
+
+seed();
+events.length = 0;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('order-check')));
+const order = events.filter((e) => ['session', 'create:ai_quota_reservation', 'create:ai_quota_usage', 'update:ai_quota_usage', 'provider'].includes(e));
+check('T-order the measured sequence is session -> claim -> charge -> provider',
+  order.join(',') === 'session,create:ai_quota_reservation,create:ai_quota_usage,provider', order.join(','));
+check('T-order the claim precedes the charge (never charge-then-record)',
+  order.indexOf('create:ai_quota_reservation') > -1 && order.indexOf('create:ai_quota_reservation') < order.indexOf('create:ai_quota_usage'),
+  order.join(','));
+const claimReq = ncb.requests.find((q) => q.pathname === '/data/create/ai_quota_reservation');
+check('the reservation write carries the exact tuple and nothing else',
+  JSON.stringify(Object.keys(claimReq?.body || {}).sort()) === JSON.stringify(['created_at', 'decision_key', 'period_key', 'user_id'])
+  && claimReq?.body?.user_id === '101' && claimReq?.body?.decision_key === 'order-check'
+  && claimReq?.body?.period_key === PERIOD, JSON.stringify(claimReq?.body));
+check('the reservation route is the configured table, on the NCB data grammar',
+  claimReq?.pathname === '/data/create/ai_quota_reservation' && claimReq?.query.Instance === '55954_bridgemind',
+  `${claimReq?.pathname} Instance=${claimReq?.query.Instance}`);
+const usageWrite = ncb.requests.find((q) => q.pathname === '/data/create/ai_quota_usage');
+check('the counter write is an absolute value computed here (read-check-write)',
+  usageWrite?.body?.calls_used === 1 && usageWrite?.body?.applied_limit === DEFAULT_LIMIT
+  && String(usageWrite?.body?.user_id) === '101' && usageWrite?.body?.period_key === PERIOD,
+  JSON.stringify(usageWrite?.body));
+
+// ── 8. surfaces that must stay quota-free ─────────────────────────────────
+seed();
+setUsage('101', 0);
+const beforeOther = ncb.requests.length;
+r = await fetch(`${B}/ai/test`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
+  body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', encryptedApiKey: enc(PROVIDER_SECRET) }, model: 'qwen3.8-flash' })
+});
+check('T21 /ai/test still dispatches the provider and charges nothing',
+  r.status === 200 && ncb.requests.slice(beforeOther).every((q) => !/ai_quota/.test(q.pathname)),
+  ncb.requests.slice(beforeOther).map((q) => q.pathname).join(' | '));
+r = await fetch(`${B}/ai/models`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' }, body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', encryptedApiKey: enc(PROVIDER_SECRET) } }) });
+check('T21 /ai/models still works and charges nothing',
+  r.status === 200 && ncb.requests.slice(beforeOther).every((q) => !/ai_quota/.test(q.pathname)),
+  JSON.stringify({ s: r.status, calls: ncb.requests.slice(beforeOther).map((q) => q.pathname).join(',') }));
+const beforeTrickster = ncb.requests.length;
+const tricksterStatuses = [];
+for (const route of ['/trickster/bid/health', '/trickster/play/health', '/trickster/bid/suggest-bid', '/trickster/play/suggest-card']) {
+  const post = route.includes('suggest');
+  tricksterStatuses.push((await fetch(`${B}${route}`, {
+    method: post ? 'POST' : 'GET',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
+    ...(post ? { body: '{}' } : {})
+  })).status);
+}
+check('T20 a Trickster call makes no quota storage request at all',
+  ncb.requests.slice(beforeTrickster).every((q) => !/ai_quota/.test(q.pathname)),
+  ncb.requests.slice(beforeTrickster).map((q) => `${q.method} ${q.pathname}`).join(' | '));
+check('T20 Trickster billing is unchanged: proxied with a session, never a quota verdict',
+  tricksterStatuses.every((s) => s === 502 || s === 504), tricksterStatuses.join(','));
+r = await fetch(`${B}/trickster/bid/suggest-bid`, AUTH('tok-a'));
+check('a wrong verb on a Trickster path still answers 405 with Allow: POST',
+  r.status === 405 && r.headers.get('allow') === 'POST', `status=${r.status}`);
+
+// ── 9. admin configuration (T19) ──────────────────────────────────────────
+seed();
 r = await fetch(`${B}/ai/quota/config`);
 check('config GET without a session -> 401', r.status === 401, `status=${r.status}`);
-const configHitsBefore = service.counters.config;
+// Counted on the /data/ traffic, not on every NCB request: the session lookup has to happen
+// to learn the role, and refusing before THAT would mean answering 403 without knowing who
+// is asking. What must not happen is a read or write of a quota table.
+const readsBeforeAdmin = dataCalls().length;
 r = await fetch(`${B}/ai/quota/config`, AUTH('tok-a'));
 j = await bodyOf(r);
-check('config GET as an ordinary user -> 403', r.status === 403 && j.status === 'forbidden', `status=${r.status}`);
-check('a 403 makes no call to the quota service at all', service.counters.config === configHitsBefore, `hits=${service.counters.config} vs ${configHitsBefore}`);
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-a', { quota_enabled: 1, default_call_limit: 7 }));
-check('config PUT as an ordinary user -> 403 before any outbound call', r.status === 403 && service.counters.config === configHitsBefore, `hits=${service.counters.config}`);
+check('config GET as an ordinary user -> 403 with no quota-table access',
+  r.status === 403 && j.status === 'forbidden' && dataCalls().length === readsBeforeAdmin,
+  JSON.stringify({ s: r.status, newCalls: dataCalls().length - readsBeforeAdmin }));
+r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-a', { quota_enabled: true, default_call_limit: 7 }));
+check('config PUT as an ordinary user -> 403 before any quota-table read or write',
+  r.status === 403 && dataCalls().length === readsBeforeAdmin, `calls=${dataCalls().length - readsBeforeAdmin}`);
 r = await fetch(`${B}/ai/quota/config`, AUTH('tok-admin'));
 j = await bodyOf(r);
-check('admin GET config -> proxied answer', r.status === 200 && j.quota_enabled === true && j.default_call_limit === 100 && j.period_type === 'monthly', JSON.stringify(j).slice(0, 140));
-const cfg = service.requests.filter((q) => q.route === 'config' && q.method === 'GET').slice(-1)[0];
-check('the config read is GET /config with the admin own bearer', cfg?.method === 'GET' && cfg?.auth === 'Bearer tok-admin', JSON.stringify({ m: cfg?.method, a: cfg?.auth }));
-const putBody = { quota_enabled: 0, default_call_limit: 25, note: 'whatever the admin set' };
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', putBody));
+check('T19 admin GET config reads the stored row',
+  r.status === 200 && j.quota_enabled === true && j.default_call_limit === DEFAULT_LIMIT
+  && j.period_type === 'monthly' && j.success === true, JSON.stringify(j).slice(0, 140));
+check('the config read is an unfiltered read of the config table with the admin bearer',
+  (() => { const q = ncb.requests.filter((x) => x.pathname === '/data/read/ai_quota_config').pop(); return q?.auth === 'Bearer tok-admin' && q?.method === 'GET'; })(), '');
+r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 5 }));
 j = await bodyOf(r);
-const cfgPut = service.requests.filter((q) => q.method === 'PUT').slice(-1)[0];
-check('admin PUT proxies the body unchanged', r.status === 200 && cfgPut?.url === '/config' && JSON.stringify(cfgPut?.body) === JSON.stringify(putBody), cfgPut?.raw ?? 'no PUT recorded');
-check('the proxy response is the service body, with no fields added', Object.keys(j).sort().join(',') === 'default_call_limit,period_type,quota_enabled,success,updated_at', Object.keys(j).sort().join(','));
-service.configMode = 'forbidden';
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 30 }));
-j = await bodyOf(r);
-check('a 403 from the service reaches the admin as 403, not as saved', r.status === 403 && j.saved === undefined && j.status === 'quota_configuration_write_403', `status=${r.status}`);
-service.configMode = 'http500';
+check('T19 admin PUT writes and reads back the new limit',
+  r.status === 200 && j.default_call_limit === 5 && ncb.rows.ai_quota_config[0].default_call_limit === 5,
+  JSON.stringify({ s: r.status, l: j.default_call_limit, stored: ncb.rows.ai_quota_config[0].default_call_limit }));
+check('T19 a partial write does not reset the other field',
+  j.quota_enabled === true && ncb.rows.ai_quota_config[0].quota_enabled === 1, JSON.stringify(j).slice(0, 120));
+check('the write goes to the config row by id, not to a table-wide route',
+  (() => { const q = ncb.requests.filter((x) => x.pathname.startsWith('/data/update/ai_quota_config/')).pop(); return q?.method === 'PUT' && /\d+$/.test(q?.pathname || '') && q?.body?.default_call_limit === 5; })(),
+  ncb.requests.filter((x) => x.pathname.includes('ai_quota_config')).map((x) => `${x.method} ${x.pathname}`).join(' | '));
+check('the update also stamps updated_at in the SQL format the store expects',
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(String(ncb.requests.filter((x) => x.pathname.startsWith('/data/update/ai_quota_config/')).pop()?.body?.updated_at)),
+  String(ncb.requests.filter((x) => x.pathname.startsWith('/data/update/ai_quota_config/')).pop()?.body?.updated_at));
+const badWrites = [
+  ['quota_enabled as a number', { quota_enabled: 1 }],
+  ['quota_enabled as a string', { quota_enabled: 'true' }],
+  ['default_call_limit zero', { default_call_limit: 0 }],
+  ['default_call_limit fractional', { default_call_limit: 2.5 }],
+  ['default_call_limit as a string', { default_call_limit: '25' }],
+  ['default_call_limit above the bound', { default_call_limit: 100001 }],
+  ['period_type weekly', { period_type: 'weekly' }],
+  ['an unrecognised field', { note: 'hello' }]
+];
+for (const [label, payload] of badWrites) {
+  const stored = JSON.stringify(ncb.rows.ai_quota_config[0]);
+  r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', payload));
+  j = await bodyOf(r);
+  check(`a rejected config write (${label}) answers 400 and never says saved`,
+    r.status === 400 && j.success === false && j.status === 'invalid_quota_configuration', JSON.stringify(j).slice(0, 110));
+  check(`a rejected config write (${label}) changes nothing in the row`,
+    JSON.stringify(ncb.rows.ai_quota_config[0]) === stored, '');
+}
+r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', null, 'not-an-object'));
+check('a non-JSON admin body is refused locally', r.status === 400 || r.status === 415, `status=${r.status}`);
+seed();
+ncb.fault = 'config_duplicate';
 r = await fetch(`${B}/ai/quota/config`, AUTH('tok-admin'));
+check('two config rows refuse the admin read rather than picking one',
+  r.status === 503 && (await bodyOf(r)).status === 'quota_service_unavailable', `status=${r.status}`);
+ncb.fault = 'update_config_fail';
+r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 9 }));
+check('a failed config write is 503 and is never reported as saved',
+  r.status === 503 && (await bodyOf(r)).success === false && ncb.rows.ai_quota_config[0].default_call_limit === DEFAULT_LIMIT,
+  `status=${r.status} stored=${ncb.rows.ai_quota_config[0].default_call_limit}`);
+ncb.fault = 'config_no_persist';
+r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 9 }));
 j = await bodyOf(r);
-check('a 500 on the config read is relayed as 500 without the service message', r.status === 500 && j.status === 'quota_configuration_read_500' && !JSON.stringify(j).includes(INTERNAL_BAIT), JSON.stringify(j).slice(0, 120));
-service.configMode = 'ok';
-service.configMode = 'html';
-r = await fetch(`${B}/ai/quota/config`, AUTH('tok-admin'));
-j = await bodyOf(r);
-check('an HTML config page is refused, and its text never reaches the caller', r.status === 503 && j.status === 'quota_service_unavailable', `status=${r.status}`);
-service.configMode = 'nullObject';
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', { default_call_limit: 30 }));
-check('a 200 whose body is not an object is never reported as a confirmation', r.status === 502, `status=${r.status}`);
-service.configMode = 'ok';
-r = await fetch(`${B}/ai/quota/config`, PUTJSON('tok-admin', 'not-an-object'));
-check('a non-object admin body is refused locally, not forwarded', r.status === 400, `status=${r.status}`);
+check('an acknowledged write that does not read back is refused (read-back verified)',
+  r.status === 503 && j.success === false && j.status === 'quota_service_unavailable', JSON.stringify(j).slice(0, 110));
+ncb.fault = null;
+seed();
+const noLeakText = await (await fetch(`${B}/ai/quota/config`, AUTH('tok-admin'))).text();
+const noLeakBody = JSON.parse(noLeakText);
+// Asserted on the parsed shape, not by substring: the response legitimately contains
+// timestamps and a request id, and a row id like "9" is a substring of both. A digit
+// search here would pass or fail on the clock, which is not a test of anything.
+check('the config answer carries no table name, storage host or row address',
+  !STORAGE_STRINGS.some((s) => noLeakText.includes(s)) && !noLeakText.includes(NCB_BASE)
+  && !('id' in noLeakBody) && !('row_id' in noLeakBody) && !('rowId' in noLeakBody)
+  && !('table' in noLeakBody) && !('sql' in noLeakBody)
+  && Object.keys(noLeakBody).sort().join(',') === 'default_call_limit,period_type,quota_enabled,requestId,success,updated_at',
+  Object.keys(noLeakBody).sort().join(','));
 
-// ── 10. relay invariants preserved by this change ──────────────────────────
+// ── 10. one mutex, one writer, one authority (T22) ────────────────────────
+const observed = { active: 0, maxSameUser: 0, maxDistinct: 0, current: new Set() };
+const hold = (userId, ms) => mod.withUserLock(userId, async () => {
+  observed.active++;
+  observed.current.add(userId);
+  observed.maxSameUser = Math.max(observed.maxSameUser, [...observed.current].filter((u) => u === userId).length + observed.active - 1);
+  observed.maxDistinct = Math.max(observed.maxDistinct, observed.current.size);
+  // A macrotask yield, not a microtask: a synchronous body would let the mutex look
+  // serialised when it is only being awaited in order.
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  observed.active--;
+  observed.current.delete(userId);
+  return observed.active;
+});
+const maxActiveDuring = [];
+const fiveSameUser = await Promise.all([1, 2, 3, 4, 5].map((i) => hold('same-user', 8).then(() => maxActiveDuring.push(observed.active))));
+check('T22 the per-user mutex serialises five concurrent tasks for one user',
+  fiveSameUser.length === 5 && observed.maxDistinct === 1 && mod.userLockCount() === 0,
+  JSON.stringify({ maxDistinct: observed.maxDistinct, lockCount: mod.userLockCount() }));
+await Promise.all([hold('user-x', 10), hold('user-y', 10), hold('user-z', 10)]);
+check('T22 different users are not queued behind one global lock',
+  observed.maxDistinct === 3, JSON.stringify({ maxDistinct: observed.maxDistinct }));
+check('T22 the lock map is emptied, so no request can strand a user behind a dead promise',
+  mod.userLockCount() === 0, `userLockCount=${mod.userLockCount()}`);
+seed();
+// The ceiling is raised so that five concurrent calls measure serialisation rather than the
+// cap: with limit 3 two of them would be denied and the count would still come out at 3.
+ncb.rows.ai_quota_config[0].default_call_limit = 10;
+const burst = await Promise.all(Array.from({ length: 5 }, (_, i) => fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(`burst-${i}`)))));
+check('T22 five concurrent keyed calls for one user bill five, not fewer or more',
+  usageRow('101')?.calls_used === 5 && burst.every((x) => x.status === 200),
+  `used=${usageRow('101')?.calls_used} statuses=${burst.map((x) => x.status).join(',')}`);
+const writtenValues = ncb.requests.filter((q) => q.pathname.startsWith('/data/update/ai_quota_usage') || q.pathname.startsWith('/data/create/ai_quota_usage')).map((q) => q.body?.calls_used);
+check('T22 the counter never moved backwards or repeated a value (no lost update)',
+  JSON.stringify(writtenValues) === JSON.stringify([1, 2, 3, 4, 5]), JSON.stringify(writtenValues));
+const bridgeSrc = fs.readFileSync(path.join(ROOT, 'bridge.js'), 'utf8');
+const codeOnly = bridgeSrc.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^[ \t]*\/\/.*$/gm, ' ');
+const dupes = (() => {
+  const seen = new Map();
+  for (const line of codeOnly.split('\n')) {
+    const m = line.match(/^(?:async\s+)?function\s+([A-Za-z0-9_$]+)/) || line.match(/^const\s+([A-Za-z0-9_$]+)\s*=/) || line.match(/^let\s+([A-Za-z0-9_$]+)\s*=/);
+    if (m) seen.set(m[1], (seen.get(m[1]) || 0) + 1);
+  }
+  return [...seen.entries()].filter(([, n]) => n > 1).map(([k, n]) => `${k}x${n}`);
+})();
+check('T22 there is no second copy of any quota decision function or state map',
+  dupes.length === 0, dupes.join(','));
+check('T22 exactly one mutex map and one ledger map exist',
+  (codeOnly.match(/const userLocks = new Map\(\)/g) || []).length === 1
+  && (codeOnly.match(/const processLedger = new Map\(\)/g) || []).length === 1
+  && (codeOnly.match(/withUserLock\s*\(/g) || []).length === 2,
+  `userLocks=${(codeOnly.match(/const userLocks = new Map\(\)/g) || []).length} withUserLock=${(codeOnly.match(/withUserLock\s*\(/g) || []).length}`);
+check('T22 exactly one writer path exists for the usage counter',
+  (codeOnly.match(/\/data\/create\/\$\{QUOTA_TABLES\.usage\}/g) || []).length === 1
+  && (codeOnly.match(/\/data\/update\/\$\{QUOTA_TABLES\.usage\}/g) || []).length === 1,
+  `create=${(codeOnly.match(/\/data\/create\/\$\{QUOTA_TABLES\.usage\}/g) || []).length} update=${(codeOnly.match(/\/data\/update\/\$\{QUOTA_TABLES\.usage\}/g) || []).length}`);
+check('T22 exactly one reservation ledger path exists',
+  (codeOnly.match(/\/data\/create\/\$\{QUOTA_TABLES\.reservation\}/g) || []).length === 1
+  && (codeOnly.match(/\/data\/read\/\$\{QUOTA_TABLES\.reservation\}/g) || []).length === 1
+  && (codeOnly.match(/\/data\/delete\/\$\{QUOTA_TABLES\.reservation\}/g) || []).length === 1, '');
+check('T22 there is one quota decision entry point, and the route adapters only wrap it',
+  (codeOnly.match(/async function reserveQuotaDecision/g) || []).length === 1
+  && (codeOnly.match(/async function reserveAiCall/g) || []).length === 1
+  && (codeOnly.match(/reserveQuotaDecision\(req, req\.bridgeUser\)/g) || []).length === 1
+  && (codeOnly.match(/quotaStatusDecision\(req, req\.bridgeUser\)/g) || []).length === 1
+  && (codeOnly.match(/withUserLock\(/g) || []).length === 2,
+  `locks=${(codeOnly.match(/withUserLock\(/g) || []).length}`);
+
+// ── 11. secret and leak hygiene ───────────────────────────────────────────
+seed();
+logs.length = 0;
+world.providerRequests.length = 0;
+const SECRET_KEY = 'decision-key-DO-NOT-LEAK-4d1c';
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(SECRET_KEY)));
+const chatBody = await r.text();
+check('T17 the decision key never reaches the provider request body',
+  world.providerRequests.every((q) => !q.raw.includes(SECRET_KEY) && !JSON.stringify(q.body).includes(SECRET_KEY)),
+  world.providerRequests.map((q) => q.raw.slice(0, 60)).join(' | '));
+check('T17 the decision key never reaches the provider request headers',
+  world.providerRequests.every((q) => !Object.keys(q.headers).some((h) => /decision/i.test(h))
+    && !Object.values(q.headers).some((v) => String(v).includes(SECRET_KEY))),
+  JSON.stringify(world.providerRequests.map((q) => Object.keys(q.headers))));
+check('T17 the provider is authenticated by the provider key, never the user bearer',
+  world.providerRequests.length > 0 && world.providerRequests.every((q) => q.auth === `Bearer ${PROVIDER_SECRET}`),
+  world.providerRequests.map((q) => q.auth.slice(0, 10)).join(','));
+check('T17 the key is not echoed back in the response', !chatBody.includes(SECRET_KEY), chatBody.slice(0, 80));
+check('T17 the key is not logged', !logs.join('\n').includes(SECRET_KEY), logs.filter((l) => /decision/.test(l)).join(' | ').slice(0, 120));
+check('the reservation is the only place the key is written, to our own storage',
+  ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_reservation' && q.body?.decision_key === SECRET_KEY)
+  && ncb.requests.filter((q) => JSON.stringify(q.body || {}).includes(SECRET_KEY)).length === 1,
+  ncb.requests.filter((q) => JSON.stringify(q.body || {}).includes(SECRET_KEY)).map((q) => q.pathname).join(' | '));
+const probes = await Promise.all([
+  fetch(`${B}/ai/quota`, AUTH('tok-admin')).then((x) => x.text()),
+  fetch(`${B}/ai/quota/config`, AUTH('tok-admin')).then((x) => x.text()),
+  fetch(`${B}/ai/quota/config`, AUTH('tok-a')).then((x) => x.text()),
+  fetch(`${B}/health`).then((x) => x.text()),
+  fetch(`${B}/`).then((x) => x.text()),
+  fetch(`${B}/crypto/public-key`).then((x) => x.text()),
+  fetch(`${B}/nope`).then((x) => x.text())
+]);
+check('every probe returned a body to inspect', probes.length === 7 && probes.every((t) => typeof t === 'string' && t.length > 0), '');
+const leaked = probes.map((t, i) => LEAK_STRINGS.filter((s) => t.includes(s)).map((s) => `${i}:${s}`)).flat();
+check('no response body carries a bearer, a session token or a provider key', leaked.length === 0, leaked.join(','));
+const blob = logs.join('\n');
+check('no bearer token or provider secret appears in any log line',
+  !blob.includes('tok-a') && !blob.includes('tok-admin') && !blob.includes(PROVIDER_SECRET),
+  blob.split('\n').find((l) => /tok-|sk-REAL/.test(l))?.slice(0, 100) || '');
+check('no log line names a table, a row id or the storage host',
+  !STORAGE_STRINGS.some((s) => blob.includes(s)) && !blob.includes(NCB_BASE) && !/row_id|rowId/.test(blob),
+  blob.split('\n').find((l) => STORAGE_STRINGS.some((s) => l.includes(s)))?.slice(0, 120) || '');
+check('no log line carries the decision key of any request',
+  !blob.includes(SECRET_KEY) && !/decision_key/.test(blob), blob.split('\n').find((l) => /decision/.test(l))?.slice(0, 120) || '');
+const canary = `[NodeSend] quota_audit ${JSON.stringify({ decision_key: SECRET_KEY, table: 'ai_quota_usage', authorization: 'Bearer tok-a' })}`;
+check('the leak detectors fire on a planted leak (positive control)',
+  LEAK_STRINGS.some((s) => canary.includes(s)) && STORAGE_STRINGS.some((s) => canary.includes(s)) && leaked.length === 0, '');
+check('the key never appears in a provider URL', world.providerRequests.every((q) => !q.url.includes(SECRET_KEY)), '');
+
+// ── 12. relay invariants that must survive the move ───────────────────────
 r = await fetch(`${B}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
 check('/send still 403 without x-api-key', r.status === 403, `status=${r.status}`);
 r = await fetch(`${B}/rocketchat`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': 'server-only-bridge-key' }, body: JSON.stringify({ text: 'x' }) });
@@ -407,173 +1171,227 @@ r = await fetch(`${B}/quota`, { headers: { Authorization: 'Bearer tok-a' } });
 check('generic /quota unchanged (403 without key)', r.status === 403, `status=${r.status}`);
 r = await fetch(`${B}/quota`, { headers: { 'x-api-key': 'server-only-bridge-key' } });
 check('generic /quota still fails closed when its own service is unconfigured', r.status === 503, `status=${r.status}`);
-r = await fetch(`${B}/ai/chat`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
-  body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKey: PROVIDER_SECRET }, model: 'qwen3.8-flash', messages: [{ role: 'user', content: 'hi' }] })
-});
-j = await bodyOf(r);
-check('plaintext provider key still refused, and spends no reservation', r.status === 400 && /disabled|required/i.test(String(j.error)), `status=${r.status}`);
-const reserveBeforeTest = service.counters.reserve;
-pc = world.providerCalls;
-r = await fetch(`${B}/ai/test`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' }, body: JSON.stringify({ provider: 'alibaba', config: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', encryptedApiKey: enc(PROVIDER_SECRET) }, model: 'qwen3.8-flash' }) });
-check('/ai/test dispatches the provider but asks the quota service for nothing', r.status === 200 && world.providerCalls === pc + 1 && service.counters.reserve === reserveBeforeTest, `status=${r.status} reserve=${service.counters.reserve - reserveBeforeTest}`);
-r = await fetch(`${B}/ai/models`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' }, body: JSON.stringify({ provider: 'alibaba', config: {} }) });
-j = await bodyOf(r);
-check('/ai/models 200 with session and no reservation', r.status === 200 && j.models?.length === 2 && service.counters.reserve === reserveBeforeTest, `status=${r.status}`);
-r = await fetch(`${B}/crypto/public-key`);
-j = await bodyOf(r);
-check('public key still served unauthenticated', r.status === 200 && j.publicKey?.includes('BEGIN PUBLIC KEY'), `status=${r.status}`);
-const rootInfo = await bodyOf(await fetch(`${B}/`));
-check('root advertises the bridgemind quota authority without naming a table', rootInfo.quotaService?.authority === 'bridgemind' && !JSON.stringify(rootInfo).includes(INTERNAL_BAIT), JSON.stringify(rootInfo.quotaService));
-check('root does not report a storage layer it no longer has', !('quotaStorage' in rootInfo), Object.keys(rootInfo).join(','));
+check('the generic server-account adapter is still a separate surface',
+  /NODESEND_QUOTA_URL/.test(codeOnly) && /quotaHandler/.test(codeOnly)
+  && codeOnly.indexOf('NODESEND_QUOTA_URL') < codeOnly.indexOf('const QUOTA_TABLES'), '');
+const beforeBadJson = ncb.requests.length;
+r = await fetch(`${B}/ai/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' }, body: '{"not json' });
+check('a malformed JSON body is refused without touching quota',
+  r.status === 400 && ncb.requests.length === beforeBadJson, `status=${r.status} newCalls=${ncb.requests.length - beforeBadJson}`);
+check('the reservation outcome is a header, never a body field',
+  !chatBody.includes('"reservation"') && !chatBody.includes('"claim"'), chatBody.slice(0, 60));
+const granted = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('header-shape')));
+check('a charged call reports created and a retry reports reused on the header',
+  granted.headers.get('x-quota-reservation') === 'created', String(granted.headers.get('x-quota-reservation')));
+const reuseHeader = (await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('header-shape')))).headers.get('x-quota-reservation');
+check('the outcome header is exposed to a browser reader',
+  reuseHeader === 'reused', String(reuseHeader));
 
-// ── 11. Trickster behaviour is untouched by the quota move ────────────────
-const tricksterNoSession = [];
-const tricksterWithSession = [];
-const dataCallsBeforeTrickster = events.length;
-for (const route of ['/trickster/bid/health', '/trickster/play/health', '/trickster/bid/suggest-bid', '/trickster/play/suggest-card']) {
-  tricksterNoSession.push((await fetch(`${B}${route}`, { method: route.includes('suggest') ? 'POST' : 'GET', headers: { 'Content-Type': 'application/json' }, ...(route.includes('suggest') ? { body: '{}' } : {}) })).status);
-  tricksterWithSession.push((await fetch(`${B}${route}`, { method: route.includes('suggest') ? 'POST' : 'GET', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' }, ...(route.includes('suggest') ? { body: '{}' } : {}) })).status);
-}
-check('Trickster routes still answer 401 without a session', tricksterNoSession.every((s) => s === 401), tricksterNoSession.join(','));
-check('Trickster routes still proxy with a session (502 upstream unreachable, never 401/403/503-quota)', tricksterWithSession.every((s) => s === 502), tricksterWithSession.join(','));
-check('a Trickster call makes no quota request', events.slice(dataCallsBeforeTrickster).filter((e) => e === 'reserve' || e === 'status' || e === 'config').length === 0, '');
-r = await fetch(`${B}/trickster/bid/suggest-bid`, AUTH('tok-a'));
-check('a wrong verb on a Trickster path still answers 405 with Allow: POST', r.status === 405 && r.headers.get('allow') === 'POST', `status=${r.status} allow=${r.headers.get('allow')}`);
-
-// ── 12. secret hygiene ────────────────────────────────────────────────────
-const blob = logs.join('\n');
-check('no bearer token in logs', !blob.includes('tok-a') && !blob.includes('tok-admin'), '');
-check('no provider secret in logs', !blob.includes(PROVIDER_SECRET), '');
-check('no private key material in logs', !blob.includes('PRIVATE KEY'), '');
-check('the shared relay key is never sent to the quota service', !service.requests.some((q) => q.apiKey !== null || JSON.stringify(q).includes('server-only-bridge-key')), '');
-check('no quota-service host or path is echoed to the browser', !(await (async () => { const t = await (await fetch(`${B}/ai/quota`, AUTH('tok-a'))).text(); return t.includes('127.0.0.1') || t.includes(QUOTA_SERVICE_BASE); })()), '');
-check('no log line names a table, an NCB data route or the quota service URL', !/ai_quota|\/data\/|QUOTA_SERVICE|127\.0\.0\.1:\d+\/reserve/.test(blob), blob.split('\n').find((l) => /ai_quota|\/data\//.test(l)) || '');
-check('the outage log never carries the service error text', !blob.includes('database exploded') && !blob.includes(SERVICE_INTERNAL_TOKEN), blob.split('\n').find((l) => /exploded/.test(l)) || '');
-check('encrypted provider credential still reaches the provider decrypted', world.providerAuthHeaders.includes(`Bearer ${PROVIDER_SECRET}`), `providerAuthCount=${world.providerAuthHeaders.length}`);
-check('provider is never authenticated by the user bearer', world.providerAuthHeaders.length > 0 && !world.providerAuthHeaders.some((h) => h.includes('tok-')), world.providerAuthHeaders.map((h) => h.slice(0, 10) + '…').join(','));
-const echoText = await Promise.all([
-  fetch(`${B}/ai/quota`, AUTH('tok-admin')).then((res) => res.text()),
-  fetch(`${B}/ai/quota/config`, AUTH('tok-admin')).then((res) => res.text()),
-  fetch(`${B}/ai/quota/config`, AUTH('tok-a')).then((res) => res.text()),
-  fetch(`${B}/ai/chat`, CHAT('tok-a')).then((res) => res.text()),
-  fetch(`${B}/health`).then((res) => res.text()),
-  fetch(`${B}/`).then((res) => res.text()),
-  fetch(`${B}/crypto/public-key`).then((res) => res.text())
-]);
-check('every probe returned a body to inspect', echoText.length === 7 && echoText.every((t) => typeof t === 'string' && t.length > 0), echoText.map((t) => typeof t).join(','));
-const SECRET_STRINGS = [...Object.keys(USERS), PROVIDER_SECRET, SERVICE_INTERNAL_TOKEN, 'PRIVATE KEY', 'server-only-bridge-key'];
-const leaked = echoText.map((t, i) => SECRET_STRINGS.filter((s) => t.includes(s)).map((s) => `${i}:${s}`)).flat();
-check('no response body carries a bearer, a session token or a provider key', leaked.length === 0, leaked.join(','));
-const canary = JSON.stringify({ authorization: 'Bearer tok-a', key: PROVIDER_SECRET, internal: SERVICE_INTERNAL_TOKEN });
-check('the leak detector fires on a planted leak (positive control)', SECRET_STRINGS.some((s) => canary.includes(s)) && leaked.length === 0, SECRET_STRINGS.filter((s) => canary.includes(s))[0] || 'none');
-
-// ── 13. source gates: the direct-table design must not come back ──────────
-// Runtime proof first, before any text search: the NCB mock records every route it
-// is asked for, so "only /auth/get-session was ever requested" is an observation
-// about this run's traffic, not a claim about the source text.
-const ncbDataEvents = events.filter((e) => String(e).startsWith('ncb-data:'));
-check('NCB received /auth/get-session only, for the entire run', ncbDataEvents.length === 0, ncbDataEvents.join(','));
-check('every quota call went to the configured BridgeMind service', service.requests.length > 0 && service.requests.every((q) => ['reserve', 'status', 'config'].includes(q.route)) && !service.requests.some((q) => /\/data\/|ai_quota/.test(q.url)), `${service.requests.length} calls: ${[...new Set(service.requests.map((q) => q.route + ' ' + q.method))].join(' | ')}`);
-check('the NCB host was asked for exactly one route, all run', [...new Set(ncbRoutes)].join(',') === '/auth/get-session', `${ncbRoutes.length} NCB calls: ${[...new Set(ncbRoutes)].join(',')}`);
-const bridgeSrc = fs.readFileSync(path.join(ROOT, 'bridge.js'), 'utf8');
-const codeOnly = bridgeSrc.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^[ \t]*\/\/.*$/gm, ' ');
+// ── 13. source gates: the external hop must not come back ─────────────────
+check('T23 BRIDGEMIND_QUOTA_URL appears nowhere in the relay source',
+  !/BRIDGEMIND_QUOTA_URL/.test(bridgeSrc), (bridgeSrc.match(/BRIDGEMIND_QUOTA_URL/g) || []).length + ' hits');
 const envExample = fs.readFileSync(path.join(ROOT, '.env.example'), 'utf8');
-const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-check('no NCB data route is built anywhere in the relay', !/\/data\/(read|create|update|delete)/.test(codeOnly) && !/\/data\//.test(codeOnly), '');
-// Word boundaries, not substrings: `quota_configuration_write_500` is a log code and
-// `ai_quota_usage` contains `quota_usage` as a fragment. A substring test would fire
-// on those and teach whoever reads it next to distrust the gate, so each retired name
-// is tested as the whole identifier it is.
-const retiredTableNames = ['ai_quota_config', 'ai_quota_user_override', 'ai_quota_usage', 'quota_config', 'quota_usage', 'quota_user_override'];
-const tableHits = retiredTableNames.filter((t) => new RegExp(`\\b${t}\\b`).test(codeOnly));
-check('no quota table is named in production source', tableHits.length === 0, tableHits.join(','));
-check('no SQL or DDL is issued from the relay', !/\b(CREATE TABLE|ALTER TABLE|DROP TABLE|TRUNCATE|ON CONFLICT|INSERT INTO|UPSERT)\b/i.test(codeOnly) && !/\bSELECT\b[\s\S]{0,60}\bFROM\b/i.test(codeOnly), '');
-const sessionCallSites = (codeOnly.match(/ncbRequest\(req,\s*"\/auth\/get-session"/g) || []).length;
-const ncbRequestUses = (codeOnly.match(/ncbRequest\s*\(/g) || []).length;
-check('NCB is called for /auth/get-session and for nothing else', sessionCallSites === 1 && ncbRequestUses === 2, `session=${sessionCallSites} total ncbRequest( =${ncbRequestUses}`);
-check('no direct-table machinery survives', !/ncbDataRead|ncbDataWrite|ncbDataCreate|ncbDataUpdate|ncbRowList|ncbFlag|ncbInt|ncbDateTime|readNcbQuotaState|readNcbQuotaConfig|withUserQuotaLock|quotaUserLocks|getCurrentPeriodKey|getNextResetAt|resolveQuotaLimit|isSensibleQuotaLimit|QUOTA_SCHEMA_SQL/.test(codeOnly), '');
-check('no database credential or driver is reachable from the relay', !/DATABASE_URL|QUOTA_DATABASE_URL|\brequire\(\s*["']pg["']\s*\)/.test(codeOnly) && !pkg.dependencies?.pg, Object.keys(pkg.dependencies || {}).join(','));
-check('the adapter reads exactly one new env name', (codeOnly.match(/process\.env\.BRIDGEMIND_QUOTA_URL/g) || []).length === 1, `reads=${(codeOnly.match(/process\.env\.BRIDGEMIND_QUOTA_URL/g) || []).length}`);
-check('identity is read only from the validated session', /req\.bridgeUser\?\.id/.test(codeOnly) && !/req\.body\??\.user_id|req\.query\??\.user_id|query\.user_id/.test(codeOnly), '');
-check('the session and admin guards are still attached to all five AI surfaces', /app\.post\("\/ai\/models",\s*requireBridgeSession/.test(codeOnly)
+check('T23 BRIDGEMIND_QUOTA_URL is gone from .env.example',
+  !/BRIDGEMIND_QUOTA_URL/.test(envExample), (envExample.match(/BRIDGEMIND_QUOTA_URL/g) || []).length + ' hits');
+const bannedAdapterNames = ['bridgemindQuotaEndpoint', 'bridgemindQuotaConfigured', 'quotaServiceState',
+  'markQuotaServiceOk', 'markQuotaServiceUnavailable', 'requestQuotaService', 'sanitizeQuotaDecision',
+  'isQuotaCount', 'QUOTA_DENIAL_REASONS', 'QUOTA_SERVICE_CODES', 'unavailableQuotaSummary',
+  'QUOTA_RESERVE_ROUTE', 'QUOTA_STATUS_ROUTE', 'QUOTA_CONFIG_ROUTE', 'QUOTA_PUBLIC_FIELDS',
+  'quotaServiceUnavailable', 'quotaConfigRejected', 'QUOTA_DECISION_AUTHORITY'];
+const adapterHits = bannedAdapterNames.filter((n) => bridgeSrc.includes(n));
+check('T24 no external quota adapter symbol survives anywhere in the file',
+  adapterHits.length === 0, adapterHits.join(','));
+check('T24 the source contains no bare /reserve, /status or /config route literal',
+  !/"\/(reserve|status|config)"/.test(codeOnly), (codeOnly.match(/"\/(reserve|status|config)"/g) || []).join(','));
+// Every place this file talks to another machine, named. A new outbound call site is how a
+// second quota hop would sneak back in, so the list is asserted to be exactly the four
+// legitimate transports rather than merely "not too many".
+const fetchTargets = (codeOnly.match(/fetch\(\s*[^,{)\s]+/g) || []).map((s) => s.replace('fetch(', '').trim());
+// The token is cut at the first `,` `)` `{` or space, so `buildNcbUrl(path)` reads as
+// `buildNcbUrl(path` — the name of the transport is what identifies it, not its argument.
+check('T24 the outbound call sites are the four known transports only (NCB, provider, generic adapter, webhook)',
+  fetchTargets.slice().sort().join(',') === ['ROCKETCHAT_WEBHOOK_URL', 'buildNcbUrl(path', 'quotaUrl.href', 'url'].sort().join(','),
+  fetchTargets.join(' | '));
+// The runtime half of the same claim, and the stronger one: whatever the source says, these
+// are the machines this run actually sent bytes to. Nothing else is reachable — the stub
+// throws for any other host, so an accidental production call would fail the run outright.
+const NCB_HOST = new URL(NCB_BASE).host;
+const RELAY_HOST = new URL(B).host;
+const TRICKSTER_DECOY = '127.0.0.1:1';
+const outboundHosts = [...new Set(world.outboundUrls.map((u) => { try { return new URL(u).host; } catch { return `unparseable:${u}`; } }))].sort();
+check('T24 the only hosts contacted all run are the mock NCB, the provider, the decoy and the relay itself',
+  outboundHosts.join(',') === [NCB_HOST, 'dashscope.aliyuncs.com', TRICKSTER_DECOY, RELAY_HOST].sort().join(','),
+  outboundHosts.join(','));
+check('T24 no outbound URL of this run is a quota service endpoint',
+  !world.outboundUrls.some((u) => /\/(reserve|status|config)(\?|$)/.test(u) && !u.includes('/ai/quota')),
+  world.outboundUrls.filter((u) => /\/(reserve|status|config)/.test(u)).join(' | ').slice(0, 200));
+check('T24 nothing in this gate or the relay still calls a BridgeMind backend',
+  !/bridgemindQuota|BRIDGEMIND_QUOTA|api\.bridgemind\.app\/(reserve|status|config)/.test(bridgeSrc + envExample), '');
+check('the quota tables are named once each, from env with a documented default',
+  ['ai_quota_config', 'ai_quota_user_override', 'ai_quota_usage', 'ai_quota_reservation'].every((t) => {
+    const count = (bridgeSrc.match(new RegExp(`"${t}"`, 'g')) || []).length;
+    return count === 1;
+  }), JSON.stringify(['ai_quota_config', 'ai_quota_user_override', 'ai_quota_usage', 'ai_quota_reservation'].map((t) => `${t}:${(bridgeSrc.match(new RegExp(`"${t}"`, 'g')) || []).length}`)));
+// Counted as env READS, not as mentions: the reservation name also appears inside the
+// startup warning's text, and that mention has nothing to do with the wiring being checked.
+const quotaEnvReads = [...new Set(codeOnly.match(/process\.env\.AI_QUOTA_[A-Z_]+/g) || [])].map((s) => s.split('.').pop());
+check('the four table names are configurable by env, and no fifth table is addressed',
+  quotaEnvReads.slice().sort().join(',') === ['AI_QUOTA_CONFIG_TABLE', 'AI_QUOTA_RESERVATION_TABLE', 'AI_QUOTA_USAGE_TABLE', 'AI_QUOTA_USER_OVERRIDE_TABLE'].sort().join(','),
+  quotaEnvReads.join(','));
+check('no SQL or DDL is issued from the relay',
+  !/\b(CREATE TABLE|ALTER TABLE|DROP TABLE|TRUNCATE|ON CONFLICT|INSERT INTO|UPSERT)\b/i.test(codeOnly)
+  && !/\bSELECT\b[\s\S]{0,60}\bFROM\b/i.test(codeOnly), '');
+// One transport helper, three awaited call sites: the session lookup, the quota read and the
+// quota write. The awaited count is what is pinned, so a fourth NCB call site cannot be added
+// without someone deciding in review what it is for.
+check('there is one NCB transport and it is used by the session lookup and the quota path only',
+  (codeOnly.match(/async function ncbRequest/g) || []).length === 1
+  && (codeOnly.match(/await ncbRequest\(/g) || []).length === 3
+  && (codeOnly.match(/ncbRequest\(req, "\/auth\/get-session"/g) || []).length === 1,
+  `definition=${(codeOnly.match(/async function ncbRequest/g) || []).length} awaits=${(codeOnly.match(/await ncbRequest\(/g) || []).length}`);
+check('no NCB service credential exists or is invented',
+  !/NCB_SERVICE_TOKEN|NCB_ADMIN_TOKEN|NCB_API_KEY|NCB_BEARER|QUOTA_DATABASE_URL|DATABASE_URL/.test(codeOnly)
+  && [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].sort().join(',') === 'NCB_INSTANCE,NCB_PROXY_BASE,NCB_TIMEOUT_MS',
+  [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].join(','));
+// Exactly two bearer expressions in the whole file: the caller's own session token, and the
+// provider key the caller supplied. Anything else would be a credential this relay holds.
+const bearerExpressions = (codeOnly.match(/Authorization: `Bearer \$\{[^}]*\}/g) || []).map((s) => s.replace(/\s+/g, ' ')).sort();
+check('the only two bearers this relay puts on a request are the caller session token and the provider key',
+  bearerExpressions.length === 2
+  // The captured literal ends at the `}` of the interpolation, so the closing paren of the
+  // call is outside the match: test for the function, not for its balanced brackets.
+  && bearerExpressions.some((s) => /getBearerToken\(req/.test(s))
+  && bearerExpressions.some((s) => /\$\{apiKey\}/.test(s))
+  // SCREAMING_SNAKE is how a module-level credential is named here; `getBearerToken` is a
+  // function reading the request, so a case-insensitive /TOKEN/ test would flag the very
+  // thing this check exists to require.
+  && !bearerExpressions.some((s) => /process\.env|_[A-Z0-9_]*TOKEN/.test(s)), bearerExpressions.join(' | '));
+check('the caller bearer is the only credential the NCB transport can carry',
+  (codeOnly.match(/Authorization: `Bearer \$\{getBearerToken\(req\)\}`/g) || []).length === 1
+  && /headers: \{[\s\S]{0,120}getBearerToken\(req\)/.test(codeOnly)
+  && !/getBearerToken\(req\)[\s\S]{0,400}process\.env/.test(codeOnly.match(/async function ncbRequest[\s\S]{0,400}/)[0] || ''), '');
+check('identity is read only from the validated session',
+  /req\.bridgeUser\?\.id/.test(codeOnly) && !/req\.body\??\.user_id|req\.query\??\.user_id|query\.user_id/.test(codeOnly), '');
+check('the session and admin guards are attached to all six AI surfaces',
+  /app\.post\("\/ai\/models",\s*requireBridgeSession/.test(codeOnly)
   && /app\.post\("\/ai\/test",\s*requireBridgeSession/.test(codeOnly)
-  && /app\.post\("\/ai\/chat",\s*requireBridgeSession/.test(codeOnly)
+  && /app\.post\("\/ai\/chat",\s*requireBridgeSession,\s*\(req, res\) => relayAI\(req, res, "chat"\)/.test(codeOnly)
   && /app\.get\("\/ai\/quota",\s*requireBridgeSession/.test(codeOnly)
   && /app\.get\("\/ai\/quota\/config",\s*requireBridgeSession,\s*requireBridgeAdmin/.test(codeOnly)
   && /app\.put\("\/ai\/quota\/config",\s*requireBridgeSession,\s*requireBridgeAdmin/.test(codeOnly), '');
-check('health names bridgemind and not a storage backend', /quotaAuthority:\s*"bridgemind"/.test(codeOnly) && !/quotaAuthority:\s*"(ncb|postgres)"/.test(codeOnly), '');
-check('BRIDGEMIND_QUOTA_URL requires https outside loopback and refuses credentials', /protocol\s*!==\s*"https:"/.test(codeOnly) && /base\.username\s*\|\|\s*base\.password/.test(codeOnly), '');
-// UPDATED 2026-10-04, disclosed: this assertion used to REQUIRE the phrase "does not exist
-// in BridgeMind yet". That phrase is now false, so the check would have gone red for doing
-// the right thing. It is re-aimed, not weakened: it still demands that the file states the
-// unconfigured consequence, and additionally forbids the stale "does not exist" claim, so
-// the doc cannot drift back to saying the endpoint is missing while also saying it is
-// pending deployment.
-// Prose is matched with comment markers and line wrapping removed. Matching the raw text
-// would have made this gate fail on a line break alone — the phrase below really is
-// written across two comment lines — and the same brittleness would let a rewrap hide a
-// revived claim: "does not exist in BridgeMind yet" split over two lines would slip past a
-// raw absence check. Both directions are therefore tested on the same normalised prose.
-const envProse = envExample.replace(/^#\s?/gm, '').replace(/\s+/g, ' ');
-check('.env.example documents the decision service as present in code but awaiting deployment, and never claims it does not exist',
-  /BRIDGEMIND_QUOTA_URL=/.test(envExample)
-    && /exists in the BridgeMind application code/.test(envProse)
-    && /must be deployed as a/.test(envProse)
-    && /fail closed while it is unset/.test(envProse)
-    && /does not exist in BridgeMind yet/.test(envProse) === false, '');
-check('.env.example documents the x-ai-decision-key header as a billing label and explicitly not identity',
-  /x-ai-decision-key: <logical decision key>/.test(envProse)
-    && /BILLING label/.test(envProse)
-    && /never authentication, never identity/.test(envProse), '');
-check('.env.example keeps the two quota URLs clearly distinct', /NODESEND_QUOTA_URL is NOT the flag/.test(envExample), '');
-check('.env.example still carries no database configuration', !/BRIDGEMIND_QUOTA_DATABASE_URL|^DATABASE_URL|NODESEND_QUOTA_DB_/m.test(envExample), '');
-check('no browser-visible quota secret exists', !/VITE_[A-Z_]*(QUOTA|NCB|DATABASE|BEARER|SESSION|BRIDGEMIND)/i.test(envExample + bridgeSrc), '');
-check('the direct-table harness never came back', !fs.existsSync(path.join(ROOT, 'verify-postgres-quota.mjs')) && !fs.existsSync(path.join(ROOT, 'verify-ncb-quota.mjs')), '');
-check('version declares the bridgemind quota authority', NODESEND_VERSION === 'bridge-bridgemind-quota-v8', NODESEND_VERSION);
+// The chat dispatch is the LAST requestProvider call in the file — the models path has one
+// earlier — so the ordering claim is pinned with lastIndexOf, which is the only form that
+// actually states it. Model validation must also precede the spend.
+check('the reservation happens inside relayAI after credentials and model validation, before dispatch',
+  codeOnly.indexOf('if (typeof model !== "string" || !model.trim())') < codeOnly.indexOf('reservation = await reserveAiCall(req, res)')
+  && codeOnly.indexOf('resolvedApiKey = resolveProviderApiKey(config)') < codeOnly.indexOf('reservation = await reserveAiCall(req, res)')
+  && codeOnly.indexOf('reservation = await reserveAiCall(req, res)') < codeOnly.lastIndexOf('result = await requestProvider({'),
+  JSON.stringify({ model: codeOnly.indexOf('if (typeof model !== "string"'), creds: codeOnly.indexOf('resolvedApiKey = resolveProviderApiKey'), reserve: codeOnly.indexOf('reservation = await reserveAiCall'), dispatch: codeOnly.lastIndexOf('result = await requestProvider({') }));
+check('T25 the single-replica invariant is stated once in code and printed three times',
+  (bridgeSrc.match(/exactly-one-quota-service-replica/g) || []).length === 1
+  && /QUOTA_SINGLE_REPLICA_INVARIANT/.test(codeOnly)
+  && /quotaLedgerState\(\)/.test(codeOnly) && /quotaLedgerFields\(\)/.test(codeOnly),
+  `literal=${(bridgeSrc.match(/exactly-one-quota-service-replica/g) || []).length}`);
+check('the relay never claims multi-replica safety',
+  !/multi-?replica (?:quota )?(?:counting )?safe|safe across replicas|replica-?safe|horizontally scal/i.test(bridgeSrc),
+  (bridgeSrc.match(/.{0,60}multi-?replica.{0,60}/i) || []).join(' | ').slice(0, 200));
+check('startup states the invariant and the process-only warning exists',
+  /quotaLedgerFields\(\)/.test(codeOnly) && /process\.emitWarning\(/.test(codeOnly)
+  && /NodeSendQuotaIdempotencyProcessOnly/.test(codeOnly) && /quotaLedgerDurable/.test(codeOnly), '');
+// Prose is matched with comment markers and wrapping removed: the same sentence split over
+// two comment lines must pass, and a revived stale claim must fail however it is wrapped.
+const proseOf = (s) => s.replace(/^#\s?/gm, '').replace(/^\s*\/\/\s?/gm, '').replace(/\s+/g, ' ');
+const envProse = proseOf(envExample);
+check('.env.example states the new architecture, not the retired one',
+  /NodeSend is the only quota backend/.test(envProse) && /NCB is the application database owner/.test(envProse)
+  && /BridgeMind is a static frontend/.test(envProse) && /no second backend hop/.test(envProse), '');
+check('.env.example no longer says NodeSend holds no quota data or reads no table',
+  !/NodeSend owns no quota data/i.test(envProse) && !/reads and writes no NCB table/i.test(envProse)
+  && !/BridgeMind-owned quota/i.test(envProse) && !/does not exist yet/i.test(envProse), '');
+check('.env.example documents all four quota tables and the reservation table by name',
+  ['AI_QUOTA_CONFIG_TABLE', 'AI_QUOTA_USER_OVERRIDE_TABLE', 'AI_QUOTA_USAGE_TABLE', 'AI_QUOTA_RESERVATION_TABLE'].every((k) => envExample.includes(k))
+  && envProse.includes('ai_quota_reservation'), [...new Set(envExample.match(/AI_QUOTA_[A-Z_]*TABLE/g) || [])].join(','));
+check('.env.example documents the header as a billing label and explicitly not identity',
+  /x-ai-decision-key: <logical decision key>/.test(envProse) && /BILLING label/.test(envProse)
+  && /never authentication, never identity/.test(envProse), '');
+check('.env.example states the single-replica requirement and that multi-replica counting is unsupported',
+  /SINGLE REPLICATION REQUIRED/.test(envProse) && /no atomic increment/.test(envProse)
+  && /Multi-replica quota counting is unsupported/.test(envProse), '');
+check('.env.example keeps the two quota URLs clearly distinct',
+  /NODESEND_QUOTA_URL has nothing to do with whether per-user quota works/.test(envProse), '');
+check('.env.example still carries no database credential and no new secret',
+  !/^DATABASE_URL|^BRIDGEMIND_QUOTA_DATABASE_URL|^AI_QUOTA_[A-Z_]*TOKEN/m.test(envExample), '');
+check('no browser-visible quota variable exists',
+  !/VITE_[A-Z_]*(QUOTA|NCB|DATABASE|BEARER|SESSION|BRIDGEMIND|AI_QUOTA)/i.test(envExample + bridgeSrc), '');
+check('the retired store-shaped harnesses never came back',
+  !fs.existsSync(path.join(ROOT, 'verify-postgres-quota.mjs')) && !fs.existsSync(path.join(ROOT, 'verify-ncb-quota.mjs')), '');
 
-// ── 14. the adapter's own predicates ─────────────────────────────────────
-const { bridgemindQuotaEndpoint, bridgemindQuotaConfigured, sanitizeQuotaDecision, isQuotaCount, quotaServiceState, QUOTA_PUBLIC_FIELDS } = mod;
-check('endpoint paths derive from the configured base', bridgemindQuotaEndpoint('reserve') === `${QUOTA_SERVICE_BASE}/reserve` && bridgemindQuotaEndpoint('/status') === `${QUOTA_SERVICE_BASE}/status`, bridgemindQuotaEndpoint('reserve'));
-check('a trailing slash on the base does not double up', (() => {
-  const previous = process.env.BRIDGEMIND_QUOTA_URL;
-  process.env.BRIDGEMIND_QUOTA_URL = `${QUOTA_SERVICE_BASE}/`;
-  const one = bridgemindQuotaEndpoint('status') === `${QUOTA_SERVICE_BASE}/status`;
-  process.env.BRIDGEMIND_QUOTA_URL = previous;
-  return one;
-})(), bridgemindQuotaEndpoint('status'));
-check('a plain host without a path still resolves the routes', (() => {
-  const previous = process.env.BRIDGEMIND_QUOTA_URL;
-  process.env.BRIDGEMIND_QUOTA_URL = 'https://api.bridgemind.app';
-  const ok = bridgemindQuotaEndpoint('reserve') === 'https://api.bridgemind.app/reserve';
-  process.env.BRIDGEMIND_QUOTA_URL = previous;
-  return ok;
-})(), '');
-check('non-https, credential-bearing and malformed bases are refused', (() => {
-  const previous = process.env.BRIDGEMIND_QUOTA_URL;
-  const refused = ['http://api.bridgemind.app', 'https://user:pw@api.bridgemind.app', 'not a url', ''].every((value) => {
-    process.env.BRIDGEMIND_QUOTA_URL = value;
-    return bridgemindQuotaEndpoint('reserve') === null;
+// ── 14. the startup line, measured from a real boot ───────────────────────
+const bootProbe = async (extraEnv) => new Promise((resolve) => {
+  const child = spawn(process.execPath, [path.join(ROOT, 'bridge.js')], {
+    env: { ...process.env, PORT: '0', ...extraEnv }, cwd: ROOT
   });
-  const loopbackOk = (() => { process.env.BRIDGEMIND_QUOTA_URL = 'http://127.0.0.1:9'; const v = bridgemindQuotaEndpoint('reserve'); process.env.BRIDGEMIND_QUOTA_URL = previous; return v === 'http://127.0.0.1:9/reserve'; })();
-  return refused && loopbackOk && bridgemindQuotaConfigured() === true;
-})(), '');
-check('sanitizeQuotaDecision requires a boolean allowed', sanitizeQuotaDecision(null).valid === false && sanitizeQuotaDecision({}).valid === false && sanitizeQuotaDecision({ allowed: 'true' }).valid === false && sanitizeQuotaDecision([]).valid === false && sanitizeQuotaDecision({ allowed: true }).valid === true, '');
-check('a denial without a reason is exhaustion, and an unknown reason cannot pick 503', sanitizeQuotaDecision({ allowed: false }).reason === 'quota_exhausted' && sanitizeQuotaDecision({ allowed: false, reason: 'token_expired' }).reason === 'quota_exhausted' && sanitizeQuotaDecision({ allowed: false, reason: 'quota_service_unavailable' }).reason === 'quota_service_unavailable', '');
-check('negative and impossible counts are dropped, not relayed', (() => {
-  const d = sanitizeQuotaDecision({ allowed: true, used: -5, limit: 1.5, remaining: 'many', percentage: 900 });
-  return d.summary.used === undefined && d.summary.limit === undefined && d.summary.remaining === undefined && d.summary.percentage === 100;
-})(), JSON.stringify(sanitizeQuotaDecision({ allowed: true, used: -5, limit: 1.5, remaining: 'many', percentage: 900 }).summary));
-check('oversized strings are dropped rather than relayed', (() => {
-  const d = sanitizeQuotaDecision({ allowed: true, period: 'x'.repeat(70), resetAt: 'y'.repeat(70) });
-  return d.summary.period === undefined && d.summary.resetAt === undefined;
-})(), '');
-check('only allowlisted fields can ever survive', (() => {
-  const d = sanitizeQuotaDecision({ allowed: true, table: 'x', sql: 'y', row_id: 1, secret: 'z', used: 1 });
-  return Object.keys(d.summary).every((k) => QUOTA_PUBLIC_FIELDS.includes(k)) && Object.keys(d.summary).join(',') === 'used';
-})(), '');
-check('isQuotaCount accepts non-negative safe integers only', isQuotaCount(0) && isQuotaCount(100000) && !isQuotaCount(-1) && !isQuotaCount(1.5) && !isQuotaCount(Number.MAX_SAFE_INTEGER + 1) && !isQuotaCount(NaN), '');
-check('quotaServiceState reports configuration without naming the target', (() => { const s = quotaServiceState(); return 'configured' in s && 'status' in s && !JSON.stringify(s).includes('127.0.0.1'); })(), JSON.stringify(quotaServiceState()));
+  let stdout = '';
+  let stderr = '';
+  const finish = () => { try { child.kill(); } catch { /* already gone */ } resolve({ stdout, stderr }); };
+  child.stdout.on('data', (d) => {
+    stdout += d.toString();
+    if (/startup/.test(stdout)) setTimeout(finish, 120);
+  });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+  child.on('exit', finish);
+  setTimeout(finish, 4000);
+});
+// The startup line is `[NodeSend] startup {json}`; parsing it out is a function rather than
+// an inline IIFE so a bad line yields {} instead of throwing the harness away.
+const parseStartup = (line) => {
+  const start = String(line).indexOf('{');
+  if (start < 0) return {};
+  try { return JSON.parse(String(line).slice(start)); } catch { return {}; }
+};
+const bootDurable = await bootProbe({});
+const startupLine = (bootDurable.stdout.split('\n').find((l) => /startup/.test(l)) || '');
+const startupJson = parseStartup(startupLine);
+check('T25 a real boot prints authority nodesend, storage ncb, idempotency durable',
+  startupJson.quotaAuthority === 'nodesend' && startupJson.quotaStorage === 'ncb'
+  && startupJson.quotaIdempotency === 'durable'
+  && startupJson.quotaReplicas === 'exactly-one-quota-service-replica'
+  && startupJson.quotaMultiReplica === 'unsupported',
+  startupLine.slice(0, 200));
+check('T25 a durable boot raises no process-only warning',
+  !/NodeSendQuotaIdempotencyProcessOnly/.test(bootDurable.stderr), bootDurable.stderr.slice(0, 160));
+check('the startup line names no secret, no bearer and no storage host',
+  !LEAK_STRINGS.some((s) => startupLine.includes(s)) && !startupLine.includes(NCB_BASE)
+  && !STORAGE_STRINGS.some((s) => startupLine.includes(s)), startupLine.slice(0, 120));
+
+// ── 15. the process-only variant, in its own process ──────────────────────
+const variantReport = await new Promise((resolve) => {
+  const child = spawn(process.execPath, [path.join(ROOT, 'verify-session-quota.mjs'), '--variant=process-only'], {
+    env: { ...process.env, AI_QUOTA_RESERVATION_TABLE: '' }, cwd: ROOT
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { err += d.toString(); });
+  child.on('close', (code) => resolve({ code, out, err }));
+  setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve({ code: -1, out, err }); }, 60000);
+});
+let variant = { passed: 0, total: 0, failed: 0, out: '' };
+try {
+  variant = JSON.parse(String(variantReport.out).trim().split('\n').pop());
+} catch { variant = { passed: 0, total: 1, failed: 1, out: `child produced no report (code=${variantReport.code}) ${variantReport.out.slice(0, 120)} ${variantReport.err.slice(0, 200)}` }; }
+for (const line of String(variant.out).split('\n')) { if (line.trim()) results.push({ name: line.slice(6).split('[')[0].trim() || line.trim(), pass: line.startsWith('PASS'), detail: (line.match(/\[(.*)\]/) || [])[1] || '' }); }
+check('the process-only variant runs clean in its own process',
+  variantReport.code === 0 && variant.failed === 0 && variant.total >= 3,
+  JSON.stringify({ code: variantReport.code, passed: variant.passed, total: variant.total, out: variant.out.slice(0, 160) }));
+const bootProcessOnly = await bootProbe({ AI_QUOTA_RESERVATION_TABLE: '', PORT: '0' });
+const startupPo = parseStartup(bootProcessOnly.stdout.split('\n').find((x) => /startup/.test(x)) || '');
+check('P-boot a process-only boot reports idempotency process-only, and does not claim durable',
+  startupPo.quotaIdempotency === 'process-only' && startupPo.quotaAuthority === 'nodesend'
+  && startupPo.quotaReplicas === 'exactly-one-quota-service-replica', JSON.stringify(startupPo));
+check('P-boot a process-only boot warns about the restart window',
+  /NodeSendQuotaIdempotencyProcessOnly/.test(bootProcessOnly.stderr)
+  && /restart can charge the same/i.test(bootProcessOnly.stderr), bootProcessOnly.stderr.slice(0, 200));
 
 console.log = realLog;
 let failed = 0;
@@ -581,10 +1399,11 @@ for (const x of results) {
   if (!x.pass) failed++;
   console.log(`${x.pass ? 'PASS' : 'FAIL'}  ${x.name}${x.detail ? '   [' + x.detail + ']' : ''}`);
 }
-console.log(`\nRESULTS: ${results.length - failed}/${results.length} passed, ${failed} failed`);
-console.log('MOCKED: the NCB session authority and the AI provider are in-process fakes; the BridgeMind quota');
-console.log('service is a real loopback HTTP server, so the adapter is exercised over a socket.');
-console.log('NOT CONFIGURED ANYWHERE REAL: no production endpoint was contacted, and no quota row exists here.');
-service.requests.length = 0;
-quotaService.close();
+console.log(`\nRESULTS: ${results.length - failed}/${results.length} passed, ${failed} failed  (variant=${VARIANT})`);
+console.log('MOCKED: NCB (session authority AND the four ai_quota_* tables) and the AI provider are loopback');
+console.log('fakes; the relay under test is the real exported app over a real socket. Two child processes boot');
+console.log('bridge.js on port 0 to read the real startup line, and the process-only variant runs itself.');
+console.log('NOT CONFIGURED ANYWHERE REAL: no production endpoint was contacted and no quota row was written.');
+ncbServer.close();
+try { app.close?.(); } catch { /* Express 4 has no app.close */ }
 process.exit(failed ? 1 : 0);

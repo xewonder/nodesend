@@ -21,9 +21,13 @@ const SESSION_SECRET = 'ncb-session-lookup-must-never-appear-in-a-response';
 const UPSTREAM_SECRET = 'TRICKSTER-UPSTREAM-KEY-do-not-leak-8f21';
 const BID_DECOY = 'https://bid.example.invalid';
 
-// The four Trickster routes never touch the per-user quota store, so this harness
-// needs no store mock at all beyond the session lookup below. (It used to stub the
-// `pg` driver for the retired Postgres quota path; that dependency is gone.)
+// The four Trickster routes never touch the per-user quota store, so this harness needs no
+// store mock beyond the session lookup below — and since NodeSend became the quota
+// authority, "no store mock" is a claim worth testing rather than assuming: the fetch stub
+// records any /data/ route it is asked for, and check 12b fails the run if a Trickster call
+// ever spends a user's quota. (This file used to stub the `pg` driver for the retired
+// Postgres quota path; that dependency is gone.)
+const ncbDataRoutes = [];
 
 process.env.BRIDGE_API_KEY = 'relay-key-not-used-by-trickster';
 process.env.NCB_PROXY_BASE = 'https://ncb.test.invalid';
@@ -75,6 +79,10 @@ const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, init = {}) => {
   const target = String(url);
   if (target.startsWith('https://ncb.test.invalid')) {
+    // A Trickster call must never reach the quota storage. Recording the NCB traffic here
+    // makes "Trickster is quota-free" an observation about this run rather than a reading
+    // of the source text — see check 12b below.
+    if (new URL(target).pathname.startsWith('/data/')) ncbDataRoutes.push(new URL(target).pathname);
     const token = String(init?.headers?.Authorization || init?.headers?.authorization || '');
     const key = token.replace(/^Bearer\s+/, '');
     const user = SESSIONS[key];
@@ -373,15 +381,37 @@ check('12. existing AI, quota, session and relay behaviour is unchanged',
   && missing.status === 404 && missing.json?.error === 'Endpoint not found'
   && root.json?.endpoints?.aiChat === 'POST /ai/chat'
   && root.json?.auth?.ai === 'BridgeMind Bearer session'
-  && root.json?.quotaService?.authority === 'bridgemind'
-  && health.json?.quotaAuthority === 'bridgemind' && health.json?.status === 'healthy'
+  // UPDATED 2026-10-04, disclosed: this clause used to pin the quota authority to
+  // "bridgemind" and to require the remote-adapter helpers (bridgemindQuotaEndpoint,
+  // sanitizeQuotaDecision) to exist. Both are gone by design — NodeSend is the sole quota
+  // authority now — so the clause is re-aimed at the new surface rather than deleted: it
+  // still proves the Trickster gateway did not disturb the quota reporting, and now proves
+  // it reports the architecture the relay actually runs.
+  && root.json?.quota?.authority === 'nodesend' && root.json?.quota?.storage === 'ncb'
+  && root.json?.quota?.replicas === 'exactly-one-quota-service-replica'
+  && health.json?.quotaAuthority === 'nodesend' && health.json?.quotaStorage === 'ncb'
+  && health.json?.quotaReplicas === 'exactly-one-quota-service-replica'
+  && health.json?.status === 'healthy'
   && root.json?.endpoints?.email === 'POST /send' && root.json?.endpoints?.quota === 'GET|POST /quota'
-  && bridge.NODESEND_VERSION === 'bridge-bridgemind-quota-v8'
-  && typeof bridge.bridgemindQuotaEndpoint === 'function' && typeof bridge.sanitizeQuotaDecision === 'function'
+  && bridge.NODESEND_VERSION === 'bridge-nodesend-quota-v9'
+  && typeof bridge.quotaStore?.findReservation === 'function'
+  && typeof bridge.reserveQuotaDecision === 'function'
+  && bridge.QUOTA_SINGLE_REPLICA_INVARIANT === 'exactly-one-quota-service-replica'
+  && typeof bridge.bridgemindQuotaEndpoint === 'undefined'
+  && typeof bridge.sanitizeQuotaDecision === 'undefined'
+  && typeof bridge.quotaServiceState === 'undefined'
   && Object.keys(bridge.TRICKSTER_RESPONSE_SHAPES).join() === 'bid:health,play:health,bid:suggest,play:suggest'
   && !/requireApiKey[\s\S]{0,80}proxyTrickster/.test(sourceOfTruth)
   && (sourceOfTruth.match(/app\.(get|post)\("\/trickster\//g) || []).length === 6,
   JSON.stringify({ ai: aiNoSession.status, quotaConfig: quotaConfigNoSession.status, quota: quotaNoKey.status, pub: publicKey.status, missing: missing.status }));
+
+// ── 12b: Trickster billing is unchanged ───────────────────────────────────
+// Every Trickster call above went through requireBridgeSession, and NodeSend now holds the
+// quota counter itself. If the gateway had been wired into the reservation path, one of
+// those calls would have reached the store — so this is a measured absence, from the
+// traffic of this run, not a reading of the source.
+check('12b. a Trickster call never touches the quota store (billing unchanged)',
+  ncbDataRoutes.length === 0, ncbDataRoutes.join(','));
 
 // ── report ────────────────────────────────────────────────────────────────
 server.close();
