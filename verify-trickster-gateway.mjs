@@ -373,11 +373,11 @@ check('12. existing AI, quota, session and relay behaviour is unchanged',
   && missing.status === 404 && missing.json?.error === 'Endpoint not found'
   && root.json?.endpoints?.aiChat === 'POST /ai/chat'
   && root.json?.auth?.ai === 'BridgeMind Bearer session'
-  && root.json?.quotaStorage?.authority === 'ncb'
-  && health.json?.quotaAuthority === 'ncb' && health.json?.status === 'healthy'
+  && root.json?.quotaService?.authority === 'bridgemind'
+  && health.json?.quotaAuthority === 'bridgemind' && health.json?.status === 'healthy'
   && root.json?.endpoints?.email === 'POST /send' && root.json?.endpoints?.quota === 'GET|POST /quota'
-  && bridge.NODESEND_VERSION === 'bridge-ncb-quota-v6'
-  && typeof bridge.resolveQuotaLimit === 'function' && typeof bridge.withUserQuotaLock === 'function'
+  && bridge.NODESEND_VERSION === 'bridge-bridgemind-quota-v8'
+  && typeof bridge.bridgemindQuotaEndpoint === 'function' && typeof bridge.sanitizeQuotaDecision === 'function'
   && Object.keys(bridge.TRICKSTER_RESPONSE_SHAPES).join() === 'bid:health,play:health,bid:suggest,play:suggest'
   && !/requireApiKey[\s\S]{0,80}proxyTrickster/.test(sourceOfTruth)
   && (sourceOfTruth.match(/app\.(get|post)\("\/trickster\//g) || []).length === 6,
