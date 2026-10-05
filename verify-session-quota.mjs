@@ -64,8 +64,11 @@ const STORAGE_STRINGS = ['ai_quota_config', 'ai_quota_user_override', 'ai_quota_
 // ── the quota store: a real loopback NCB proxy mock ────────────────────────
 const ncb = {
   requests: [],
-  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [] },
-  nextId: { ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1 },
+  // `user_settings` is the AUTHORITATIVE ai_source table the relay now reads. It is in
+  // this registry so a read for it is served like any other and, crucially, so a
+  // missing-table bug would surface as a 404 rather than as a silent free pass.
+  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [] },
+  nextId: { ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1, user_settings: 1 },
   // One fault at a time: mixing them makes a red check ambiguous about which fired.
   fault: null,
   faultHits: {},
@@ -141,6 +144,13 @@ const ncbServer = http.createServer((req, res) => {
         rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
       }
       if (ncb.fault === 'override_malformed' && table === 'ai_quota_user_override') rows = rows.map((r) => ({ ...r, enabled: null }));
+      // The authoritative source lookup under stress: a storage error, and a doubled
+      // row. Both must fall toward BILLING, so these are what prove the fail-closed
+      // direction is real and not a comment.
+      if (ncb.fault === 'settings_read_fail' && table === 'user_settings') return fail(500, 'storage unavailable');
+      if (ncb.fault === 'settings_duplicate' && table === 'user_settings') {
+        rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
+      }
       return ok(rows);
     }
 
@@ -203,6 +213,15 @@ const seed = () => {
   ncb.rows.ai_quota_user_override = [];
   ncb.rows.ai_quota_usage = [];
   ncb.rows.ai_quota_reservation = [];
+  // Every seeded account starts on System AI, which is the app's own default and the
+  // conservative answer: the pre-existing charging checks keep testing a billed path,
+  // and an exemption is always an explicit choice made in this file.
+  ncb.rows.user_settings = [
+    { id: ncb.nextId.user_settings++, user_id: 101, ai_source: 'system' },
+    { id: ncb.nextId.user_settings++, user_id: 202, ai_source: 'system' },
+    { id: ncb.nextId.user_settings++, user_id: 204, ai_source: 'system' },
+    { id: ncb.nextId.user_settings++, user_id: 900, ai_source: 'system' }
+  ];
   ncb.fault = null;
   ncb.faultHits = {};
   ncb.hideReservationReads = 0;
@@ -210,7 +229,27 @@ const seed = () => {
   ncb.counts = {};
   events.length = 0;
   mod.resetQuotaProcessLedger();
+  // The source cache is process state. Left warm, it would make a "the switch
+  // propagated" check pass while reading a stale answer, so every scenario starts cold.
+  mod.resetAiSourceCache();
 };
+// Set an account's AUTHORITATIVE source, as the app's own settings save would.
+// `null` removes the row entirely, which is the "never opened Settings" case.
+const setSource = (userId, value) => {
+  const existing = ncb.rows.user_settings.find((r) => String(r.user_id) === String(userId));
+  if (value === null) {
+    ncb.rows.user_settings = ncb.rows.user_settings.filter((r) => String(r.user_id) !== String(userId));
+    mod.resetAiSourceCache(userId);
+    return null;
+  }
+  if (existing) existing.ai_source = value;
+  else ncb.rows.user_settings.push({ id: ncb.nextId.user_settings++, user_id: userId, ai_source: value });
+  mod.resetAiSourceCache(userId);
+  return existing || ncb.rows.user_settings.find((r) => String(r.user_id) === String(userId));
+};
+const sourceReads = (userId) => ncb.requests.filter((q) => q.pathname === `/data/read/user_settings`
+  && String(q.query.user_id) === String(userId));
+const overrideRow = (userId) => ncb.rows.ai_quota_user_override.find((r) => String(r.user_id) === String(userId));
 const usageRow = (userId) => ncb.rows.ai_quota_usage.find((r) => String(r.user_id) === String(userId) && r.period_key === PERIOD);
 const setUsage = (userId, callsUsed, appliedLimit = DEFAULT_LIMIT) => {
   const existing = usageRow(userId);
@@ -925,6 +964,278 @@ check('the counter write is an absolute value computed here (read-check-write)',
   && String(usageWrite?.body?.user_id) === '101' && usageWrite?.body?.period_key === PERIOD,
   JSON.stringify(usageWrite?.body));
 
+// ── 7b. AUTHORITATIVE AI SOURCE: the quota governs System AI accounts only ──
+// SECURITY INVARIANT proved here: the waiver is granted by `user_settings.ai_source`
+// read for the SESSION's user, and by nothing the requester controls. Every check
+// below that involves a header is therefore a FORGERY test — the interesting question
+// is never "did the header work" but "is the header still powerless".
+// The exemption claim is also strong on purpose: not "the counter grew more slowly"
+// but "no quota table was read or written at all".
+const FORGE_USER = { 'x-ai-billing-source': 'user' };
+const FORGE_SYSTEM = { 'x-ai-billing-source': 'system' };
+const quotaCalls = (from = 0) => ncb.requests.slice(from).filter((q) => /ai_quota_/.test(q.pathname || ''));
+
+seed();
+events.length = 0;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, { ...KEY('forge-1'), ...FORGE_USER }));
+j = await bodyOf(r);
+const forgedUsed = ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage');
+check('S1 a forged "user" header CANNOT bypass the quota: stored system ⇒ the call is still charged',
+  r.status === 200 && forgedUsed === true && usageRow('101')?.calls_used === 1
+  && j?.quota?.enabled === true && r.headers.get('x-quota-reservation') === 'created',
+  `charged=${forgedUsed} used=${usageRow('101')?.calls_used} header=${r.headers.get('x-quota-reservation')}`);
+check('S1b the forgery is logged as a mismatch, and nothing else',
+  events.filter((e) => e === 'read:user_settings').length === 1
+  && usageRow('101')?.calls_used === 1, events.filter((e) => /user_settings/.test(e)).join(','));
+
+seed();
+setSource('101', 'user');
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, { ...KEY('forge-2'), ...FORGE_SYSTEM }));
+j = await bodyOf(r);
+check('S2 a forged "system" header cannot force an Own-AI account to consume System quota either',
+  r.status === 200 && quotaCalls().length === 0 && usageRow('101') === undefined
+  && j?.quota?.quota_applies === false,
+  `quota calls=${quotaCalls().length} used=${usageRow('101')?.calls_used}`);
+
+seed();
+setSource('101', null);
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('no-row')));
+check('S3 no settings row ⇒ System AI (the app default), so an account is never silently unbilled',
+  r.status === 200 && ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage'),
+  `charged=${ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage')}`);
+
+seed();
+setSource('101', 'user');
+ncb.fault = 'settings_read_fail';
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('source-down')));
+const readFailedCharged = ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage');
+check('S4 a failed source read fails toward BILLING, never toward free usage',
+  r.status === 200 && readFailedCharged === true,
+  `charged=${readFailedCharged} status=${r.status}`);
+ncb.fault = null;
+
+seed();
+setSource('101', 'banana');
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('odd-value')));
+check('S5 an unrecognised stored value is System AI, not an exemption',
+  ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage'),
+  `charged=${ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage')}`);
+
+seed();
+setSource('101', 'user');
+ncb.fault = 'settings_duplicate';
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('dup-settings')));
+check('S6 duplicate settings rows never buy an exemption — ambiguous means billed',
+  r.status === 200 && ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage'),
+  `charged=${ncb.requests.some((q) => q.pathname === '/data/create/ai_quota_usage')}`);
+ncb.fault = null;
+
+seed();
+setSource('101', 'system');
+const cachedStatuses = [];
+for (const k of ['c1', 'c2', 'c3', 'c4', 'c5']) {
+  const res = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(k)));
+  cachedStatuses.push(res.status);
+}
+// The cache claim is about READS, not about how many calls were allowed: the cap is
+// DEFAULT_LIMIT (3), so calls 4 and 5 are correctly 429 — and they still cost no
+// second source read, which is the point.
+check('S7 the source is read once and then cached, including on calls the cap refuses',
+  sourceReads('101').length === 1 && usageRow('101')?.calls_used === DEFAULT_LIMIT
+  && cachedStatuses.filter((s) => s === 200).length === DEFAULT_LIMIT
+  && cachedStatuses.filter((s) => s === 429).length === 5 - DEFAULT_LIMIT,
+  `settings reads=${sourceReads('101').length} used=${usageRow('101')?.calls_used} statuses=${cachedStatuses.join('/')}`);
+check('S7b the cache is bounded and in range: 45s TTL, 5s for a failed read',
+  mod.AI_SOURCE_CACHE_TTL_MS === 45000 && mod.AI_SOURCE_FAILURE_CACHE_TTL_MS === 5000
+  && mod.AI_SOURCE_CACHE_TTL_MS >= 30000 && mod.AI_SOURCE_CACHE_TTL_MS <= 60000,
+  `ttl=${mod.AI_SOURCE_CACHE_TTL_MS} failureTtl=${mod.AI_SOURCE_FAILURE_CACHE_TTL_MS}`);
+
+seed();
+setSource('101', 'system');
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('d1')));
+const readsBeforeInvalidate = sourceReads('101').length;
+const requestsAtSwitch = ncb.requests.length;
+setSource('101', 'user');   // setSource drops that user's cache entry, as a settings write would
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('d2')));
+check('S8 the cache re-reads after the source changes, and the next call is exempt',
+  sourceReads('101').length === readsBeforeInvalidate + 1 && r.status === 200
+  && quotaCalls(requestsAtSwitch).length === 0 && usageRow('101')?.calls_used === 1,
+  `reads=${sourceReads('101').length} quota calls after the switch=${quotaCalls(requestsAtSwitch).length}`);
+
+seed();
+setSource('101', 'user');
+const raced = await Promise.all([1, 2, 3, 4, 5].map((n) => fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(`race-${n}`)))));
+check('S8b five concurrent exempt calls: no quota traffic at all, and one source read at most',
+  raced.every((res) => res.status === 200) && quotaCalls().length === 0
+  && sourceReads('101').length <= 1,
+  `settings reads=${sourceReads('101').length} quota calls=${quotaCalls().length}`);
+
+seed();
+setSource('101', 'user');
+const beforeDup = ncb.requests.length;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, { ...KEY('dup-exempt'), ...FORGE_SYSTEM }));
+const dupSecond = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, { ...KEY('dup-exempt'), ...FORGE_SYSTEM }));
+check('S9 an exempt account creates no reservation and no counter, on a retry or out of the box',
+  claim('101', 'dup-exempt') === undefined && usageRow('101') === undefined
+  && r.status === 200 && dupSecond.status === 200,
+  `claims=${ncb.rows.ai_quota_reservation.length} usage=${ncb.rows.ai_quota_usage.length}`);
+void beforeDup;
+
+seed();
+setSource('101', 'system');
+const switchLadderStart = world.providerCalls;
+for (let n = 1; n <= DEFAULT_LIMIT; n += 1) {
+  r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY(`ladder-${n}`)));
+}
+const overCap = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('ladder-over')));
+setSource('101', 'user');
+mod.resetAiSourceCache('101');
+const afterExemption = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('ladder-after-switch')));
+check('S10 an account at the cap starts working the moment it moves to its own AI, and the quota is untouched',
+  overCap.status === 429 && afterExemption.status === 200
+  && usageRow('101')?.calls_used === DEFAULT_LIMIT
+  && world.providerCalls === switchLadderStart + DEFAULT_LIMIT + 1,
+  `cap=${overCap.status} exempt=${afterExemption.status} used=${usageRow('101')?.calls_used}`);
+
+seed();
+setSource('101', 'user');
+r = await fetch(`${B}/ai/models`, CHAT('tok-a', {}, FORGE_USER));
+check('S11 the source decision is confined to the chat path; a non-chat surface stays quota-free',
+  r.status === 200 && quotaCalls().length === 0, `quota calls=${quotaCalls().length}`);
+
+// ── ADMINISTRATOR PER-USER ROUTES ──────────────────────────────────────────
+seed();
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-a'));
+check('R1 the per-account quota status is administrator-only (403 for an ordinary user)',
+  r.status === 403 && quotaCalls().length === 0, `status=${r.status}`);
+r = await fetch(`${B}/ai/quota/status?user_id=101`, { method: 'GET' });
+check('R1b it requires a session at all', r.status === 401, `status=${r.status}`);
+
+seed();
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-admin'));
+j = await bodyOf(r);
+check('R2 an admin sees real System AI figures, computed by the same resolver that bills',
+  r.status === 200 && j.aiSource === 'system' && j.quotaApplies === true
+  && j.effectiveLimit === DEFAULT_LIMIT && j.used === 0 && j.globalLimit === DEFAULT_LIMIT
+  && j.limitSource === 'default' && j.overrideEnabled === null,
+  JSON.stringify({ s: r.status, a: j.aiSource, l: j.effectiveLimit, u: j.used }));
+
+seed();
+setSource('101', 'user');
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-admin'));
+j = await bodyOf(r);
+check('R3 an Own-AI account is reported as not applicable, with no invented figures',
+  r.status === 200 && j.aiSource === 'user' && j.quotaApplies === false
+  && j.used === null && j.effectiveLimit === null && j.remaining === null && j.percentage === null,
+  JSON.stringify({ a: j.aiSource, u: j.used, e: j.effectiveLimit }));
+
+seed();
+r = await fetch(`${B}/ai/quota/status?user_id=101`, {
+  method: 'GET', headers: { Authorization: 'Bearer tok-admin', ...FORGE_USER }
+});
+j = await bodyOf(r);
+check('R4 the admin view follows the stored source, never a header the caller sent',
+  r.status === 200 && j.aiSource === 'system' && j.quotaApplies === true,
+  JSON.stringify({ a: j.aiSource, q: j.quotaApplies }));
+
+seed();
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-a', { user_id: '101', enabled: true, call_limit: 9 }));
+check('R5 an ordinary user cannot set anyone\'s limit, and nothing is written',
+  r.status === 403 && ncb.rows.ai_quota_user_override.length === 0, `status=${r.status}`);
+
+seed();
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+j = await bodyOf(r);
+check('R6 an admin sets a System AI account\'s custom limit, persisted and read back',
+  r.status === 200 && j.effectiveLimit === 9 && j.limitSource === 'override'
+  && overrideRow('101')?.call_limit === 9 && overrideRow('101')?.enabled === 1,
+  JSON.stringify({ s: r.status, e: j.effectiveLimit, row: overrideRow('101') }));
+const usedAfterSet = usageRow('101')?.calls_used;
+check('R6b setting a limit never touches the usage counter',
+  usedAfterSet === undefined && !dataCalls().some((q) => /create\/ai_quota_usage|update\/ai_quota_usage/.test(q.pathname)),
+  `usage rows=${ncb.rows.ai_quota_usage.length}`);
+
+seed();
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+const usedBeforeRemoval = setUsage('101', 2);
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: false, call_limit: 0 }));
+j = await bodyOf(r);
+check('R7 "return to global" clears the override the way the resolver reads it (enabled=0)',
+  r.status === 200 && j.effectiveLimit === DEFAULT_LIMIT && j.limitSource === 'default'
+  && overrideRow('101')?.enabled === 0,
+  JSON.stringify({ s: r.status, e: j.effectiveLimit, row: overrideRow('101') }));
+check('R7b and it still does not touch the usage counter',
+  usageRow('101')?.calls_used === 2 && usageRow('101')?.id === usedBeforeRemoval.id,
+  `used=${usageRow('101')?.calls_used}`);
+
+seed();
+setSource('101', 'user');
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+j = await bodyOf(r);
+check('R8 setting a limit for an Own-AI account is refused with a stable code, and nothing is written',
+  r.status === 409 && j.reason === 'user_not_using_system_ai'
+  && ncb.rows.ai_quota_user_override.length === 0
+  && !dataCalls().some((q) => /create\/ai_quota_user_override|update\/ai_quota_user_override/.test(q.pathname)),
+  JSON.stringify({ s: r.status, reason: j.reason, rows: ncb.rows.ai_quota_user_override.length }));
+
+seed();
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+check('R8b a stored limit survives the switch to Own AI and is dormant, not deleted',
+  r.status === 200 && overrideRow('101')?.call_limit === 9, `row=${JSON.stringify(overrideRow('101'))}`);
+setSource('101', 'user');
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-admin'));
+j = await bodyOf(r);
+check('R8c the admin sees it as a dormant override while the account is on its own AI',
+  r.status === 200 && j.quotaApplies === false && j.dormantOverride === true && j.overrideLimit === 9,
+  JSON.stringify({ d: j.dormantOverride, l: j.overrideLimit }));
+setSource('101', 'system');
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-admin'));
+j = await bodyOf(r);
+check('R8d switching back to System AI makes the same stored override effective again',
+  r.status === 200 && j.quotaApplies === true && j.effectiveLimit === 9 && j.limitSource === 'override',
+  JSON.stringify({ e: j.effectiveLimit, s: j.limitSource }));
+const rowBeforeReroute = overrideRow('101').id;
+r = await fetch(`${B}/ai/chat`, CHAT('tok-a', {}, KEY('effective-after-switch')));
+check('R8e and the chat path actually bills against it, with no new override row created',
+  r.status === 200 && usageRow('101')?.applied_limit === 9
+  && overrideRow('101')?.id === rowBeforeReroute,
+  `applied=${usageRow('101')?.applied_limit}`);
+
+seed();
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 0 }));
+const zeroRow = overrideRow('101');
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 2.5 }));
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 'lots' }));
+check('R9 an invalid limit is refused with 400 and never reaches storage',
+  r.status === 400 && zeroRow === undefined && !dataCalls().some((q) => /ai_quota_user_override/.test(q.pathname)),
+  `status=${r.status} rows=${ncb.rows.ai_quota_user_override.length}`);
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', call_limit: 9 }));
+check('R9b a non-boolean enabled is refused rather than guessed at', r.status === 400, `status=${r.status}`);
+
+seed();
+// The duplicate fault doubles rows that EXIST; against an empty override table it
+// would silently produce zero rows and the check would pass without ever testing the
+// ambiguity it exists to cover. So a real row is written first.
+await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+ncb.fault = 'override_duplicate';
+r = await fetch(`${B}/ai/quota/status?user_id=101`, AUTH('tok-admin'));
+const dupBody = await bodyOf(r);
+check('R10 an ambiguous override is reported as unavailable, never resolved by taking the first row',
+  r.status === 503 && dupBody.reason === 'override_duplicate',
+  `status=${r.status} reason=${dupBody.reason} rows=${ncb.rows.ai_quota_user_override.length}`);
+ncb.fault = null;
+
+seed();
+r = await fetch(`${B}/ai/quota/status`, AUTH('tok-admin'));
+check('R11 a missing target is a 400 and costs no storage read',
+  r.status === 400 && quotaCalls().length === 0, `status=${r.status}`);
+
+seed();
+setSource('101', 'system');
+r = await fetch(`${B}/ai/quota/user`, PUTJSON('tok-admin', { user_id: '101', enabled: true, call_limit: 9 }));
+check('R12 a header claiming "user" cannot make the admin route refuse a legitimate write',
+  r.status === 200 && overrideRow('101')?.call_limit === 9, `status=${r.status}`);
+
 // ── 8. surfaces that must stay quota-free ─────────────────────────────────
 seed();
 setUsage('101', 0);
@@ -1241,14 +1552,24 @@ check('the four table names are configurable by env, and no fifth table is addre
 check('no SQL or DDL is issued from the relay',
   !/\b(CREATE TABLE|ALTER TABLE|DROP TABLE|TRUNCATE|ON CONFLICT|INSERT INTO|UPSERT)\b/i.test(codeOnly)
   && !/\bSELECT\b[\s\S]{0,60}\bFROM\b/i.test(codeOnly), '');
-// One transport helper, three awaited call sites: the session lookup, the quota read and the
-// quota write. The awaited count is what is pinned, so a fourth NCB call site cannot be added
-// without someone deciding in review what it is for.
-check('there is one NCB transport and it is used by the session lookup and the quota path only',
+// UNCHANGED IN COUNT, EXTENDED IN SCOPE. The pin below still requires exactly THREE
+// awaited `ncbRequest` sites (session, quota read, quota write). The authoritative
+// AI-source lookup added no fourth one: it goes through the same read-only `quotaRead`
+// the config, override and usage reads already use, so the transport surface did not
+// grow — only the set of tables the read helper may touch. Because a new table is now
+// reachable, this check additionally pins that the new one is READ-ONLY from this
+// process, which is the property that actually matters: the relay never writes a
+// player's AI source, so it cannot talk itself out of a bill.
+const sourceAwaits = (codeOnly.match(/await ncbRequest\(/g) || []).length;
+check('there is one NCB transport, still three call sites, and user_settings is reachable only by reading',
   (codeOnly.match(/async function ncbRequest/g) || []).length === 1
-  && (codeOnly.match(/await ncbRequest\(/g) || []).length === 3
-  && (codeOnly.match(/ncbRequest\(req, "\/auth\/get-session"/g) || []).length === 1,
-  `definition=${(codeOnly.match(/async function ncbRequest/g) || []).length} awaits=${(codeOnly.match(/await ncbRequest\(/g) || []).length}`);
+  && sourceAwaits === 3
+  && (codeOnly.match(/ncbRequest\(req, "\/auth\/get-session"/g) || []).length === 1
+  && /quotaRead\(req,\s*`\/data\/read\/\$\{USER_SETTINGS_TABLE\}/.test(codeOnly)
+  && (codeOnly.match(/\/data\/(create|update|delete)\/\$\{USER_SETTINGS_TABLE\}/g) || []).length === 0
+  // The source table is not folded into the write helper at all.
+  && !/USER_SETTINGS_TABLE/.test((codeOnly.match(/quotaWrite\(req[^)]*\)/g) || []).join(' ')),
+  `awaits=${sourceAwaits} (expected 3: session, read, write) sourceReadOnly=${/quotaRead\(req,\s*`\/data\/read\/\$\{USER_SETTINGS_TABLE\}/.test(codeOnly)}`);
 check('no NCB service credential exists or is invented',
   !/NCB_SERVICE_TOKEN|NCB_ADMIN_TOKEN|NCB_API_KEY|NCB_BEARER|QUOTA_DATABASE_URL|DATABASE_URL/.test(codeOnly)
   && [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].sort().join(',') === 'NCB_INSTANCE,NCB_PROXY_BASE,NCB_TIMEOUT_MS',
@@ -1270,8 +1591,27 @@ check('the caller bearer is the only credential the NCB transport can carry',
   (codeOnly.match(/Authorization: `Bearer \$\{getBearerToken\(req\)\}`/g) || []).length === 1
   && /headers: \{[\s\S]{0,120}getBearerToken\(req\)/.test(codeOnly)
   && !/getBearerToken\(req\)[\s\S]{0,400}process\.env/.test(codeOnly.match(/async function ncbRequest[\s\S]{0,400}/)[0] || ''), '');
-check('identity is read only from the validated session',
-  /req\.bridgeUser\?\.id/.test(codeOnly) && !/req\.body\??\.user_id|req\.query\??\.user_id|query\.user_id/.test(codeOnly), '');
+// UNCHANGED IN SUBSTANCE, made precise: who a call is BILLABLE to still comes only
+// from the validated session, and no chat, relay or quota-decision path may read a user
+// id from the request. The two administrator per-user routes do read a TARGET id — that
+// is their whole purpose — so the exemption is carved out by name and bounded, rather
+// than the rule being relaxed to "whatever appears somewhere". A non-admin cannot reach
+// those handlers at all (session + role guard, asserted separately), so a target id can
+// never redirect a charge.
+const adminHandlerBodies = ['quotaAdminStatusHandler', 'quotaAdminLimitHandler']
+  .map((name) => (codeOnly.match(new RegExp(`async function ${name}\\([\\s\\S]*?\\n\\}`, 'u')) || [''])[0]);
+const codeOutsideAdminTargets = codeOnly
+  .split('\n')
+  .filter((line) => !adminHandlerBodies.some((body) => body.includes(line)))
+  .join('\n');
+check('identity for billing is the session only; a request-supplied target id exists in no other path',
+  /req\.bridgeUser\?\.id/.test(codeOnly)
+  && !/req\.body\??\.user_id|req\.query\??\.user_id|query\.user_id/.test(codeOutsideAdminTargets)
+  // the ledger and the reservation still take the id from the session user
+  && !/user_id:\s*req\.(body|query)/.test(codeOnly)
+  // and the target is only ever read inside the two handlers that are role-guarded
+  && adminHandlerBodies.every((body) => /user_id/.test(body)),
+  `leaks outside the admin handlers: ${(codeOutsideAdminTargets.match(/req\.body\??\.user_id|req\.query\??\.user_id|query\.user_id/g) || []).join(', ') || 'none'}`);
 check('the session and admin guards are attached to all six AI surfaces',
   /app\.post\("\/ai\/models",\s*requireBridgeSession/.test(codeOnly)
   && /app\.post\("\/ai\/test",\s*requireBridgeSession/.test(codeOnly)

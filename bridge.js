@@ -603,6 +603,36 @@ const DECISION_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._:#+-]{0,127}$/u;
 // client's decisions share one key — the ledger would then report "already billed" for
 // genuinely new work. Dropping a key costs a dedupe; it never buys a free call.
 const DECISION_KEY_UNSET_WORDS = /^(?:undefined|null|nan|\{\}|object|string)$/iu;
+/* Which AI configuration is paying for this call, as a HEADER — like the decision key, and
+   for the same mechanical reason: `buildProviderBody` removes only `provider` and `config`
+   and forwards everything else to the provider, so a marker in the body would be sent to
+   Alibaba/OpenAI as a parameter.
+
+   DIAGNOSTIC ONLY, WITH ZERO BILLING AUTHORITY. Whether this account is governed by the
+   System AI quota is decided server-side from `user_settings.ai_source`, resolved for the
+   user id the SESSION authenticated (`resolveUserAiSource`), and by nothing else on this
+   request: not this header, not a body field, not a credential, not a claimed role. That is
+   the whole reason it cannot be decisional — the party that benefits from claiming "user"
+   is the party writing the request.
+
+   A value that disagrees with the stored source is logged as `ai_source_claim_mismatch` in
+   BOTH directions and acted on in NEITHER. Forged values can therefore neither waive a
+   charge nor impose one. Absent or unrecognised means "system", which is both BridgeMind's
+   own default for an unset preference and the conservative answer for money: an old client
+   keeps being billed rather than quietly escaping the counter.
+
+   BridgeMind's current source no longer sends this header at all; a previously deployed
+   build may still send one, and it is treated exactly like any other forged value — logged,
+   never believed. */
+const BILLING_SOURCE_HEADER = "x-ai-billing-source";
+const BILLING_SOURCE_SYSTEM = "system";
+const BILLING_SOURCE_USER = "user";
+
+function requestBillingSource(req) {
+  const raw = String(req.get(BILLING_SOURCE_HEADER) ?? "").trim().toLowerCase();
+  return raw === BILLING_SOURCE_USER ? BILLING_SOURCE_USER : BILLING_SOURCE_SYSTEM;
+}
+
 const QUOTA_PROCESS_LEDGER_LIMIT = 5000;
 const QUOTA_WRITE_METHODS = { create: "POST", update: "PUT", remove: "DELETE" };
 // The deployment requirement, named once. NCB gives this process no atomic increment and no
@@ -723,6 +753,15 @@ const quotaStore = {
   readConfig: (req) => quotaRead(req, `/data/read/${QUOTA_TABLES.config}`),
   readOverride: (req, userId) => quotaRead(req,
     `/data/read/${QUOTA_TABLES.override}?${quotaFilter({ user_id: userId })}`),
+  // The override WRITE side, added for the administrator per-user limit route. Same
+  // transport, same envelope, same absolute-value semantics as the counter write:
+  // there is no increment here to lose, and a rejected write is reported, never
+  // retried blind. `create`/`update` are chosen by whether a row already exists,
+  // which the caller learns from `readOverride` in the same critical section.
+  createOverride: (req, row) => quotaWrite(req, QUOTA_WRITE_METHODS.create,
+    `/data/create/${QUOTA_TABLES.override}`, row, "override_create_failed"),
+  updateOverride: (req, id, patch) => quotaWrite(req, QUOTA_WRITE_METHODS.update,
+    `/data/update/${QUOTA_TABLES.override}/${encodeURIComponent(id)}`, patch, "override_update_failed"),
   readUsage: (req, userId, periodKey) => quotaRead(req,
     `/data/read/${QUOTA_TABLES.usage}?${quotaFilter({ user_id: userId, period_key: periodKey })}`),
   createUsage: (req, row) => quotaWrite(req, QUOTA_WRITE_METHODS.create,
@@ -845,6 +884,124 @@ async function resolveQuotaLimit(req, userId, config) {
 // One usage row per (user, period) is required. Duplicates are reported, never resolved
 // by picking the first row, because silently billing one of two rows is exactly the
 // defect a guard must refuse to hide.
+// ── AUTHORITATIVE AI SOURCE: who is paying for this account's AI ───────────
+// SECURITY: the System-AI quota may only ever be waived on the strength of THIS
+// lookup. A client-supplied header, body field, credential or role is a HINT with
+// zero billing authority, because the party that benefits from being marked "own AI"
+// is the party writing the request. A forged `x-ai-billing-source: user` while still
+// using the System's credential must therefore be billed anyway — that is the whole
+// reason this function exists and the reason it is read here rather than trusted
+// from the request.
+//
+// The authority is the same column the app itself uses: `user_settings.ai_source`,
+// written as the literal 'user' only when the player chose their own AI
+// (settingsService.js:49) and read back the same way (:72). So the semantics are
+// the app's, not invented here: literal 'user' ⇒ Own AI; everything else, including
+// no row, an unrecognised value, a malformed row or a failed read, ⇒ System AI.
+//
+// Every ambiguity resolves toward BILLING, never toward free usage:
+//   read failure        → system   (the quota still applies)
+//   no settings row     → system   (an account that never chose has the app default)
+//   unrecognised value  → system
+//   duplicate rows      → system   (never exempt on an ambiguous record; and unlike
+//                                   config/override duplicates this cannot 503 a chat,
+//                                   because refusing a call that was perfectly payable
+//                                   would be a worse answer than charging it)
+// This adds NO new transport call site: the lookup goes through the same read-only
+// `quotaRead` the config, override and usage reads already use, so the relay still has
+// exactly three awaited `ncbRequest` sites (session, read, write) — now over a fifth
+// table. `verify-session-quota.mjs` pins that count and additionally pins that
+// `user_settings` is only ever READ, never written, from this process.
+const USER_SETTINGS_TABLE = "user_settings";
+const AI_SOURCE_SYSTEM = "system";
+const AI_SOURCE_OWN = "user";
+const AI_SOURCE_CACHE_TTL_MS = 45000;     // in-range: 30–60s, so an admin/user change lands quickly
+const AI_SOURCE_FAILURE_CACHE_TTL_MS = 5000; // a blip must not stick for a whole TTL
+const aiSourceCache = new Map();
+const aiSourceInFlight = new Map();
+
+function aiSourceFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { aiSource: AI_SOURCE_SYSTEM, cached: true, reason: "no_settings_row" };
+  }
+  if (rows.length > 1) {
+    return { aiSource: AI_SOURCE_SYSTEM, cached: true, reason: "settings_duplicate" };
+  }
+  const raw = rows[0]?.ai_source;
+  if (raw === undefined || raw === null || raw === "") {
+    return { aiSource: AI_SOURCE_SYSTEM, cached: true, reason: "no_settings_row" };
+  }
+  const value = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
+  if (value === AI_SOURCE_OWN) return { aiSource: AI_SOURCE_OWN, cached: true, reason: null };
+  if (value === AI_SOURCE_SYSTEM) return { aiSource: AI_SOURCE_SYSTEM, cached: true, reason: null };
+  return { aiSource: AI_SOURCE_SYSTEM, cached: true, reason: "unrecognised_value" };
+}
+
+// The lookup itself, with no cache, so the cache can be tested against it.
+async function readUserAiSource(req, userId) {
+  const result = await quotaRead(req,
+    `/data/read/${USER_SETTINGS_TABLE}?${quotaFilter({ user_id: userId })}`);
+  if (!result.ok) return { aiSource: AI_SOURCE_SYSTEM, cached: false, reason: result.reason || QUOTA_UNAVAILABLE };
+  const resolved = envelopeRows(result);
+  if (!resolved.ok) return { aiSource: AI_SOURCE_SYSTEM, cached: false, reason: resolved.reason };
+  return aiSourceFromRows(resolved.rows);
+}
+
+async function resolveUserAiSource(req, userId, { force = false } = {}) {
+  const key = userId == null ? "" : String(userId).trim();
+  // No identity, no exemption. Every caller of this is on a path that has already
+  // authenticated, so this branch is a guard against a future misuse rather than a
+  // live route, and it answers System AI for the same reason everything else does.
+  if (!key) return { aiSource: AI_SOURCE_SYSTEM, cached: false, reason: "no_identity" };
+  const now = Date.now();
+  if (!force) {
+    const hit = aiSourceCache.get(key);
+    if (hit && hit.expiresAt > now) return { aiSource: hit.aiSource, cached: true, reason: hit.reason ?? null };
+  }
+  // One read per user across concurrent requests: the cache is the point, and N
+  // simultaneous calls without a join would be N reads that all answer the same.
+  const pending = aiSourceInFlight.get(key);
+  if (pending) return pending;
+  const run = (async () => {
+    const outcome = await readUserAiSource(req, key);
+    // A failure is remembered only briefly, and never as an exemption: the cached
+    // value on a failed read is System AI, so the worst a blip can do is keep
+    // charging an account for a few more seconds.
+    aiSourceCache.set(key, {
+      aiSource: outcome.aiSource,
+      expiresAt: now + (outcome.cached ? AI_SOURCE_CACHE_TTL_MS : AI_SOURCE_FAILURE_CACHE_TTL_MS),
+      reason: outcome.reason ?? null
+    });
+    return { aiSource: outcome.aiSource, cached: outcome.cached, reason: outcome.reason ?? null };
+  })().finally(() => {
+    aiSourceInFlight.delete(key);
+  });
+  aiSourceInFlight.set(key, run);
+  return run;
+}
+
+// The exemption test, spelled once so no call site can "forget" the authority and
+// read a header instead.
+async function quotaIsApplicableToUser(req, userId) {
+  const resolved = await resolveUserAiSource(req, userId);
+  return { quotaApplies: resolved.aiSource !== AI_SOURCE_OWN, resolved };
+}
+
+// Test seam, and the hook a future settings-write notification would use. Dropping one
+// entry is enough for the next request to re-read, which is how a change made through
+// a path this relay can observe would propagate without waiting out the TTL.
+function resetAiSourceCache(userId) {
+  if (userId === undefined || userId === null || userId === "") {
+    aiSourceCache.clear();
+    aiSourceInFlight.clear();
+    return 0;
+  }
+  const key = String(userId).trim();
+  const had = aiSourceCache.delete(key);
+  aiSourceInFlight.delete(key);
+  return had ? 1 : 0;
+}
+
 async function resolveQuotaUsage(req, userId, periodKey) {
   const resolved = envelopeRows(await quotaStore.readUsage(req, userId, periodKey));
   if (!resolved.ok) return resolved;
@@ -871,6 +1028,28 @@ function quotaView(fields) {
 
 function quotaDisabledView() {
   return quotaView({ enabled: false, unlimited: true, used: 0, limit: null, remaining: null, percentage: 0 });
+}
+
+/* The System AI quota bounds what the SYSTEM pays for. A call the account funds with its
+   own provider key is outside that ledger entirely, so it is none of: "0 used", "not
+   exhausted", or "unlimited" — each of those is a statement about a counter this request
+   never touched. Every figure is null, exactly as an unreadable counter reports itself,
+   and the single positive fact carried is the reason. `allowed` is true because nothing
+   about the call is refused; the quota simply does not apply to it. */
+function quotaNotApplicableView() {
+  return {
+    allowed: true,
+    quota_applies: false,
+    reason: "billing_source_own_ai",
+    enabled: false,
+    unlimited: false,
+    used: null,
+    limit: null,
+    remaining: null,
+    percentage: null,
+    period: null,
+    resetAt: null
+  };
 }
 
 function quotaBoundedView(used, limit) {
@@ -991,6 +1170,29 @@ async function releaseReservation(req, userId, period, key, claim) {
 // result object only, never in a response body.
 async function reserveQuotaDecision(req, user) {
   const key = decisionKeyValue(req);
+  // Own-key accounts stop here, BEFORE any storage read: no config read, no override
+  // read, no reservation, no increment. A request that is not spending the System's
+  // money must not touch the System's ledger even to discover it is exempt.
+  //
+  // SECURITY: the exemption is granted ONLY by `resolveUserAiSource`, which reads
+  // user_settings.ai_source for the id the SESSION resolved. Nothing on this request —
+  // not a header, not a body field, not a credential, not a claimed role — can move
+  // this decision, because the party that benefits from claiming "own AI" is the party
+  // writing the request. A forged header is at most a log line (see below).
+  const applicability = await quotaIsApplicableToUser(req, user?.id);
+  const authoritative = applicability.resolved.aiSource;
+  const claimed = requestBillingSource(req);
+  // Diagnostic, in BOTH directions, and never decisional. The interesting case is
+  // `claimed=user` with `authoritative=system`: somebody trying to step outside the
+  // quota while still spending the System's credential. Recording it is worth one
+  // line; acting on it would hand the attacker the switch.
+  if (claimed !== authoritative) {
+    quotaAudit("ai_source_claim_mismatch", { userId: user?.id ?? null, claimed, authoritative });
+  }
+  if (!applicability.quotaApplies) {
+    quotaAudit("reserve_not_applicable", { userId: user?.id ?? null, key: key ?? null });
+    return { status: 200, body: quotaNotApplicableView(), reservation: "unbilled" };
+  }
   const config = await resolveQuotaConfig(req);
   if (!config.ok) {
     quotaAudit("reserve_refused", config);
@@ -1235,6 +1437,158 @@ async function getQuotaStatus(req, res) {
 // The role still comes from the validated session only, and both spellings the
 // app's own isAdministrator() accepts are honoured, so a user the admin UI shows
 // as an administrator is never locked out of the panel.
+// ── ADMIN PER-USER QUOTA: authoritative view, and the custom limit ──────────
+// Both decisions take the TARGET user id from the route and the CALLER's right to ask
+// from the validated session role (`requireBridgeAdmin` runs before either handler).
+// The target's AI source is resolved from `user_settings` here — never from the
+// frontend's label, which is a display value the browser chose, and never from a
+// header. A non-admin therefore cannot enumerate anybody's quota, and an admin cannot
+// be talked into editing a limit that the quota will never consult.
+async function quotaOverrideRow(req, userId) {
+  const resolved = envelopeRows(await quotaStore.readOverride(req, userId));
+  if (!resolved.ok) return resolved;
+  const rows = resolved.rows;
+  if (rows.length === 0) return { ok: true, row: null };
+  // Duplicates are reported, never resolved by taking the first: `resolveQuotaLimit`
+  // already refuses to bill against an ambiguous override, so the admin view must
+  // refuse to describe one too.
+  if (rows.length > 1) return { ok: false, reason: "override_duplicate" };
+  const row = rows[0] || {};
+  return {
+    ok: true,
+    row: {
+      id: row.id ?? null,
+      enabled: storedFlag(row.enabled),
+      callLimit: storedCount(row.call_limit)
+    }
+  };
+}
+
+async function quotaAdminStatusDecision(req, targetUserId) {
+  const userId = String(targetUserId ?? "").trim();
+  if (!userId) return { status: 400, body: { error: "user_id is required" } };
+  const source = await resolveUserAiSource(req, userId, { force: true });
+  const base = { userId, aiSource: source.aiSource, sourceReason: source.reason ?? null };
+  const override = await quotaOverrideRow(req, userId);
+  if (!override.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: override.reason } };
+
+  if (source.aiSource === AI_SOURCE_OWN) {
+    // No System figures exist for this account, so none are invented. The stored
+    // override is still reported — that is how an admin sees that a limit survived
+    // the switch to personal AI and will apply again if the account returns.
+    return {
+      status: 200,
+      body: {
+        ...base,
+        quotaApplies: false,
+        period: null,
+        globalLimit: null,
+        used: null,
+        overrideEnabled: override.row ? override.row.enabled : null,
+        overrideLimit: override.row ? override.row.callLimit : null,
+        effectiveLimit: null,
+        remaining: null,
+        percentage: null,
+        dormantOverride: Boolean(override.row && override.row.enabled === 1)
+      }
+    };
+  }
+
+  const config = await resolveQuotaConfig(req);
+  if (!config.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: config.reason } };
+  const limit = await resolveQuotaLimit(req, userId, config.config);
+  if (!limit.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: limit.reason } };
+  const usage = await resolveQuotaUsage(req, userId, quotaPeriodKey());
+  if (!usage.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: usage.reason } };
+  const used = usage.used ?? 0;
+  const effective = limit.limit;
+  return {
+    status: 200,
+    body: {
+      ...base,
+      quotaApplies: true,
+      period: quotaPeriodKey(),
+      globalLimit: config.config.default_call_limit,
+      used,
+      overrideEnabled: override.row ? override.row.enabled : null,
+      overrideLimit: override.row ? override.row.callLimit : null,
+      // `source` is 'override' | 'default' straight from the resolver the counter uses,
+      // so the number an admin reads here is computed by the same code that decides
+      // whether a call is exhausted — not by a second calculation that could drift.
+      effectiveLimit: effective,
+      limitSource: limit.source,
+      remaining: Math.max(0, effective - used),
+      percentage: effective > 0 ? Math.round((used / effective) * 100) : 0,
+      dormantOverride: false
+    }
+  };
+}
+
+/* Write (or clear) one account's custom limit.
+   Ordering matters: the authoritative source check happens BEFORE any mutation, so a
+   request aimed at an Own-AI account cannot reach storage at all — the answer is a
+   409 that names why, not a row that silently does nothing. `enabled` is the flag the
+   existing resolver already honours (`resolveQuotaLimit` returns the global default for
+   enabled = 0), so "return to global" is written the same way the quota reads it, and
+   no delete verb is invented to get there. The usage counter is never touched. */
+async function quotaAdminLimitDecision(req, targetUserId, body) {
+  const userId = String(targetUserId ?? "").trim();
+  if (!userId) return { status: 400, body: { error: "user_id is required" } };
+  const enabled = bodyFlag(body?.enabled);
+  if (enabled === null) return { status: 400, body: { error: "enabled must be a boolean" } };
+  let callLimit = null;
+  if (enabled === 1) {
+    callLimit = bodyLimit(body?.call_limit);
+    if (callLimit === null || callLimit < QUOTA_LIMIT_MIN || callLimit > QUOTA_LIMIT_MAX) {
+      return { status: 400, body: { error: "call_limit must be an integer within the allowed range" } };
+    }
+  }
+  const source = await resolveUserAiSource(req, userId, { force: true });
+  if (source.aiSource !== AI_SOURCE_SYSTEM) {
+    return { status: 409, body: { reason: "user_not_using_system_ai", aiSource: source.aiSource } };
+  }
+  const existing = await quotaOverrideRow(req, userId);
+  if (!existing.ok) {
+    return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: existing.reason } };
+  }
+  const row = existing.row;
+  const patch = { enabled, call_limit: enabled === 1 ? callLimit : 0 };
+  const written = row && row.id !== null && row.id !== undefined
+    ? await quotaStore.updateOverride(req, row.id, patch)
+    : await quotaStore.createOverride(req, { user_id: userId, ...patch });
+  if (!written.ok) {
+    return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: written.reason || "write_failed" } };
+  }
+  // Read back and compare, exactly as the global config write does: a stored value
+  // that differs from what was sent is an outage-shaped answer, not a success.
+  const after = await quotaOverrideRow(req, userId);
+  if (!after.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: after.reason } };
+  const storedEnabled = after.row ? after.row.enabled : null;
+  const storedLimit = after.row ? after.row.callLimit : null;
+  const matches = storedEnabled === enabled
+    && (enabled === 0 || storedLimit === callLimit);
+  if (!matches) {
+    return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: "readback_mismatch" } };
+  }
+  const config = await resolveQuotaConfig(req);
+  if (!config.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: config.reason } };
+  const effective = await resolveQuotaLimit(req, userId, config.config);
+  if (!effective.ok) return { status: 503, body: { error: QUOTA_UNAVAILABLE, reason: effective.reason } };
+  return {
+    status: 200,
+    body: {
+      userId,
+      aiSource: AI_SOURCE_SYSTEM,
+      quotaApplies: true,
+      overrideEnabled: enabled,
+      overrideLimit: enabled === 1 ? callLimit : null,
+      globalLimit: config.config.default_call_limit,
+      effectiveLimit: effective.limit,
+      limitSource: effective.source
+    }
+  };
+}
+
 function isBridgeAdminRole(role) {
   const normalized = String(role || "").trim().toLowerCase();
   return normalized === "admin" || normalized === "administrator";
@@ -1291,6 +1645,68 @@ async function writeQuotaConfigHandler(req, res) {
   });
   return res.status(200).json({ success: true, ...decision.body, requestId });
 }
+
+// The two administrator per-user quota routes. `requireBridgeAdmin` runs before these,
+// so a denied caller is refused before any NCB read — enumeration costs nothing without
+// the role. The TARGET id is read here and nowhere else: it names whose quota to look
+// at, it is never whose quota to BILL (that stays `req.bridgeUser.id`), and it is never
+// taken from a chat request at all.
+async function quotaAdminStatusHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await quotaAdminStatusDecision(req, req.query?.user_id);
+  if (decision.status !== 200) {
+    safeEvent("quota_admin_status_unavailable", {
+      requestId, target: String(req.query?.user_id ?? "").slice(0, 64), status: decision.status,
+      reason: String(decision.body?.reason ?? decision.body?.error ?? "unavailable")
+    });
+    return res.status(decision.status).json({
+      success: false, status: decision.status === 400 ? "invalid_user" : QUOTA_UNAVAILABLE,
+      // The stable reason travels to the admin as well as to the log: "the override
+      // row is duplicated" and "storage did not answer" are different things to
+      // investigate, and an admin looking at a 503 should not have to guess which.
+      reason: decision.body?.reason ?? null,
+      error: decision.body?.error || "Quota status unavailable", requestId
+    });
+  }
+  safeEvent("quota_admin_status_served", {
+    requestId, userId: req.bridgeUser?.id ?? null,
+    target: decision.body.userId, aiSource: decision.body.aiSource, quotaApplies: decision.body.quotaApplies
+  });
+  return res.status(200).json({ success: true, status: "success", ...decision.body, requestId });
+}
+
+async function quotaAdminLimitHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await quotaAdminLimitDecision(req, req.body?.user_id, req.body);
+  if (decision.status === 409) {
+    safeEvent("quota_admin_limit_refused", {
+      requestId, target: decision.body.userId, reason: decision.body.reason, aiSource: decision.body.aiSource
+    });
+    // The reason is a stable code, not prose: the admin UI explains WHY the limit was
+    // not set, and an Own-AI account is told it is not governed by this quota.
+    return res.status(409).json({
+      success: false, status: "conflict", reason: decision.body.reason,
+      aiSource: decision.body.aiSource, error: "This account is not using System AI, so its System AI limit does not apply.",
+      requestId
+    });
+  }
+  if (decision.status !== 200) {
+    safeEvent("quota_admin_limit_failed", {
+      requestId, status: decision.status, reason: String(decision.body?.reason ?? decision.body?.error ?? "failed")
+    });
+    return res.status(decision.status).json({
+      success: false, status: decision.status === 400 ? "invalid_limit" : QUOTA_UNAVAILABLE,
+      error: decision.body?.error || "Quota limit could not be saved",
+      reason: decision.body?.reason ?? null, requestId
+    });
+  }
+  safeEvent("quota_admin_limit_updated", {
+    requestId, userId: req.bridgeUser?.id ?? null, target: decision.body.userId,
+    overrideEnabled: decision.body.overrideEnabled, effectiveLimit: decision.body.effectiveLimit
+  });
+  return res.status(200).json({ success: true, status: "success", ...decision.body, requestId });
+}
+
 async function quotaHandler(req, res) {
   const requestId = requestIdentity(req, res);
   if (!NODESEND_QUOTA_URL) {
@@ -1536,6 +1952,11 @@ app.get("/ai/quota", requireBridgeSession, async (req, res) => {
 // before any NCB call is made.
 app.get("/ai/quota/config", requireBridgeSession, requireBridgeAdmin, readQuotaConfigHandler);
 app.put("/ai/quota/config", requireBridgeSession, requireBridgeAdmin, writeQuotaConfigHandler);
+// Per-account quota, administrator-only, and authoritative about the target's AI
+// source. The routes sit beside the config pair because they share its guard: session
+// first, role second, refusal before any storage call.
+app.get("/ai/quota/status", requireBridgeSession, requireBridgeAdmin, quotaAdminStatusHandler);
+app.put("/ai/quota/user", requireBridgeSession, requireBridgeAdmin, quotaAdminLimitHandler);
 app.get("/quota", requireApiKey, quotaHandler);
 app.post("/quota", requireApiKey, quotaHandler);
 
@@ -1763,6 +2184,14 @@ module.exports = {
   QUOTA_PROCESS_LEDGER_LIMIT, reserveQuotaDecision, getQuotaStatus, reserveAiCall,
   findReservation, claimReservation, releaseReservation,
   quotaConfigReadDecision, quotaConfigWriteDecision,
+  // The AI-source authority, exported for the same reason the other predicates are:
+  // the harness tests the real lookup, the real cache and the real admin decisions,
+  // not a copy of them. `resetAiSourceCache` is the seam that makes cache expiry and
+  // in-flight deduplication observable rather than inferred.
+  resolveUserAiSource, resetAiSourceCache, aiSourceFromRows, quotaIsApplicableToUser,
+  AI_SOURCE_SYSTEM, AI_SOURCE_OWN, AI_SOURCE_CACHE_TTL_MS, AI_SOURCE_FAILURE_CACHE_TTL_MS,
+  USER_SETTINGS_TABLE, quotaAdminStatusDecision, quotaAdminLimitDecision,
+  quotaNotApplicableView, requestBillingSource, BILLING_SOURCE_HEADER,
   // The Trickster gateway's own rules, exported so the harness can test the real
   // predicates instead of a copy of them. The routes themselves are exercised over
   // HTTP through `app`, which is what proves the session guard is attached.
