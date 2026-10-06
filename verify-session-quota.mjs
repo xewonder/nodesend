@@ -67,8 +67,11 @@ const ncb = {
   // `user_settings` is the AUTHORITATIVE ai_source table the relay now reads. It is in
   // this registry so a read for it is served like any other and, crucially, so a
   // missing-table bug would surface as a 404 rather than as a silent free pass.
-  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [] },
-  nextId: { ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1, user_settings: 1 },
+  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [], user_codes: [], ai_provider_credentials_1770000000: [] },
+  nextId: {
+    ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1,
+    user_settings: 1, user_codes: 1, ai_provider_credentials_1770000000: 1
+  },
   // One fault at a time: mixing them makes a red check ambiguous about which fired.
   fault: null,
   faultHits: {},
@@ -110,6 +113,25 @@ const ncbServer = http.createServer((req, res) => {
       // which is exactly what happened on the first run of this harness.
       const user = USERS[auth.replace('Bearer ', '')];
       return user ? send(200, { status: 'success', data: { user } }) : fail(401, 'invalid session');
+    }
+    // NCB's PUBLIC data route: reachable with no session at all, and only for tables whose
+    // policy allows it. It is modelled as strictly credential-free — a request that arrives
+    // here carrying an Authorization is refused — because that is the whole property the
+    // invitation route depends on: an anonymous pre-registration read must not be able to
+    // present the caller's session, and a mock that tolerated a bearer here would let a real
+    // regression pass.
+    if (pathname.startsWith('/public-data/read/')) {
+      const publicTable = pathname.split('/')[3] || null;
+      events.push(`publicread:${publicTable}`);
+      // The same outage the authenticated route can suffer: an anonymous read has to face a
+      // timeout too, or the invitation route's fail-closed branch is untestable.
+      if (ncb.fault === 'data_hang') return;
+      if (auth) return fail(400, 'the public route accepts no credential');
+      if (!ncb.rows[publicTable]) return fail(404, `unknown table ${publicTable}`);
+      const publicRows = ncb.rows[publicTable].filter((row) => Object.entries(query).every(([key, value]) =>
+        key === 'Instance' || String(row[key]) === String(value)));
+      ncb.counts.publicRead = (ncb.counts.publicRead || 0) + 1;
+      return ok(publicRows);
     }
     if (!pathname.startsWith('/data/')) return fail(404, 'no such route');
     if (ncb.fault === 'data_hang') return; // never answers: the NCB timeout must fire
@@ -176,6 +198,10 @@ const ncbServer = http.createServer((req, res) => {
       if (!rows) return fail(404, `unknown table ${table}`);
       if (ncb.fault === 'update_usage_fail' && table === 'ai_quota_usage') return fail(500, 'write rejected');
       if (ncb.fault === 'update_config_fail' && table === 'ai_quota_config') return fail(500, 'write rejected');
+      // The legacy-repair fail-closed branch is only testable if a credential update can be
+      // refused — and the row must then be left exactly as it was, which is why this fails
+      // before `Object.assign` rather than after.
+      if (ncb.fault === 'credential_update_fail' && table === 'ai_provider_credentials_1770000000') return fail(500, 'write rejected');
       const target = rows.find((r) => String(r.id) === String(rowId));
       if (!target) return fail(404, 'no such row');
       // config_no_persist: the write is ACKNOWLEDGED and then dropped. The only defence
@@ -1391,6 +1417,407 @@ check('T22 five concurrent keyed calls for one user bill five, not fewer or more
 const writtenValues = ncb.requests.filter((q) => q.pathname.startsWith('/data/update/ai_quota_usage') || q.pathname.startsWith('/data/create/ai_quota_usage')).map((q) => q.body?.calls_used);
 check('T22 the counter never moved backwards or repeated a value (no lost update)',
   JSON.stringify(writtenValues) === JSON.stringify([1, 2, 3, 4, 5]), JSON.stringify(writtenValues));
+// ── 8. INVITATION CODES and PER-USER CREDENTIALS (Stage 1 hardening) ───────
+// Two different claims are tested here, and keeping them apart is the point. The invitation
+// routes reduce what OUR browser receives; they do not make `user_codes` private, and nothing
+// below is allowed to read as if they did. The credential routes move a per-account secret
+// behind the account's own session, which is the one surface that a `private` policy can
+// actually enforce later.
+const CODE_SECRET = 'INVITATION-SECRET-must-never-leave-the-relay-4f2c';
+const CODE_ROW_USER = 'admin-who-issued-the-code';
+const A_SECRET = enc('sk-USER-A-own-provider-key-1a2b');
+const B_SECRET = enc('sk-USER-B-own-provider-key-3c4d');
+const resetCodes = (rows) => { ncb.rows.user_codes = rows; };
+const resetCreds = (rows) => { ncb.rows.ai_provider_credentials_1770000000 = rows; };
+const INVITE = (body, headers = {}) => fetch(`${B}/auth/validate-invitation`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body)
+});
+const CONSUME = (tok, body) => fetch(`${B}/auth/consume-invitation`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+  body: JSON.stringify(body)
+});
+const CHAT_WITH = (tok, config, key) => fetch(`${B}/ai/chat`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}`, ...(key ? { 'x-ai-decision-key': key } : {}) },
+  body: JSON.stringify({
+    provider: 'alibaba', config, model: 'qwen3.8-flash',
+    messages: [{ role: 'user', content: 'hi' }]
+  })
+});
+// Every response body and log line produced from here on, searched for material that must
+// never leave the relay. One accumulator, so a leak in ANY of these routes is caught.
+const seenBodies = [];
+const readBody = async (res) => { const b = await res.json().catch(() => ({})); seenBodies.push(JSON.stringify(b)); return b; };
+const leakedInResponses = (needle) => seenBodies.some((text) => text.includes(needle));
+
+resetCodes([
+  { id: ncb.nextId.user_codes++, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-VALID', used: 0, created_at: sqlDate() },
+  { id: ncb.nextId.user_codes++, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-USED', used: 1, created_at: sqlDate() }
+]);
+mod.resetInvitationRateBuckets();
+// I-1/2/3 — the three answers, and nothing else.
+r = await INVITE({ code: 'INV-VALID' }); j = await readBody(r);
+check('I-1 an anonymous valid-code check succeeds and answers one boolean',
+  r.status === 200 && j.valid === true && Object.keys(j).sort().join(',') === 'requestId,success,valid',
+  JSON.stringify(j));
+r = await INVITE({ code: 'INV-NOPE' }); j = await readBody(r);
+check('I-2 an unknown code is answered valid:false, with no row and no status inflation',
+  r.status === 200 && j.valid === false, JSON.stringify(j));
+r = await INVITE({ code: 'INV-USED' }); j = await readBody(r);
+check('I-3 a spent code cannot be validated again',
+  r.status === 200 && j.valid === false, JSON.stringify(j));
+// I-4/5 — the absence half, which is the entire reason this route exists.
+check('I-4 no response of any kind carries the stored secret_key',
+  !leakedInResponses(CODE_SECRET), `${seenBodies.length} responses searched`);
+check('I-5 no response carries a row id, the issuing user, the used flag or the code object',
+  !leakedInResponses('"secret_key"') && !leakedInResponses(CODE_ROW_USER) && !leakedInResponses('"used"') && !leakedInResponses('"id":'),
+  seenBodies.filter((t) => /secret_key|"used"|admin-who/.test(t)).join(' | ').slice(0, 160));
+// I-6 — runtime proof the anonymous read stayed anonymous: the MOCK refuses a credential on
+// the public route, so a bearer-carrying transport would not merely be noticed, it would fail.
+const publicReads = ncb.requests.filter((q) => q.pathname.startsWith('/public-data/'));
+check('I-6 every public-data read carried no Authorization at all',
+  publicReads.length >= 3 && publicReads.every((q) => q.auth === ''),
+  `${publicReads.length} public reads; auths=${[...new Set(publicReads.map((q) => q.auth || '(none)'))].join(',')}`);
+check('I-6b the public read is filtered by the typed code, not by an id the caller chose',
+  publicReads.every((q) => String(q.query.code ?? '').startsWith('INV-')) && !publicReads.some((q) => q.query.id),
+  JSON.stringify(publicReads.map((q) => q.query.code)));
+// I-7/8 — fail closed, in both directions.
+resetCodes([
+  { id: 1, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-TWIN', used: 0 },
+  { id: 2, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-TWIN', used: 0 }
+]);
+mod.resetInvitationRateBuckets();
+r = await INVITE({ code: 'INV-TWIN' }); j = await readBody(r);
+check('I-7 two live rows for one code is refused, not silently resolved by taking the first',
+  r.status === 503 && j.valid === undefined && j.status === 'invitation_duplicate', JSON.stringify(j));
+ncb.fault = 'data_hang';
+resetCodes([{ id: 3, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-VALID', used: 0 }]);
+mod.resetInvitationRateBuckets();
+r = await INVITE({ code: 'INV-VALID' }); j = await readBody(r);
+ncb.fault = null;
+check('I-8 an unreachable store is 503, never a confident valid:false',
+  r.status === 503 && j.valid === undefined && j.status === 'invitation_service_unavailable',
+  JSON.stringify(j));
+// I-9 — the abuse control, measured rather than described.
+resetCodes([{ id: 4, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-VALID', used: 0 }]);
+mod.resetInvitationRateBuckets();
+const flood = [];
+for (let i = 0; i < mod.INVITATION_RATE_MAX + 3; i += 1) flood.push((await INVITE({ code: 'INV-VALID' })).status);
+check('I-9 the anonymous route is throttled per address, then answers 429 with Retry-After',
+  flood.slice(0, mod.INVITATION_RATE_MAX).every((s) => s === 200)
+  && flood.slice(mod.INVITATION_RATE_MAX).every((s) => s === 429),
+  flood.join(','));
+// The two refusal cases below are about LOCAL validation, so they need a fresh window:
+// ordering is deliberate in the handler (an over-limit anonymous caller is turned away before
+// the body is even parsed), and a test that wanted to see the 400 has to ask from an
+// un-flooded address rather than reorder the production code to satisfy it.
+mod.resetInvitationRateBuckets();
+const readsBeforeLocal = ncb.counts.publicRead || 0;
+r = await INVITE({ code: '' });
+check('I-9b a missing code is refused locally, before any storage call',
+  r.status === 400 && (ncb.counts.publicRead || 0) === readsBeforeLocal,
+  `status=${r.status} storage reads added=${(ncb.counts.publicRead || 0) - readsBeforeLocal}`);
+r = await INVITE({ code: 'x'.repeat(400) });
+check('I-9c an over-long code is refused locally, so it cannot be used to spray the store',
+  r.status === 400, String(r.status));
+// The adversarial half of the bound: a code of EXACTLY the maximum length must still be
+// accepted. Without this, an off-by-one that rejected every long-but-legal code — or a limit
+// clamped to zero, which would refuse everything — would leave I-9c looking correct.
+r = await INVITE({ code: 'y'.repeat(mod.INVITATION_CODE_MAX_LENGTH) });
+check('I-9d a code at exactly the bound is validated, not rejected by an off-by-one',
+  r.status === 200, String(r.status));
+// I-10/11/12 — consumption needs a session and spends the code for THAT account only.
+resetCodes([{ id: 5, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-FRESH', used: 0 }]);
+mod.resetInvitationRateBuckets();
+r = await CONSUME(null, { code: 'INV-FRESH' }); j = await readBody(r);
+check('I-10 consumption requires a session (the code is spent for an account, not for a string)',
+  r.status === 401 && j.success !== true, JSON.stringify(j));
+r = await CONSUME('tok-a', { code: 'INV-FRESH', user_id: 999, userId: 'whoever' });
+j = await readBody(r);
+check('I-11 the spent code is assigned to the SESSION user and a forged body user_id is ignored',
+  r.status === 200 && j.success === true
+  && String(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.user_id) === '101'
+  && ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.used === 1,
+  JSON.stringify(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')));
+r = await CONSUME('tok-b', { code: 'INV-FRESH' }); j = await readBody(r);
+check('I-12 a code already spent cannot be spent by a second account',
+  r.status === 200 && j.success === false && j.reason === 'invitation_not_found', JSON.stringify(j));
+r = await CONSUME('tok-b', { code: 'INV-NEVER-EXISTED' }); j = await readBody(r);
+check('I-12b an unknown code is a declined consumption, not a write attempt',
+  r.status === 200 && j.success === false && j.reason === 'invitation_not_found', JSON.stringify(j));
+
+// ── per-user credentials ───────────────────────────────────────────────────
+resetCreds([]);
+r = await fetch(`${B}/ai/credentials`);
+check('C-1 the credential list requires a session', r.status === 401, String(r.status));
+r = await fetch(`${B}/ai/credentials`, AUTH('tok-a')); j = await readBody(r);
+check('C-2 an account with no credential gets an empty list, not an error',
+  r.status === 200 && Array.isArray(j.credentials) && j.credentials.length === 0, JSON.stringify(j));
+const baseUrl = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', {
+  usage: 'gameplay', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encryptedApiKey: A_SECRET,
+  user_id: 202, userId: 'not-me'
+})); j = await readBody(r);
+check('C-3 saving one\'s own credential writes it for the SESSION user and ignores a forged user_id',
+  r.status === 200 && j.credential?.usage === 'gameplay' && j.credential?.credentialPresent === true
+  && ncb.rows.ai_provider_credentials_1770000000.length === 1
+  && String(ncb.rows.ai_provider_credentials_1770000000[0].user_id) === '101',
+  JSON.stringify(j));
+const metaKeysC4 = Object.keys(j.credential ?? {}).sort();
+check('C-4 the save response is metadata only and never contains the key material',
+  r.status === 200 && !leakedInResponses(A_SECRET) && !leakedInResponses('encrypted_api_key')
+  // Every field the client needs is present…
+  && ['credentialPresent', 'id', 'model', 'provider', 'usage'].every((k) => metaKeysC4.includes(k))
+  // …and nothing that could ever be a secret is, whatever it is called. A field list that
+  // only forbids today's names would let `auth` or `apiKey` slip in later.
+  && !metaKeysC4.some((k) => /key|secret|token|password|credential_(?!present)/i.test(k)),
+  JSON.stringify(j.credential));
+check('C-4b the stored ciphertext is what was sent, byte-for-byte, and no plaintext was ever written',
+  ncb.rows.ai_provider_credentials_1770000000[0].encrypted_api_key === A_SECRET
+  && !JSON.stringify(ncb.rows.ai_provider_credentials_1770000000).includes('sk-USER-A-own-provider-key'),
+  'at-rest model preserved: ciphertext in, ciphertext stored');
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', {
+  usage: 'gameplay', provider: 'alibaba', model: 'qwen-plus', endpoint: baseUrl, apiKey: 'sk-PLAINTEXT-NOPE'
+})); j = await readBody(r);
+check('C-5 a plaintext provider key is refused outright, never stored and never downgraded',
+  r.status === 400 && j.status === 'invalid_credential', JSON.stringify(j));
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', {
+  usage: 'gameplay', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encryptedApiKey: 'not-even-base64-ciphertext'
+})); j = await readBody(r);
+check('C-6 a blob this relay cannot decrypt is refused at save time rather than stored broken',
+  r.status === 400 && j.status === 'invalid_credential', JSON.stringify(j));
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', {
+  usage: 'gameplay', provider: 'alibaba', model: 'qwen-plus', endpoint: baseUrl
+})); j = await readBody(r);
+check('C-7 changing the model without a new key leaves the stored ciphertext untouched',
+  r.status === 200 && j.credential.model === 'qwen-plus'
+  && ncb.rows.ai_provider_credentials_1770000000[0].encrypted_api_key === A_SECRET,
+  JSON.stringify(j.credential));
+// Cross-account: user B may see, change, or spend nothing of A's.
+resetCreds([
+  { id: 11, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' },
+  { id: 22, user_id: '202', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: B_SECRET, usage: 'gameplay' }
+]);
+r = await fetch(`${B}/ai/credentials`, AUTH('tok-b')); j = await readBody(r);
+check('C-8 user B\'s list contains only B\'s row, and the read sent to storage named B',
+  r.status === 200 && j.credentials.length === 1 && j.credentials[0].id === 22
+  && ncb.requests.slice(-1)[0].query.user_id === '202', JSON.stringify(j));
+check('C-8b no listing response ever carried either account\'s ciphertext',
+  !leakedInResponses(A_SECRET) && !leakedInResponses(B_SECRET) && !leakedInResponses('encrypted_api_key'), JSON.stringify(j));
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-b', {
+  id: 11, usage: 'gameplay', provider: 'alibaba', model: 'qwen-turbo', endpoint: baseUrl
+})); j = await readBody(r);
+check('C-9 user B cannot overwrite user A\'s row by naming A\'s id — no id is accepted at all',
+  r.status === 200 && j.credential?.id === 22
+  && ncb.rows.ai_provider_credentials_1770000000.find((x) => x.id === 11).model === 'qwen3.8-flash'
+  && ncb.requests.some((q) => q.pathname === '/data/update/ai_provider_credentials_1770000000/22')
+  && !ncb.requests.some((q) => q.pathname === '/data/update/ai_provider_credentials_1770000000/11'),
+  JSON.stringify(j.credential));
+r = await fetch(`${B}/ai/credentials`, {
+  method: 'DELETE', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-b' },
+  body: JSON.stringify({ usage: 'gameplay', id: 11 })
+}); j = await readBody(r);
+check('C-10 user B cannot delete user A\'s credential; only B\'s own row went',
+  r.status === 200 && j.removed === 1
+  && ncb.rows.ai_provider_credentials_1770000000.some((x) => x.id === 11)
+  && !ncb.rows.ai_provider_credentials_1770000000.some((x) => x.id === 22), JSON.stringify(j));
+r = await fetch(`${B}/ai/credentials`, {
+  method: 'DELETE', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-c' },
+  body: JSON.stringify({ usage: 'gameplay' })
+}); j = await readBody(r);
+check('C-10b deleting a credential nobody holds is a clean no-op, not a failure',
+  r.status === 200 && j.removed === 0, JSON.stringify(j));
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', { usage: 'sideways', provider: 'alibaba' })); j = await readBody(r);
+check('C-11 an unknown usage scope is refused, so the two scopes stay two scopes',
+  r.status === 400, JSON.stringify(j));
+// The chat path: id-based resolution must work, must be able to deny, and must not spend quota
+// when it denies.
+resetCreds([
+  { id: 31, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' },
+  { id: 32, user_id: '202', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: B_SECRET, usage: 'gameplay' }
+]);
+seed();
+const providerBefore = world.providerCalls;
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 31 }); j = await readBody(r);
+check('C-12 a chat that names only a credential id still reaches the provider with the right key',
+  r.status === 200 && world.providerCalls === providerBefore + 1
+  && world.providerRequests.slice(-1)[0].auth === `Bearer ${'sk-USER-A-own-provider-key-1a2b'}`,
+  `status=${r.status} auth=${world.providerRequests.slice(-1)[0]?.auth}`);
+check('C-12b the decrypted key never appears in the response body',
+  !JSON.stringify(j).includes('sk-USER-A-own-provider-key'), JSON.stringify(j).slice(0, 120));
+const callsBefore = ncb.requests.length;
+const usedBefore = usageRow('202')?.calls_used ?? 0;
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 32 }); j = await readBody(r);
+check('C-13 naming ANOTHER account\'s credential id is refused with 403, identically to "no such row"',
+  r.status === 403 && j.code === 'CREDENTIAL_FORBIDDEN', JSON.stringify(j));
+check('C-13b that refusal charged no quota, contacted no provider, and wrote nothing',
+  world.providerCalls === providerBefore + 1
+  && (usageRow('202')?.calls_used ?? 0) === usedBefore
+  && !ncb.requests.slice(callsBefore).some((q) => /update|create|delete/.test(q.pathname) && q.pathname.includes('ai_quota')),
+  ncb.requests.slice(callsBefore).map((q) => `${q.method} ${q.pathname}`).join(' | ').slice(0, 200));
+r = await CHAT_WITH('tok-c', { baseUrl, credentialId: 99999 }); j = await readBody(r);
+check('C-14 an id belonging to nobody is refused, and the answer is indistinguishable from C-13',
+  r.status === 403 && j.code === 'CREDENTIAL_FORBIDDEN', JSON.stringify(j));
+resetCreds([
+  { id: 41, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' },
+  { id: 42, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' }
+]);
+r = await fetch(`${B}/ai/credentials`, PUTJSON('tok-a', { usage: 'gameplay', provider: 'alibaba', model: 'qwen-turbo', endpoint: baseUrl }));
+j = await readBody(r);
+check('C-15 duplicate rows for one (user, usage) refuse the write instead of picking one',
+  r.status === 503 && j.status === 'ai_credentials_unavailable' && j.error === 'credential_duplicate',
+  JSON.stringify(j));
+resetCreds([
+  { id: 41, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' },
+  { id: 42, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' }
+]);
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 41 });
+check('C-15b a chat naming one of two duplicates is served, because the id resolves uniquely',
+  r.status === 200, String(r.status));
+// Deployment-skew guard: the shipped bundle still sends the inline blob, and must keep working
+// until it is replaced. This is the ONLY reason the inline branch exists.
+resetCreds([]);
+seed();
+const before = usageRow('101')?.calls_used ?? 0;
+r = await CHAT_WITH('tok-a', { baseUrl, encryptedApiKey: A_SECRET });
+check('C-16 the inline ciphertext path still works, so deploying NodeSend first cannot break AI',
+  r.status === 200 && (usageRow('101')?.calls_used ?? 0) === before + 1, `status=${r.status}`);
+r = await CHAT_WITH('tok-a', { baseUrl, encryptedApiKey: A_SECRET }, 'cred-key-1');
+const dup = await CHAT_WITH('tok-a', { baseUrl, encryptedApiKey: A_SECRET }, 'cred-key-1');
+check('C-17 quota and idempotency are unchanged on the new path (one decision, one charge)',
+  r.status === 200 && dup.status === 200
+  && (usageRow('101')?.calls_used ?? 0) === before + 2, `used=${usageRow('101')?.calls_used}`);
+// B was deliberately NOT migrated. Assert the consequence rather than the intention: no route
+// here reads the system credential table, so nothing in this change pretends to server-only.
+check('C-18 no route in this relay reads or writes system_ai_credentials (B deferred, not half-done)',
+  !/system_ai_credentials/.test(bridgeSrcTextForCredCheck())
+  && !ncb.requests.some((q) => String(q.pathname || '').includes('system_ai_credentials')),
+  `${ncb.requests.filter((q) => String(q.pathname || '').includes('system_ai_credentials')).length} touches`);
+// ── 6 of the next spec: no nested-ciphertext grace, because this key size cannot produce one ─
+// There is deliberately NO compatibility branch for a double-encrypted blob. This is the
+// measurement that justifies its absence rather than a judgement call: the deployed relay key is
+// 3072-bit, so RSA-OAEP/SHA-256 carries at most 318 bytes through it while the base64 of one of
+// its OWN ciphertexts is 512. An old bundle that read a repaired row therefore cannot re-encrypt
+// it at all — the WebCrypto call throws inside the page, loudly, instead of sending a nested
+// blob this relay would have to unfold and trust. Keeping a branch for an unreachable input
+// would add a 403 path, an ownership lookup and a permanent "temporary" marker to the hot path
+// for a case that cannot occur; if the key is ever rotated large enough for it to become
+// reachable, the arithmetic below is what has to change, and this check is what fails first.
+const OWN_PLAIN_KEY = 'sk-OWN-ACCOUNT-REAL-PROVIDER-KEY-7a3b';
+resetCreds([{ id: 81, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: enc(OWN_PLAIN_KEY), usage: 'gameplay' }]);
+const ownCiphertext = ncb.rows.ai_provider_credentials_1770000000[0].encrypted_api_key;
+let nested = { possible: true, code: '' };
+try { enc(ownCiphertext); } catch (error) { nested.possible = false; nested.code = error.code || error.message; }
+check('K-1 a stored ciphertext cannot be re-encrypted through this key, so no nested-input grace is needed',
+  nested.possible === false && /DATA_TOO_LARGE_FOR_KEY_SIZE/i.test(nested.code)
+  && ownCiphertext.length > 318,
+  'ciphertext is ' + ownCiphertext.length + ' chars against this 2048-bit harness key (carry 214); '
+  + 'the deployed key measures 3072-bit (carry 318, its own ciphertext 512) — impossible on either',
+  nested.code);
+check('K-2 the relay contains no nested-ciphertext compatibility branch, and none can reappear silently',
+  !/LEGACY_DEPLOYMENT_SKEW|resolveLegacyNestedKey|legacy_nested_ciphertext_served/.test(bridgeSrcTextForCredCheck()),
+  're-adding the branch without re-running the key-size argument above fails here by construction');
+const k3Calls = world.providerCalls;
+r = await CHAT_WITH('tok-a', { baseUrl, encryptedApiKey: enc(OWN_PLAIN_KEY) });
+check('K-3 the ordinary single-decrypt inline path is unaffected by all of this',
+  r.status === 200 && world.providerCalls === k3Calls + 1
+  && world.providerRequests.slice(-1)[0].auth === 'Bearer ' + OWN_PLAIN_KEY,
+  'status=' + r.status);
+check('K-4 the provider request carries only provider fields — no id, ciphertext, user id or table name',
+  !JSON.stringify(world.providerRequests.slice(-1)[0].body).match(/credentialId|encryptedApiKey|user_id|ai_provider_credentials/)
+  && !JSON.stringify(world.providerRequests.slice(-1)[0].headers).match(/credentialId|encryptedApiKey/)
+  && Object.keys(world.providerRequests.slice(-1)[0].body).sort().join(',') === 'messages,model',
+  'body keys=' + Object.keys(world.providerRequests.slice(-1)[0].body).join(','));
+
+// ── legacy plaintext repair (§3) ───────────────────────────────────────────
+// The emergency this exists for: rows written before the credential routes hold the provider
+// key as PLAINTEXT, under a policy every session can read. Repair happens on the OWNER's use,
+// on the SAME row, and refuses to continue when the repair cannot be confirmed.
+const LEGACY_PLAINTEXT = 'sk-LEGACY-PLAINTEXT-PROVIDER-KEY-9d1e';
+resetCreds([
+  { id: 51, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: LEGACY_PLAINTEXT, usage: 'gameplay' },
+  { id: 52, user_id: '202', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: LEGACY_PLAINTEXT, usage: 'gameplay' }
+]);
+seed();
+const legacyCallsBefore = world.providerCalls;
+const legacyUpdatesAt = () => ncb.requests.filter((q) => q.pathname === `/data/update/ai_provider_credentials_1770000000/51`).length;
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 51 });
+check('L-1 the owner of a legacy plaintext row can still use it, and the provider gets the real key',
+  r.status === 200 && world.providerCalls === legacyCallsBefore + 1
+  && world.providerRequests.slice(-1)[0].auth === `Bearer ${LEGACY_PLAINTEXT}`,
+  `status=${r.status}`);
+const repairedRow = ncb.rows.ai_provider_credentials_1770000000.find((x) => x.id === 51);
+check('L-2 the stored value is no longer the plaintext, and it is decryptable ciphertext',
+  repairedRow.encrypted_api_key !== LEGACY_PLAINTEXT
+  && mod.storedValueIsCiphertext(repairedRow.encrypted_api_key) === true
+  && mod.encryptProviderApiKeyLocal(LEGACY_PLAINTEXT) !== repairedRow.encrypted_api_key,
+  'ciphertext is RSA-OAEP; a fresh encryption differs per padding, so equality is not the test');
+check('L-3 the repair rewrote the SAME row and created no second credential',
+  ncb.rows.ai_provider_credentials_1770000000.filter((x) => String(x.user_id) === '101').length === 1
+  && legacyUpdatesAt() === 1, `update calls to row 51: ${legacyUpdatesAt()}`);
+const usedAfterFirst = usageRow('101')?.calls_used;
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 51 });
+check('L-4 the repair is idempotent: the second use needs no further write',
+  r.status === 200 && legacyUpdatesAt() === 1, `update calls now: ${legacyUpdatesAt()}`);
+check('L-4b and the second use still charged exactly one call (no silent freebie)',
+  (usageRow('101')?.calls_used ?? 0) === (usedAfterFirst ?? 0) + 1,
+  `used=${usageRow('101')?.calls_used}`);
+check('L-5 the plaintext never appeared in a response, a log line, or the stored row afterwards',
+  !JSON.stringify(r).includes(LEGACY_PLAINTEXT)
+  && !seenBodies.some((t) => t.includes(LEGACY_PLAINTEXT))
+  && !logs.some((line) => line.includes(LEGACY_PLAINTEXT))
+  && repairedRow.encrypted_api_key !== LEGACY_PLAINTEXT,
+  `${logs.length} logs / ${seenBodies.length} bodies searched`);
+// A stranger cannot cause a repair of somebody else's row — and the row must stay untouched.
+const otherRow = ncb.rows.ai_provider_credentials_1770000000.find((x) => x.id === 52);
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 52 });
+check('L-6 a non-owner naming a legacy row is refused and that row is not rewritten',
+  r.status === 403 && otherRow.encrypted_api_key === LEGACY_PLAINTEXT
+  && !ncb.requests.some((q) => q.pathname === '/data/update/ai_provider_credentials_1770000000/52'),
+  `status=${r.status} still=${otherRow.encrypted_api_key === LEGACY_PLAINTEXT}`);
+// Repair write failure ⇒ fail CLOSED. The provider must not be contacted and no unit spent.
+resetCreds([{ id: 53, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: LEGACY_PLAINTEXT, usage: 'gameplay' }]);
+// `seed()` clears the fault (and the request log), so the fault is armed AFTER it. Setting it
+// first looked correct and tested nothing at all — the failure L-7 exists to prove was simply
+// never armed, and the call went through and succeeded.
+seed();
+ncb.fault = 'credential_update_fail';
+const failClosedCalls = world.providerCalls;
+const failClosedUsed = usageRow('101')?.calls_used ?? 0;
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 53 });
+j = await readBody(r);
+ncb.fault = null;
+check('L-7 a failed repair fails CLOSED: 503, no provider call, no quota charged',
+  r.status === 503 && world.providerCalls === failClosedCalls
+  && (usageRow('101')?.calls_used ?? 0) === failClosedUsed
+  && j.code === 'CREDENTIAL_UNAVAILABLE',
+  `status=${r.status} provider=${world.providerCalls - failClosedCalls} used=${(usageRow('101')?.calls_used ?? 0) - failClosedUsed}`);
+check('L-7b the row is still plaintext after the failed repair, so it stays eligible for one',
+  ncb.rows.ai_provider_credentials_1770000000.find((x) => x.id === 53).encrypted_api_key === LEGACY_PLAINTEXT,
+  'no partial state, no flag, no destroyed credential');
+// The §7 leak: only config.credentialId is a channel. A top-level id must be inert, because
+// `buildProviderBody` forwards top-level fields to the provider.
+resetCreds([{ id: 61, user_id: '101', provider: 'alibaba', model: 'qwen3.8-flash', endpoint: baseUrl, encrypted_api_key: A_SECRET, usage: 'gameplay' }]);
+r = await fetch(`${B}/ai/chat`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-a' },
+  body: JSON.stringify({
+    provider: 'alibaba', config: { baseUrl }, model: 'qwen3.8-flash', credentialId: 61,
+    messages: [{ role: 'user', content: 'hi' }]
+  })
+});
+check('L-8 a TOP-LEVEL credentialId is not a second channel and cannot spend a credential',
+  r.status === 400, `status=${r.status}`);
+r = await CHAT_WITH('tok-a', { baseUrl, credentialId: 61 });
+const leakedId = world.providerRequests.slice(-1).some((q) => JSON.stringify(q.body).includes('credentialId')
+  || JSON.stringify(q.headers).includes('credentialId'));
+check('L-9 credentialId never reaches the provider request body or headers',
+  r.status === 200 && !leakedId,
+  JSON.stringify(Object.keys(world.providerRequests.slice(-1)[0]?.body || {})));
+
+function bridgeSrcTextForCredCheck() {
+  return fs.readFileSync(path.join(ROOT, 'bridge.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^[ \t]*\/\/.*$/gm, ' ');
+}
 const bridgeSrc = fs.readFileSync(path.join(ROOT, 'bridge.js'), 'utf8');
 const codeOnly = bridgeSrc.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^[ \t]*\/\/.*$/gm, ' ');
 const dupes = (() => {
@@ -1520,9 +1947,28 @@ check('T24 the source contains no bare /reserve, /status or /config route litera
 const fetchTargets = (codeOnly.match(/fetch\(\s*[^,{)\s]+/g) || []).map((s) => s.replace('fetch(', '').trim());
 // The token is cut at the first `,` `)` `{` or space, so `buildNcbUrl(path)` reads as
 // `buildNcbUrl(path` — the name of the transport is what identifies it, not its argument.
-check('T24 the outbound call sites are the four known transports only (NCB, provider, generic adapter, webhook)',
-  fetchTargets.slice().sort().join(',') === ['ROCKETCHAT_WEBHOOK_URL', 'buildNcbUrl(path', 'quotaUrl.href', 'url'].sort().join(','),
+// UPDATED 2026-10-05, disclosed old→new. This check listed FOUR sites and asserted exact
+// set equality, so the invitation route's anonymous NCB read was a legitimate fifth. The set
+// is now five named transports — the count is still exact, nothing is admitted by pattern, and
+// a sixth site still fails this check. What was ADDED is the important half: the new site is
+// pinned below as provably credential-free, which is a stronger claim than the four-site list
+// ever made.
+const KNOWN_TRANSPORTS = [
+  'ROCKETCHAT_WEBHOOK_URL', 'buildNcbUrl(path', 'buildNcbPublicUrl(path', 'quotaUrl.href', 'url'
+];
+check('T24 the outbound call sites are the five known transports only (NCB authenticated, NCB anonymous public, provider, generic adapter, webhook)',
+  fetchTargets.slice().sort().join(',') === KNOWN_TRANSPORTS.slice().sort().join(','),
   fetchTargets.join(' | '));
+// The property that makes the fifth site safe: an anonymous read must stay anonymous. A
+// `buildNcbPublicUrl` that also forwarded `Authorization` would turn the pre-registration
+// route into a bearer-presenting one, so this is asserted on the function body, not assumed
+// from its name.
+const publicTransportBody = (bridgeSrc.match(/async function ncbPublicRead[\s\S]*?\n\}/) || [''])[0];
+check('T24 the public transport can present no credential of any kind',
+  publicTransportBody.length > 0
+  && !/authorization|bearer|getBearerToken/i.test(publicTransportBody)
+  && /fetch\(buildNcbPublicUrl\(path\)/.test(publicTransportBody),
+  `public transport body chars: ${publicTransportBody.length}, bearer mentions: ${(publicTransportBody.match(/authorization|bearer|getBearerToken/gi) || []).length}`);
 // The runtime half of the same claim, and the stronger one: whatever the source says, these
 // are the machines this run actually sent bytes to. Nothing else is reachable — the stub
 // throws for any other host, so an accidental production call would fail the run outright.

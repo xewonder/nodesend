@@ -141,6 +141,17 @@ function buildNcbUrl(path) {
   return url.toString();
 }
 
+/* A SEPARATE URL builder for the one anonymous read in this relay, rather than a flag on
+   `buildNcbUrl`. The name is the security property: a transport whose name begins with
+   `Public` can be asserted — by the gates and by a reader — never to carry the caller's
+   session. Two callers sharing one builder with a boolean would let a future edit pass a
+   bearer down the public path without changing any call site. */
+function buildNcbPublicUrl(path) {
+  const url = new URL(path, NCB_PROXY_BASE);
+  url.searchParams.set("Instance", NCB_INSTANCE);
+  return url.toString();
+}
+
 function getBearerToken(req) {
   const authorization = req.get("authorization") || "";
   return authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
@@ -231,6 +242,39 @@ function getNodeSendPrivateKey() {
 function isEncryptionConfigured() {
   try { crypto.createPublicKey(getNodeSendPrivateKey()); return true; }
   catch { return false; }
+}
+
+/* RSA-OAEP/SHA-256 encryption with this relay's OWN public key — the exact inverse of
+   `decryptProviderApiKey`, and deliberately the same scheme rather than a second one. Adding an
+   AES key here would create two formats in one column and a reader could not tell which row used
+   which; the existing keypair is the only secret material this relay already holds for this
+   purpose. The public key is derived from the private key rather than configured separately, so a
+   rotation cannot leave the encryptor pointing at the old half. */
+function encryptProviderApiKeyLocal(plaintextKey) {
+  const value = String(plaintextKey ?? "");
+  if (!value) throw new Error("provider API key is empty");
+  const publicKey = crypto.createPublicKey(getNodeSendPrivateKey());
+  return crypto.publicEncrypt({
+    key: publicKey,
+    padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+    oaepHash: "sha256"
+  }, Buffer.from(value, "utf8")).toString("base64");
+}
+
+/* Is this stored value ciphertext this relay can read?
+   Two tests, both cheap and both necessary. The base64 shape is checked first because
+   `decryptProviderApiKey` already rejects a non-conforming string on that basis, and then a real
+   decrypt attempt decides: a legacy plaintext key is arbitrary text that will not happen to be
+   valid base64 AND decryptable. Only a successful decrypt counts as ciphertext — guessing from
+   length or character class is how a key that happens to look like base64 gets misclassified. */
+function storedValueIsCiphertext(value) {
+  const encoded = String(value ?? "").trim();
+  if (!encoded) return false;
+  try {
+    return Boolean(decryptProviderApiKey(encoded));
+  } catch {
+    return false;
+  }
 }
 
 function decryptProviderApiKey(encryptedApiKey) {
@@ -414,6 +458,46 @@ async function requestProvider({ provider, config, resolvedApiKey, path, method 
   return { ok: response.ok, status: response.status, body: parsed, metrics };
 }
 
+/* The chat/test/models key resolver, in the order the migration needs.
+
+   The INLINE ciphertext wins whenever it is present, and that ordering is load-bearing rather
+   than cosmetic. The System AI path supplies both a credential id AND the ciphertext it fetched
+   itself, and that id names an admin-owned row — so a resolver that preferred the id would try
+   to read somebody else's credential and refuse the request, turning every System AI call into a
+   403. Preferring the inline value keeps System AI on exactly the path it has always used, and
+   leaves `credentialId` meaningful for the case where the caller holds no key material at all:
+   an Own-AI account whose credential now lives only here.
+
+   The inline branch is also the deployment-skew path — the shipped bundle still sends it — and
+   it carries ciphertext, never a plaintext key, so keeping it is not a weakening. Once the new
+   frontend is verified in production this branch becomes dead code and should be deleted rather
+   than left as a second way in. */
+/* The chat/test/models key resolver.
+
+   The inline ciphertext wins whenever it is present, and that ordering is load-bearing rather
+   than cosmetic. The System AI path supplies a credential id AND the ciphertext it fetched
+   itself, and that id names an admin-owned row — a resolver that preferred the id would try to
+   read somebody else's credential and answer 403, breaking every System AI call. Preferring the
+   inline value keeps System AI on exactly the path it has always used, and leaves
+   `credentialId` meaningful for the case where the caller holds no key material at all: an
+   Own-AI account whose credential now lives only here.
+
+   The inline branch is also the deployment-skew path — the shipped bundle still sends it. No
+   nested-ciphertext tolerance was added for the transition, because the deployed key cannot
+   produce one: it is 3072-bit, RSA-OAEP/SHA-256 carries at most 318 bytes under it, and its own
+   ciphertext base64-encodes to 512. An old bundle that read a repaired row therefore fails
+   loudly at encrypt time in its own process rather than sending a double-wrapped blob this
+   relay would have to unfold. verify-session-quota asserts that bound, so if the key is ever
+   rotated to 4096 or larger the assumption is caught as a red check instead of silently
+   becoming true. */
+async function resolveRequestApiKey(req, config) {
+  const inlineKey = String(config?.encryptedApiKey ?? "").trim();
+  if (inlineKey) return resolveProviderApiKey(config);
+  const credentialId = String(config?.credentialId ?? "").trim();
+  if (credentialId) return (await resolveStoredCredential(req, credentialId)).apiKey;
+  return resolveProviderApiKey(config);
+}
+
 async function relayAI(req, res, operation) {
   const requestId = requestIdentity(req, res);
   const lifecycle = requestLifecycle(req, res, requestId);
@@ -431,8 +515,12 @@ async function relayAI(req, res, operation) {
           models: ALIBABA_TOKEN_PLAN_MODELS
         });
       }
+      // Model discovery is a provider call too, so a credential referenced by id must be
+      // resolved here rather than left to the inline path. A failure is reported the same way
+      // the request above reports it, and never as an empty model list.
+      const discoveredKey = await resolveRequestApiKey(req, config);
       result = await requestProvider({
-        provider, config, path: "/models", method: "GET", lifecycle, requestId
+        provider, config, resolvedApiKey: discoveredKey, path: "/models", method: "GET", lifecycle, requestId
       });
       if (!result.ok) {
         res.setHeader("Server-Timing", timeHeader({ ...result.metrics, relayTotalMs: lifecycle.elapsed() }));
@@ -472,8 +560,14 @@ async function relayAI(req, res, operation) {
     // the provider is never contacted.
     let reservation = null;
     let resolvedApiKey = null;
+    if (operation === "test") {
+      // The connectivity probe spends no quota, but it still needs a key, and the key may now
+      // live only in this relay. Failing here is the correct answer: an admin must not be told
+      // a credential works when it cannot be resolved.
+      resolvedApiKey = await resolveRequestApiKey(req, config);
+    }
     if (operation === "chat") {
-      resolvedApiKey = resolveProviderApiKey(config);
+      resolvedApiKey = await resolveRequestApiKey(req, config);
       reservation = await reserveAiCall(req, res);
       if (!reservation.allowed) {
         const status = reservation.reason === "quota_service_unavailable" || reservation.reason === "auth_required"
@@ -528,13 +622,29 @@ async function relayAI(req, res, operation) {
       return;
     }
     const timeout = lifecycle.cause === "upstream_timeout";
-    const invalid = error?.status === 400 || (/required|disabled|invalid|decryption|not allowed|not configured/i).test(error?.message || "");
+    // A credential this relay could not resolve is a REFUSAL with a known status — 403 for a
+    // row belonging to somebody else, 400 for a unusable id, 503 when storage did not answer.
+    // Falling through to the generic 502 would tell the client the upstream failed when the
+    // request never left, and 502 is a code a caller may retry.
+    const refusedStatus = Number(error?.status || 0);
+    const refused = [400, 403, 503].includes(refusedStatus);
+    const invalid = refused || error?.status === 400
+      || (/required|disabled|invalid|decryption|not allowed|not configured/i).test(error?.message || "");
     safeEvent("request_failed", {
       requestId, operation, provider: req.body?.provider || null,
       cause: timeout ? "upstream_timeout" : invalid ? "validation" : "upstream_or_network_error",
       elapsedMs: Math.round(lifecycle.elapsed())
     });
     if (res.headersSent) return;
+    if (refused) {
+      res.setHeader("Server-Timing", timeHeader({ relayTotalMs: lifecycle.elapsed() }));
+      return res.status(refusedStatus).json({
+        success: false, error: error.message,
+        code: refusedStatus === 403 ? "CREDENTIAL_FORBIDDEN"
+          : refusedStatus === 503 ? "CREDENTIAL_UNAVAILABLE" : "INVALID_CREDENTIAL",
+        requestId
+      });
+    }
     return res.status(timeout ? 504 : invalid ? 400 : 502).json({
       success: false,
       error: timeout ? "NodeSend upstream timeout" : invalid ? error.message : "AI upstream request failed",
@@ -1605,6 +1715,504 @@ function requireBridgeAdmin(req, res, next) {
   return next();
 }
 
+// ── INVITATION CODES — app-surface reduction, NOT a storage fix ─────────────
+// Read the policy first: `user_codes` carries `public_read,shared_readwrite` in this
+// instance (measured 2026-10-05 against NCB's own policy list), and the columns include
+// `secret_key`. Until that policy changes, ANY anonymous caller that knows the proxy URL
+// can read the whole table directly, and nothing in this file prevents that. What these
+// routes DO change is what BridgeMind's own browser code receives: the page stops
+// downloading rows and instead gets one boolean. That is a real reduction in exposure of
+// secret material in a client we control, and it is also the precondition for tightening
+// the policy later — but it is NOT hardening at the storage layer, and must never be
+// described as such.
+//
+// Why the read here is anonymous: validation happens BEFORE sign-up, so there is no
+// session to present. It therefore goes through NCB's public data route, which is the same
+// route and the same table policy `Login.jsx` was already using. No service credential is
+// invented, and none exists: see `ncbRequest`, which carries only the caller's bearer.
+const USER_CODES_TABLE = String(process.env.USER_CODES_TABLE || "user_codes").trim();
+const INVITATION_CODE_MAX_LENGTH = 128;
+// Abuse control for a pre-registration endpoint. There is no existing limiter in this
+// relay, so this is the same shape the quota code already uses for process-local state:
+// one bounded Map, oldest-key eviction, and an explicit statement of what it cannot do.
+// It is per-process only — it does not survive a restart, and it is not shared between
+// replicas — so it slows down a caller who keeps hitting THIS worker from THIS address.
+// It is not a distributed throttle and must not be reported as one.
+const INVITATION_RATE_WINDOW_MS = boundedInt(
+  process.env.INVITATION_RATE_WINDOW_MS, 60000, 1000, 3600000
+);
+const INVITATION_RATE_MAX = boundedInt(process.env.INVITATION_RATE_MAX, 20, 1, 10000);
+const INVITATION_RATE_BUCKETS_LIMIT = 5000;
+const invitationBuckets = new Map();
+
+/* A read with NO credential of any kind. Deliberately its own helper rather than a flag on
+   `ncbRequest`: the bearer-carrying transport is pinned by the gates as the only path that
+   can present the caller's session, and an anonymous public read must not look like, or be
+   able to become, a credentialed one. */
+async function ncbPublicRead(path) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NCB_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(buildNcbPublicUrl(path), {
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal
+    });
+    if (!response.ok) return { ok: false, reason: "invitation_service_unavailable" };
+    const payload = await response.json().catch(() => null);
+    return payload === null
+      ? { ok: false, reason: "invitation_service_unavailable" }
+      : { ok: true, payload };
+  } catch {
+    return { ok: false, reason: "invitation_service_unavailable" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* Named functions, not arrow properties in the export object: a harness that loads this module
+   through `import()` sees only identifier exports, and an inline `key: () => …` is invisible to
+   it. Both of these exist so the rate limiter is observable and resettable between scenarios —
+   without them the only way to test the throttle is to burn twenty requests per run. */
+function resetInvitationRateBuckets() {
+  invitationBuckets.clear();
+}
+
+function invitationBucketCount() {
+  return invitationBuckets.size;
+}
+
+function normalizeInvitationCode(value) {
+  const code = typeof value === "string" ? value.trim() : "";
+  if (!code || code.length > INVITATION_CODE_MAX_LENGTH) return null;
+  if (DECISION_KEY_UNSET_WORDS.test(code)) return null;
+  return code;
+}
+
+/* Best-effort, in-process, per-address window. Returns the seconds the caller must wait,
+   or 0 when the attempt is allowed. The key is the socket address, which behind a proxy may
+   be the proxy's own — another reason this is throttling, not access control. */
+function invitationRateHit(ip) {
+  const now = Date.now();
+  const key = String(ip || "unknown");
+  const entry = invitationBuckets.get(key);
+  if (!entry || now - entry.startedAt >= INVITATION_RATE_WINDOW_MS) {
+    if (invitationBuckets.size >= INVITATION_RATE_BUCKETS_LIMIT) {
+      // Bounded, like the quota ledger: a long-lived process cannot grow without limit.
+      const oldest = invitationBuckets.keys().next().value;
+      if (oldest !== undefined) invitationBuckets.delete(oldest);
+    }
+    invitationBuckets.set(key, { startedAt: now, count: 1 });
+    return 0;
+  }
+  entry.count += 1;
+  if (entry.count <= INVITATION_RATE_MAX) return 0;
+  return Math.max(1, Math.ceil((INVITATION_RATE_WINDOW_MS - (now - entry.startedAt)) / 1000));
+}
+
+/* Rows are matched on the EXACT code the caller typed and an unused flag, which is the
+   predicate `Login.jsx` used; `?code=` filtering at NCB is a substring-free equality
+   filter, but the comparison is re-done here so a filter change upstream cannot quietly
+   turn the check into "somebody else's code matched". */
+async function findUsableInvitationRow(req, code) {
+  const read = await ncbPublicRead(
+    `/public-data/read/${USER_CODES_TABLE}?code=${encodeURIComponent(code)}`
+  );
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
+  const matches = rows.filter((row) => String(row?.code ?? "") === code && !Number(row?.used ?? 0));
+  if (matches.length > 1) {
+    // Two live rows for one code is a data fault, not a choice to make silently.
+    return { ok: false, reason: "invitation_duplicate" };
+  }
+  return { ok: true, row: matches[0] ?? null, duplicate: false };
+}
+
+async function validateInvitationDecision(req, body) {
+  const code = normalizeInvitationCode(body?.code);
+  if (!code) return { status: 400, body: { error: "code is required" } };
+  const found = await findUsableInvitationRow(req, code);
+  if (!found.ok) return { status: 503, body: { error: found.reason } };
+  // The answer is a boolean and nothing else: no row id, no secret_key, no user_id, no
+  // stored code object, no count of matches.
+  return { status: 200, body: { valid: Boolean(found.row) } };
+}
+
+/* Mark the code spent for the account that just registered. The identity written is the
+   SESSION's user id, never a body field: a caller cannot attach a code to somebody else's
+   account, and cannot spend one on an account it does not hold. */
+async function consumeInvitationDecision(req, body) {
+  const userId = req.bridgeUser?.id;
+  if (!userId) return { status: 401, body: { error: "Authentication required" } };
+  const code = normalizeInvitationCode(body?.code);
+  if (!code) return { status: 400, body: { error: "code is required" } };
+  const found = await findUsableInvitationRow(req, code);
+  if (!found.ok) return { status: 503, body: { error: found.reason } };
+  if (!found.row?.id) return { status: 200, body: { success: false, reason: "invitation_not_found" } };
+
+  const written = await quotaWrite(req, QUOTA_WRITE_METHODS.update,
+    `/data/update/${USER_CODES_TABLE}/${encodeURIComponent(found.row.id)}`,
+    { used: 1, user_id: userId }, "invitation_update_failed");
+  if (!written.ok) return { status: 503, body: { error: written.reason } };
+
+  // Read back, exactly as every other write in this relay does: a code that still says
+  // "unused" after a reported success is an outage-shaped answer, not a consumed one.
+  const after = await findUsableInvitationRow(req, code);
+  if (!after.ok) return { status: 503, body: { error: after.reason } };
+  if (after.row) return { status: 503, body: { error: "invitation_write_unconfirmed" } };
+  return { status: 200, body: { success: true } };
+}
+
+async function validateInvitationHandler(req, res) {
+  const requestId = requestIdentity(req, res);
+  const retryAfter = invitationRateHit(req.ip);
+  if (retryAfter > 0) {
+    res.setHeader("Retry-After", String(retryAfter));
+    safeEvent("invitation_rate_limited", { requestId });
+    return res.status(429).json({
+      success: false, status: "invitation_rate_limited", error: "Too many attempts", requestId
+    });
+  }
+  const decision = await validateInvitationDecision(req, req.body);
+  if (decision.status !== 200) {
+    safeEvent("invitation_validation_unavailable", { requestId, status: decision.status });
+    return res.status(decision.status).json({
+      success: false,
+      status: decision.status === 400 ? "invalid_invitation_code" : decision.body.error,
+      error: decision.body.error, requestId
+    });
+  }
+  safeEvent("invitation_validated", { requestId, valid: decision.body.valid });
+  return res.status(200).json({ success: true, ...decision.body, requestId });
+}
+
+async function consumeInvitationHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await consumeInvitationDecision(req, req.body);
+  if (decision.status !== 200) {
+    safeEvent("invitation_consume_failed", {
+      requestId, status: decision.status, reason: String(decision.body.error ?? "rejected"),
+      userId: req.bridgeUser?.id ?? null
+    });
+    return res.status(decision.status).json({
+      success: false, status: decision.body.error, error: decision.body.error, requestId
+    });
+  }
+  safeEvent("invitation_consumed", { requestId, userId: req.bridgeUser?.id ?? null,
+    success: decision.body.success === true, reason: decision.body.reason ?? null });
+  return res.status(200).json({ success: decision.body.success === true, ...
+    (decision.body.reason ? { reason: decision.body.reason } : {}), requestId });
+}
+
+// ── PER-USER AI CREDENTIALS — the one Stage 1 surface that can really tighten ─
+// `ai_provider_credentials_1770000000` holds each account's OWN provider key, as RSA-OAEP
+// ciphertext produced in the browser with this relay's public key
+// (`GET /crypto/public-key`). The plaintext key has never been stored here or in NCB, and
+// never will be. What this section changes is who is allowed to see the ciphertext and who
+// is allowed to write it:
+//
+//   before — the browser read the table, received the ciphertext, passed it back on every
+//            /ai/chat call, and wrote rows itself;
+//   after  — the browser sees metadata only, and this relay resolves the ciphertext itself
+//            and decrypts it at the moment a provider call is made.
+//
+// This table is different from `user_codes` and `system_ai_credentials` in one decisive way:
+// every row is owned by exactly one account, and the owner is the very session whose bearer
+// this relay presents. So when NCB's policy on it becomes `private`
+// (`WHERE user_id = session_user`), the reads below keep working UNCHANGED — the filter this
+// code applies by hand is the filter NCB would then apply itself. That is why tightening this
+// table is a real recommendation and the other two are not.
+//
+// Honest scope of the protection today: while the policy stays `shared_readwrite`, a session
+// that addresses NCB directly can still read or overwrite another account's row. These routes
+// stop BRIDGEMIND from doing that, and they stop the ciphertext from travelling through the
+// client at all; they do not enforce it at the storage layer, and must not be described as
+// doing so.
+const AI_CREDENTIALS_TABLE = String(
+  process.env.AI_CREDENTIALS_TABLE || "ai_provider_credentials_1770000000"
+).trim();
+const AI_CREDENTIAL_USAGE_SCOPES = ["gameplay", "tutor"];
+const AI_PROVIDER_NAMES = ["alibaba", "openai"];
+
+function normalizeUsageScope(value) {
+  const usage = String(value ?? "").trim().toLowerCase();
+  return AI_CREDENTIAL_USAGE_SCOPES.includes(usage) ? usage : null;
+}
+
+/* The ONLY shape this relay hands back about a credential. `encrypted_api_key` is not in it
+   and cannot be added by accident: the field list is explicit, and the gate asserts both
+   that this function names no key field and that no serialized response of these routes
+   ever contains the stored ciphertext. */
+function credentialMetadata(row) {
+  return {
+    id: row?.id ?? null,
+    provider: String(row?.provider ?? ""),
+    model: String(row?.model ?? ""),
+    endpoint: String(row?.endpoint ?? ""),
+    usage: normalizeUsageScope(row?.usage) ?? "gameplay",
+    credentialPresent: Boolean(String(row?.encrypted_api_key ?? "").trim()),
+    updatedAt: row?.updated_at ?? null
+  };
+}
+
+function credentialRows(payload) {
+  return Array.isArray(payload?.data) ? payload.data : [];
+}
+
+// Reads are always filtered by the SESSION's user id. A caller-supplied user_id is not
+// merely ignored here — it is never even read — so "User A asks for User B" has no path to
+// exist, whichever spelling it tries (body, query, or a row id that happens to be B's).
+async function readOwnCredentialRows(req, userId, usage) {
+  const filter = usage ? { user_id: userId, usage } : { user_id: userId };
+  const read = await quotaRead(req, `/data/read/${AI_CREDENTIALS_TABLE}?${quotaFilter(filter)}`);
+  if (!read.ok) return { ok: false, reason: read.reason };
+  return { ok: true, rows: credentialRows(read.payload) };
+}
+
+async function listOwnCredentialsDecision(req) {
+  const userId = req.bridgeUser?.id;
+  if (!userId) return { status: 401, body: { error: "Authentication required" } };
+  const found = await readOwnCredentialRows(req, userId, null);
+  if (!found.ok) return { status: 503, body: { error: found.reason } };
+  // Stable order, so a client that renders this list does not reshuffle between polls.
+  const credentials = found.rows
+    .map(credentialMetadata)
+    .sort((a, b) => `${a.usage}:${a.id}`.localeCompare(`${b.usage}:${b.id}`));
+  return { status: 200, body: { credentials } };
+}
+
+/* Store or replace the caller's own credential for one usage scope.
+   Two rules carry the security property: the owner is the session and nothing else, and the
+   key travels only as ciphertext. A plaintext key is REFUSED outright — the relay will not
+   become the thing that puts a raw provider key into a request body, a log line or NCB.
+   When no key is supplied, the stored ciphertext is left alone, because the Settings screen
+   has to be able to change a model without the user retyping a secret they cannot see. */
+async function saveOwnCredentialDecision(req, body) {
+  const userId = req.bridgeUser?.id;
+  if (!userId) return { status: 401, body: { error: "Authentication required" } };
+  const usage = normalizeUsageScope(body?.usage);
+  if (!usage) return { status: 400, body: { error: "usage must be gameplay or tutor" } };
+  const provider = String(body?.provider ?? "").trim().toLowerCase();
+  if (!AI_PROVIDER_NAMES.includes(provider)) {
+    return { status: 400, body: { error: "Unsupported AI provider" } };
+  }
+  const model = String(body?.model ?? "").trim().slice(0, 200);
+  const endpoint = String(body?.endpoint ?? "").trim().slice(0, 500);
+  const suppliedKey = typeof body?.encryptedApiKey === "string" ? body.encryptedApiKey.trim() : "";
+
+  if (body?.apiKey !== undefined && body?.apiKey !== null && String(body.apiKey).trim() !== "") {
+    // Explicitly refused rather than silently dropped: a client that sends a plaintext key
+    // has misunderstood the contract, and accepting it would hide that.
+    return { status: 400, body: { error: "Plaintext provider keys are not accepted. Send encryptedApiKey." } };
+  }
+
+  if (suppliedKey) {
+    // Validate before storing. A blob this relay cannot decrypt is a broken credential, and
+    // discovering that at save time is far better than discovering it inside a hand.
+    // The value itself is never logged and never returned.
+    try {
+      decryptProviderApiKey(suppliedKey);
+    } catch {
+      return { status: 400, body: { error: "encryptedApiKey could not be decrypted with this relay's key" } };
+    }
+  }
+
+  const found = await readOwnCredentialRows(req, userId, usage);
+  if (!found.ok) return { status: 503, body: { error: found.reason } };
+  const rows = found.rows;
+  if (rows.length > 1) {
+    // Never resolved by taking the first, exactly as the quota override read behaves: two
+    // rows for one (user, usage) mean the answer is unknown, not that one of them is right.
+    return { status: 503, body: { error: "credential_duplicate" } };
+  }
+
+  const patch = { provider, model, endpoint, usage };
+  if (suppliedKey) patch.encrypted_api_key = suppliedKey;
+
+  let written;
+  if (rows.length === 1) {
+    written = await quotaWrite(req, QUOTA_WRITE_METHODS.update,
+      `/data/update/${AI_CREDENTIALS_TABLE}/${encodeURIComponent(rows[0].id)}`, patch,
+      "credential_update_failed");
+  } else {
+    written = await quotaWrite(req, QUOTA_WRITE_METHODS.create,
+      `/data/create/${AI_CREDENTIALS_TABLE}`, { ...patch, user_id: userId },
+      "credential_create_failed");
+  }
+  if (!written.ok) return { status: 503, body: { error: written.reason } };
+
+  // Read back and compare the metadata, the same way the quota config write does. A stored
+  // row that disagrees with what was sent is an outage-shaped answer, not a success.
+  const after = await readOwnCredentialRows(req, userId, usage);
+  if (!after.ok) return { status: 503, body: { error: after.reason } };
+  const stored = after.rows.length === 1 ? credentialMetadata(after.rows[0]) : null;
+  if (!stored || stored.provider !== provider || stored.usage !== usage || stored.model !== model) {
+    return { status: 503, body: { error: "credential_write_unconfirmed" } };
+  }
+  if (suppliedKey && stored.credentialPresent !== true) {
+    return { status: 503, body: { error: "credential_write_unconfirmed" } };
+  }
+  return { status: 200, body: { credential: stored } };
+}
+
+/* Remove the caller's own credential for one usage scope. Row ids come from the
+   session-filtered read above and never from the request, so the only rows this can reach are
+   the caller's. `removeUserCredentialForUsage` in the browser used to delete by an id it had
+   read itself — the same effect, but the authority was the client. */
+async function deleteOwnCredentialDecision(req, body, query) {
+  const userId = req.bridgeUser?.id;
+  if (!userId) return { status: 401, body: { error: "Authentication required" } };
+  const usage = normalizeUsageScope(body?.usage ?? query?.usage);
+  if (!usage) return { status: 400, body: { error: "usage must be gameplay or tutor" } };
+  const found = await readOwnCredentialRows(req, userId, usage);
+  if (!found.ok) return { status: 503, body: { error: found.reason } };
+  const rows = found.rows;
+  if (rows.length === 0) return { status: 200, body: { removed: 0 } };
+  let removed = 0;
+  for (const row of rows) {
+    const written = await quotaWrite(req, QUOTA_WRITE_METHODS.remove,
+      `/data/delete/${AI_CREDENTIALS_TABLE}/${encodeURIComponent(row.id)}`, {},
+      "credential_delete_failed");
+    if (!written.ok) return { status: 503, body: { error: written.reason } };
+    removed += 1;
+  }
+  const after = await readOwnCredentialRows(req, userId, usage);
+  if (!after.ok) return { status: 503, body: { error: after.reason } };
+  if (after.rows.length !== 0) {
+    return { status: 503, body: { error: "credential_delete_unconfirmed" } };
+  }
+  return { status: 200, body: { removed } };
+}
+
+/* The chat path's own resolver: turn a credential id into a usable provider key, or refuse.
+   Ownership is checked against the row's `user_id`, so a caller that names somebody else's
+   credential id is denied rather than served — the row is never read past the filter, and no
+   ciphertext crosses the response either way.
+
+   LEGACY PLAINTEXT UPGRADE, in this path and nowhere else. Rows written before the credential
+   routes existed hold the provider key as PLAINTEXT in `encrypted_api_key`, while the table
+   policy let any session read it. When the OWNER resolves such a row, this rewrites the same
+   row as ciphertext and only then continues. Four properties are load-bearing:
+   • it runs only after the ownership check, so no caller can make the relay rewrite a row that
+     is not theirs;
+   • it is idempotent — the rewritten value decrypts, so the next call takes the normal path;
+   • it never creates a row, so a user cannot accumulate two credentials by being migrated;
+   • if the rewrite fails, the request FAILS CLOSED rather than continuing on a plaintext row.
+     Serving the key anyway would trade the one chance to repair the row for one call that was
+     going to work regardless, and a repair path that gives up under a storage blip is a path
+     that never finishes. */
+async function resolveStoredCredential(req, credentialId) {
+  const userId = req.bridgeUser?.id;
+  const id = String(credentialId ?? "").trim();
+  if (!userId || !id || /^\d+$/.test(id) === false) {
+    throw Object.assign(new Error("A usable credential id is required"), { status: 400 });
+  }
+  const read = await quotaRead(req, `/data/read/${AI_CREDENTIALS_TABLE}?${quotaFilter({ id })}`);
+  if (!read.ok) {
+    throw Object.assign(new Error("AI credential is unavailable"), { status: 503 });
+  }
+  const row = credentialRows(read.payload)[0] ?? null;
+  if (!row || String(row.user_id ?? "") !== String(userId)) {
+    // The same answer for "no such row" and "somebody else's row": neither the existence of
+    // another account's credential nor its shape is observable through this route.
+    throw Object.assign(new Error("AI credential is unavailable"), { status: 403 });
+  }
+  const stored = String(row.encrypted_api_key ?? "").trim();
+  if (!stored) {
+    throw Object.assign(new Error("AI provider API key is required"), { status: 400 });
+  }
+
+  let usable = stored;
+  if (!storedValueIsCiphertext(stored)) {
+    // Legacy plaintext. Encrypt with this relay's own public key and put the ciphertext back on
+    // the SAME row. The plaintext never leaves this function, is never logged, and is never
+    // returned to the caller.
+    let repaired;
+    try {
+      repaired = encryptProviderApiKeyLocal(stored);
+    } catch {
+      throw Object.assign(new Error("AI credential is unavailable"), { status: 503 });
+    }
+    const written = await quotaWrite(req, QUOTA_WRITE_METHODS.update,
+      `/data/update/${AI_CREDENTIALS_TABLE}/${encodeURIComponent(row.id)}`,
+      { encrypted_api_key: repaired }, "credential_repair_failed");
+    if (!written.ok) {
+      safeEvent("credential_legacy_repair_failed", { userId, credentialId: row.id });
+      throw Object.assign(new Error("AI credential is unavailable"), { status: 503 });
+    }
+    // Read the row back before believing the repair: an acknowledged write that did not land
+    // would otherwise leave the next request starting from plaintext again, and this call would
+    // have reported success on a repair that never happened.
+    const after = await quotaRead(req, `/data/read/${AI_CREDENTIALS_TABLE}?${quotaFilter({ id })}`);
+    const afterRow = after.ok ? credentialRows(after.payload)[0] ?? null : null;
+    const afterValue = String(afterRow?.encrypted_api_key ?? "").trim();
+    if (!afterValue || !storedValueIsCiphertext(afterValue)) {
+      safeEvent("credential_legacy_repair_unconfirmed", { userId, credentialId: row.id });
+      throw Object.assign(new Error("AI credential is unavailable"), { status: 503 });
+    }
+    safeEvent("credential_legacy_repaired", { userId, credentialId: row.id });
+    usable = afterValue;
+  }
+
+  return {
+    apiKey: decryptProviderApiKey(usable),
+    provider: String(row.provider ?? ""),
+    endpoint: String(row.endpoint ?? "")
+  };
+}
+
+async function credentialsListHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await listOwnCredentialsDecision(req);
+  if (decision.status !== 200) {
+    safeEvent("ai_credentials_refused", { requestId, status: decision.status, userId: req.bridgeUser?.id ?? null });
+    return res.status(decision.status).json({
+      success: false, status: decision.status === 400 ? "invalid_request" : "ai_credentials_unavailable",
+      error: decision.body.error, requestId
+    });
+  }
+  safeEvent("ai_credentials_served", { requestId, userId: req.bridgeUser?.id ?? null });
+  return res.status(200).json({ success: true, ...decision.body, requestId });
+}
+
+async function credentialsSaveHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await saveOwnCredentialDecision(req, req.body);
+  if (decision.status !== 200) {
+    safeEvent("ai_credentials_rejected", {
+      requestId, status: decision.status, reason: String(decision.body.error ?? "rejected"),
+      userId: req.bridgeUser?.id ?? null
+    });
+    return res.status(decision.status).json({
+      success: false, status: decision.status === 400 ? "invalid_credential" : "ai_credentials_unavailable",
+      error: decision.body.error, requestId
+    });
+  }
+  safeEvent("ai_credentials_saved", {
+    requestId, userId: req.bridgeUser?.id ?? null,
+    // Usage and presence only. Never the key, and not even its length.
+    usage: decision.body.credential.usage, credentialPresent: decision.body.credential.credentialPresent
+  });
+  return res.status(200).json({ success: true, ...decision.body, requestId });
+}
+
+async function credentialsDeleteHandler(req, res) {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const decision = await deleteOwnCredentialDecision(req, req.body, req.query);
+  if (decision.status !== 200) {
+    safeEvent("ai_credentials_delete_failed", {
+      requestId, status: decision.status, reason: String(decision.body.error ?? "rejected"),
+      userId: req.bridgeUser?.id ?? null
+    });
+    return res.status(decision.status).json({
+      success: false, status: decision.status === 400 ? "invalid_request" : "ai_credentials_unavailable",
+      error: decision.body.error, requestId
+    });
+  }
+  safeEvent("ai_credentials_deleted", { requestId, userId: req.bridgeUser?.id ?? null, removed: decision.body.removed });
+  return res.status(200).json({ success: true, ...decision.body, requestId });
+}
+
 // Thin HTTP wrappers over the two config decisions above: authenticate from the session,
 // run the decision, send its status and its bounded body. The storage is never described
 // to the caller — no row id, no table name, no NCB response, no free-text database error.
@@ -1795,9 +2403,21 @@ app.get("/", (req, res) => res.json({
     tricksterBidSuggest: "POST /trickster/bid/suggest-bid",
     tricksterPlayHealth: "GET /trickster/play/health",
     tricksterPlaySuggest: "POST /trickster/play/suggest-card",
+    // Named so an operator can see the surface exists. No table name appears here or in
+    // any response body: the route is described by what it does, not by where it reads.
+    invitationValidate: "POST /auth/validate-invitation",
+    invitationConsume: "POST /auth/consume-invitation",
     quota: "GET|POST /quota"
   },
-  auth: { ai: "BridgeMind Bearer session", aiQuotaConfig: "Bearer session + admin role", relay: "x-api-key" },
+  auth: {
+    ai: "BridgeMind Bearer session", aiQuotaConfig: "Bearer session + admin role",
+    relay: "x-api-key",
+    // Stated plainly, because the difference matters to anyone reading this for security
+    // reasons: validation is unauthenticated by necessity (it runs before sign-up) and
+    // answers a boolean only; consumption requires the session.
+    invitationValidate: "none (pre-registration) — boolean answer only",
+    invitationConsume: "BridgeMind Bearer session"
+  },
   trickster: { auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
   quota: quotaLedgerState(),
   providers: ["alibaba", "openai"]
@@ -1957,6 +2577,19 @@ app.put("/ai/quota/config", requireBridgeSession, requireBridgeAdmin, writeQuota
 // first, role second, refusal before any storage call.
 app.get("/ai/quota/status", requireBridgeSession, requireBridgeAdmin, quotaAdminStatusHandler);
 app.put("/ai/quota/user", requireBridgeSession, requireBridgeAdmin, quotaAdminLimitHandler);
+// Invitation codes. Validation runs BEFORE sign-up, so it has no session to guard it and is
+// deliberately the only unauthenticated AI-adjacent route here: it answers one boolean and
+// nothing else, and it is rate-limited per address in-process. Consumption needs the
+// brand-new session, because the account the code is spent on is the one the bearer resolves
+// to — a body field never names it.
+app.post("/auth/validate-invitation", validateInvitationHandler);
+app.post("/auth/consume-invitation", requireBridgeSession, consumeInvitationHandler);
+// The caller's OWN provider credentials. Session-guarded, never role-guarded: the whole
+// authority of these routes is that the account is the one the bearer resolved to, so there
+// is no admin dimension to them and no user_id for a caller to forge.
+app.get("/ai/credentials", requireBridgeSession, credentialsListHandler);
+app.put("/ai/credentials", requireBridgeSession, credentialsSaveHandler);
+app.delete("/ai/credentials", requireBridgeSession, credentialsDeleteHandler);
 app.get("/quota", requireApiKey, quotaHandler);
 app.post("/quota", requireApiKey, quotaHandler);
 
@@ -2192,6 +2825,18 @@ module.exports = {
   AI_SOURCE_SYSTEM, AI_SOURCE_OWN, AI_SOURCE_CACHE_TTL_MS, AI_SOURCE_FAILURE_CACHE_TTL_MS,
   USER_SETTINGS_TABLE, quotaAdminStatusDecision, quotaAdminLimitDecision,
   quotaNotApplicableView, requestBillingSource, BILLING_SOURCE_HEADER,
+  // Invitation codes, exported for the same reason: the harness must exercise the real
+  // predicate, the real read-back and the real limiter rather than reimplement them.
+  USER_CODES_TABLE, INVITATION_CODE_MAX_LENGTH, INVITATION_RATE_MAX,
+  INVITATION_RATE_WINDOW_MS, normalizeInvitationCode, invitationRateHit,
+  validateInvitationDecision, consumeInvitationDecision, ncbPublicRead,
+  resetInvitationRateBuckets, invitationBucketCount,
+  // Per-user credentials, exported for the same reason: the harness must exercise the real
+  // ownership filter and the real metadata projection, not a copy of either.
+  AI_CREDENTIALS_TABLE, AI_CREDENTIAL_USAGE_SCOPES, normalizeUsageScope,
+  credentialMetadata, listOwnCredentialsDecision, saveOwnCredentialDecision,
+  deleteOwnCredentialDecision, resolveStoredCredential, resolveRequestApiKey,
+  encryptProviderApiKeyLocal, storedValueIsCiphertext, buildNcbPublicUrl,
   // The Trickster gateway's own rules, exported so the harness can test the real
   // predicates instead of a copy of them. The routes themselves are exercised over
   // HTTP through `app`, which is what proves the session guard is attached.
