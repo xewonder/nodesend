@@ -52,7 +52,10 @@ const SESSIONS = {
   'tok-rejected': { id: '21', role: 'user' },
   'tok-removed': { id: '22', role: 'user' },
   'tok-pending-admin': { id: '23', role: 'user' },
-  'tok-inactive-club': { id: '24', role: 'user' }
+  'tok-inactive-club': { id: '24', role: 'user' },
+  // The account a Super Admin appoints mid-run in arm 2Rk. It has NO row until that appointment
+  // creates one, which is the point: the appointee must be able to administer straight away.
+  'tok-appointed': { id: '30', role: 'user' }
 };
 
 // ── the environment the REAL relay boots with ───────────────────────────────
@@ -606,6 +609,128 @@ check('2Qq. a PENDING club_admin elect has no admin surface at all',
   pendingAdminSurface.status === 403 && pendingAdminMembers.status === 403
   && pendingAdminMembers.body.error === 'not_a_club_admin',
   `${pendingAdminSurface.status}/${pendingAdminMembers.status}`);
+
+// ── 2R. the approval workflow an admin actually drives ──────────────────────
+// 2Q proved the DENIALS. This section proves the positive workflow an owner can operate, because a
+// rule that only ever returns 403 is not a membership system. Each arm here maps to one of the ten
+// operations in the approval spec.
+
+// (Op 2) The member list is where a club admin finds the applications. `membership_status` must be
+// ON THE ROW — a list without it forces a second endpoint, and a second endpoint means a second
+// place to get the club-scope check wrong.
+const adminMemberList = await ask('GET', '/clubs/10/members', { token: 'tok-admin10' });
+const listedPending = (adminMemberList.body?.data ?? []).filter((row) => row.membership_status === 'pending');
+check('2Ra. a Club Admin lists their own club and sees each row\'s membership_status (op 2)',
+  adminMemberList.status === 200
+  && (adminMemberList.body?.data ?? []).every((row) => 'membership_status' in row)
+  && listedPending.some((row) => String(row.user_id) === '20'),
+  `${adminMemberList.status} ${JSON.stringify(adminMemberList.body?.data ?? []).slice(0, 160)}`);
+const superMemberList = await ask('GET', '/clubs/10/members', { token: CALLER_TOKEN });
+check('2Rb. a Super Admin reads the same list (op 2, authority path)',
+  superMemberList.status === 200 && superMemberList.body.data.length === (adminMemberList.body?.data ?? []).length,
+  `${superMemberList.status} vs ${adminMemberList.status}`);
+const crossMemberList = await ask('GET', '/clubs/11/members', { token: 'tok-admin10' });
+check('2Rc. an admin cannot list another club\'s members, so no pending application crosses clubs',
+  crossMemberList.status === 403 && crossMemberList.body.error === 'not_a_club_admin',
+  `${crossMemberList.status} ${crossMemberList.text.slice(0, 120)}`);
+const memberListNeedsSession = await call('GET', '/clubs/10/members');
+check('2Rd. the member list is not a public endpoint',
+  memberListNeedsSession.status === 401, `${memberListNeedsSession.status}`);
+
+// (Op 4) Rejection. A rejected applicant must end up exactly where a no-club user is.
+const rejected = await ask('POST', '/clubs/10/members/20/status', { token: 'tok-admin10', body: { status: 'rejected' } });
+const rejectedRow = tables.club_memberships.find((row) => String(row.user_id) === '20');
+const rejectedSees = await ask('GET', '/me/club', { token: 'tok-pending' });
+const rejectedDenied = await ask('GET', '/me/club/board-collections', { token: 'tok-pending' });
+check('2Re. a Club Admin rejects an applicant, and rejection grants nothing (op 4)',
+  rejected.status === 200 && rejected.body?.data?.membership_status === 'rejected'
+  && rejectedRow?.status === 'rejected' && rejectedSees.body?.data?.club_id === null
+  && rejectedSees.body?.data?.membership_status === 'rejected' && rejectedDenied.status === 403,
+  `${rejected.status} row=${rejectedRow?.status} view=${JSON.stringify(rejectedSees.body?.data).slice(0, 90)} denied=${rejectedDenied.status}`);
+check('2Rf. rejection preserves the row and the club it referred to, so Profile can explain it',
+  rejectedRow?.club_id === '10', JSON.stringify(rejectedRow));
+
+// (Op 6) A rejected applicant may apply again — the same single row, back to pending.
+const reapplied = await ask('POST', '/me/club', { token: 'tok-pending', body: { club_id: '10' } });
+const reappliedRow = tables.club_memberships.find((row) => String(row.user_id) === '20');
+check('2Rg. a REJECTED player can apply again and lands back at pending (op 6)',
+  reapplied.status === 200 && reapplied.body?.data?.outcome === 'requested'
+  && reappliedRow?.status === 'pending'
+  && tables.club_memberships.filter((row) => String(row.user_id) === '20').length === 1,
+  `${reapplied.status} ${reapplied.text.slice(0, 120)} row=${JSON.stringify(reappliedRow)}`);
+
+// (Op 7) Switching clubs must never carry an approval across.
+const inactiveSwitch = await ask('POST', '/me/club', { token: 'tok-inactive-club', body: { club_id: '10' } });
+const switchedRow = tables.club_memberships.find((row) => String(row.user_id) === '24');
+check('2Rh. switching clubs resets status to pending, never reusing the old approval (op 7)',
+  inactiveSwitch.status === 200 && inactiveSwitch.body?.data?.outcome === 'requested'
+  && String(switchedRow?.club_id) === '10' && switchedRow?.status === 'pending',
+  `${inactiveSwitch.status} ${inactiveSwitch.text.slice(0, 120)} row=${JSON.stringify(switchedRow)}`);
+const switchedDenied = await ask('GET', '/me/club/board-collections', { token: 'tok-inactive-club' });
+check('2Ri. and the switched player reaches nothing until the new club approves them',
+  switchedDenied.status === 403, `${switchedDenied.status}`);
+
+// Leave, then re-choose: approval is gone, pending is what returns.
+const joiner = await ask('POST', '/me/club', { token: 'tok-noclub', body: { club_id: '10' } });
+await ask('POST', '/clubs/10/members/5/status', { token: CALLER_TOKEN, body: { status: 'approved' } });
+await ask('DELETE', '/me/club', { token: 'tok-noclub' });
+const rejoined = await ask('POST', '/me/club', { token: 'tok-noclub', body: { club_id: '11' } });
+const rejoinedRow = tables.club_memberships.find((row) => String(row.user_id) === '5');
+check('2Rj. a returning player starts again at pending, with no memory of the prior approval (op 7)',
+  joiner.status === 200 && rejoined.status === 200
+  && rejoined.body?.data?.outcome === 'requested' && rejoinedRow?.status === 'pending'
+  && String(rejoinedRow?.club_id) === '11',
+  `${rejoined.status} ${JSON.stringify(rejoinedRow)}`);
+await ask('DELETE', '/me/club', { token: 'tok-noclub' });
+
+// (Op 8) A direct appointment IS the approval — no separate approve step, no pending limbo.
+const directAppointment = await ask('POST', '/clubs/11/admins', { token: CALLER_TOKEN, body: { user_id: '30', role: 'club_admin' } });
+const appointedRow = tables.club_memberships.find((row) => String(row.user_id) === '30');
+check('2Rk. a Super Admin appoints a Club Admin already APPROVED, not pending (op 8)',
+  directAppointment.status === 200 && directAppointment.body?.data?.membership_status === 'approved'
+  && appointedRow?.status === 'approved' && appointedRow?.role === 'club_admin',
+  `${directAppointment.status} ${directAppointment.text.slice(0, 130)} row=${JSON.stringify(appointedRow)}`);
+// The appointee acting with the row the appointment just created — the real proof of op 8, and the
+// reason this arm uses tok-appointed (user 30) rather than the plain member of club 11.
+const appointedAdminCanAct = await ask('GET', '/clubs/11/members', { token: 'tok-appointed' });
+check('2Rl. an appointed club admin immediately has their own club\'s admin surface (op 8)',
+  appointedAdminCanAct.status === 200
+  && (appointedAdminCanAct.body?.data ?? []).some((row) => String(row.user_id) === '30'),
+  `${appointedAdminCanAct.status} ${appointedAdminCanAct.text.slice(0, 100)}`);
+const appointedCannotReachOtherClub = await ask('GET', '/clubs/10/members', { token: 'tok-appointed' });
+check('2Rm. while their authority stops at their own club (op 8 + op 10)',
+  appointedCannotReachOtherClub.status === 403 && appointedCannotReachOtherClub.body.error === 'not_a_club_admin',
+  `${appointedCannotReachOtherClub.status}`);
+
+// (Op 10) The sharpest form of "cannot approve themselves": a PENDING club_admin elect. Their row
+// says club_admin, so any check that trusts `role` without `status` lets them induct themselves.
+const electSelfApprove = await ask('POST', '/clubs/10/members/23/status', { token: 'tok-pending-admin', body: { status: 'approved' } });
+const electRow = tables.club_memberships.find((row) => String(row.user_id) === '23');
+check('2Rn. a pending club_admin elect cannot approve themselves (op 10)',
+  electSelfApprove.status === 403 && electSelfApprove.body.error === 'not_a_club_admin'
+  && electRow?.status === 'pending',
+  `${electSelfApprove.status} ${electSelfApprove.text.slice(0, 120)} row=${electRow?.status}`);
+const electApproveOther = await ask('POST', '/clubs/10/members/21/status', { token: 'tok-pending-admin', body: { status: 'approved' } });
+check('2Ro. nor can they approve anyone else, despite the club_admin role on their row (op 10)',
+  electApproveOther.status === 403 && electApproveOther.body.error === 'not_a_club_admin',
+  `${electApproveOther.status} ${electApproveOther.text.slice(0, 120)}`);
+const electCantRemoveMember = await ask('POST', '/clubs/10/members/3/status', { token: 'tok-pending-admin', body: { status: 'removed' } });
+check('2Rp. and an elect cannot remove an approved member of the club they are waiting to join (op 10)',
+  electCantRemoveMember.status === 403, `${electCantRemoveMember.status}`);
+
+// (Op 5) Removal of an existing approved member by that club's admin, with the scope wall intact.
+const removeTarget = await ask('POST', '/clubs/10/members/21/status', { token: 'tok-admin10', body: { status: 'removed' } });
+check('2Rq. an admin can also move a rejected row to removed, and the write reads back (op 5)',
+  removeTarget.status === 200 && removeTarget.body?.data?.membership_status === 'removed'
+  && tables.club_memberships.find((row) => String(row.user_id) === '21')?.status === 'removed',
+  `${removeTarget.status} ${removeTarget.text.slice(0, 120)}`);
+
+// Reset every row this section moved, so 2Q's equivalence battery and the R3/R4 arms below still
+// measure the fixture they were written against.
+resetRow('20', { club_id: '10', role: 'member', status: 'pending' });
+resetRow('21', { club_id: '10', role: 'member', status: 'rejected' });
+resetRow('24', { club_id: '12', role: 'member', status: 'approved' });
+tables.club_memberships = tables.club_memberships.filter((row) => String(row.user_id) !== '30' && String(row.user_id) !== '5');
 
 // ── R3 — a Club Admin reaches only their own club ───────────────────────────
 const ownCollections = await ask('GET', '/clubs/10/board-collections', { token: 'tok-admin10' });
