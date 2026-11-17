@@ -78,11 +78,13 @@ process.env.CLUB_NCB_SCHEMA_JSON = JSON.stringify({
   },
   columns: {
     systemAdmins: { userId: 'user_id' },
-    clubs: { id: 'id', name: 'name', status: 'status' },
+    clubs: { id: 'id', name: 'name', status: 'active' },
     memberships: { id: 'id', userId: 'user_id', clubId: 'club_id', role: 'role', status: 'status' },
-    collections: { id: 'id', clubId: 'club_id', name: 'name', status: 'status' },
-    boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json', sourcePbn: 'source_pbn' }
-  }
+    collections: { id: 'id', clubId: 'club_id', name: 'title', status: 'publication_status', createdBy: 'created_by_user_id' },
+    boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json' }
+  },
+  // The live flag is numeric, exactly as production declares it.
+  values: { clubs: { status: { active: 1, inactive: 0 } } }
 });
 delete process.env.AI_QUOTA_RESERVATION_TABLE;
 delete process.env.NODESEND_PRIVATE_KEY_B64;
@@ -95,9 +97,9 @@ const { app, buildClubMount, clubRoutes, clubAuthorize, clubValidateShape, clubV
 const tables = {
   system_admins: [{ id: 'sa1', user_id: '1' }],
   clubs: [
-    { id: '10', name: 'Glyfada BC', status: 'active' },
-    { id: '11', name: 'Thessaloniki BC', status: 'active' },
-    { id: '12', name: 'Piraeus CC', status: 'inactive' }
+    { id: '10', name: 'Glyfada BC', active: 1 },
+    { id: '11', name: 'Thessaloniki BC', active: 1 },
+    { id: '12', name: 'Piraeus CC', active: 0 }
   ],
   club_memberships: [
     // Approved members are the only ones holding a club. Every fixture below states its status
@@ -179,7 +181,9 @@ globalThis.fetch = async (url, init = {}) => {
   }
 
   if (pathname.startsWith('/data/')) {
-    dataCalls.push({ pathname, method, bearer, body });
+    // `search` is recorded as well as `pathname`: `pathname` alone never contains a query, so a
+    // filter assertion that read it would silently compare against nothing.
+    dataCalls.push({ pathname, search: searchParams.toString(), method, bearer, body });
     // The one rule the whole design rests on, enforced by the mock so a fallback cannot hide:
     // club data does not move on a caller's token.
     if (bearer !== CLUB_SESSION_TOKEN) {
@@ -286,9 +290,9 @@ function seedCollections() {
   tables.club_board_collections.length = 0;
   tables.club_collection_boards.length = 0;
   tables.club_board_collections.push(
-    { id: 'c-pub', club_id: '10', name: 'Round 1', status: 'published' },
-    { id: 'c-draft', club_id: '10', name: 'Round 2', status: 'draft' },
-    { id: 'c-other', club_id: '11', name: 'Opponent round', status: 'published' }
+    { id: 'c-pub', club_id: '10', title: 'Round 1', publication_status: 'published', created_by_user_id: '2' },
+    { id: 'c-draft', club_id: '10', title: 'Round 2', publication_status: 'draft', created_by_user_id: '2' },
+    { id: 'c-other', club_id: '11', title: 'Opponent round', publication_status: 'published', created_by_user_id: '4' }
   );
   for (const number of [1, 2, 3]) {
     tables.club_collection_boards.push({
@@ -750,8 +754,8 @@ check('3c. a Club Admin is refused a write into another club',
   crossImport.status === 403 && crossImport.body.error === 'not_a_club_admin',
   `${crossImport.status} ${crossImport.text.slice(0, 140)}`);
 check('3d. the refused cross-club import stored nothing',
-  !tables.club_board_collections.some((row) => row.name === 'Intrusion'),
-  JSON.stringify(tables.club_board_collections.map((row) => row.name)));
+  !tables.club_board_collections.some((row) => row.title === 'Intrusion'),
+  JSON.stringify(tables.club_board_collections.map((row) => row.title)));
 
 const memberImport = await ask('POST', '/clubs/10/board-collections', {
   token: 'tok-member10', body: { name: 'By a member', boards: [legalBoard(9)] }
@@ -947,7 +951,7 @@ check('7a. an import whose board write fails mid-way is reported as a failure, n
   `${broken.status} ${broken.text.slice(0, 180)}`);
 const brokenRow = tables.club_board_collections.find((row) => row.id === String(broken.body?.data?.collectionId));
 check('7b. a failed import published nothing',
-  broken.status === 422 && (!brokenRow || brokenRow.status === 'draft'),
+  broken.status === 422 && (!brokenRow || brokenRow.publication_status === 'draft'),
   JSON.stringify(brokenRow));
 check('7c. the partial board rows were cleaned up rather than left to be discovered later',
   !tables.club_collection_boards.some((row) => String(row.collection_id) === String(broken.body?.data?.collectionId)),
@@ -969,7 +973,7 @@ check('7e. an import whose read-back disagrees with its writes is refused, and s
 
 // A collection this process did not import must be re-read before it can be published, so a
 // corrupted stored hand is refused rather than shipped to members.
-tables.club_board_collections.push({ id: 'c-corrupt', club_id: '10', name: 'Corrupt', status: 'draft' });
+tables.club_board_collections.push({ id: 'c-corrupt', club_id: '10', title: 'Corrupt', publication_status: 'draft', created_by_user_id: '2' });
 tables.club_collection_boards.push({
   id: 'cc1', collection_id: 'c-corrupt', board_number: '1', dealer: 'North',
   vulnerability: 'None', hands_json: JSON.stringify({ North: ['XX'], East: [], South: [], West: [] })
@@ -979,8 +983,8 @@ check('7f. publishing a collection with a corrupt stored board is refused',
   publishCorrupt.status === 422 && publishCorrupt.body.error === 'publish_refused_unverified',
   `${publishCorrupt.status} ${publishCorrupt.text.slice(0, 180)}`);
 check('7g. the refused collection is still a draft',
-  tables.club_board_collections.find((row) => row.id === 'c-corrupt')?.status === 'draft',
-  String(tables.club_board_collections.find((row) => row.id === 'c-corrupt')?.status));
+  tables.club_board_collections.find((row) => row.id === 'c-corrupt')?.publication_status === 'draft',
+  String(tables.club_board_collections.find((row) => row.id === 'c-corrupt')?.publication_status));
 const memberSeesCorrupt = await ask('GET', '/clubs/collections/c-corrupt/boards', { token: 'tok-member10' });
 check('7h. and a member is refused it as unpublished, not served a broken board',
   memberSeesCorrupt.status === 403 && memberSeesCorrupt.body.error === 'collection_not_published',
@@ -1106,7 +1110,7 @@ check('8r. an unknown board number in a reachable collection is a 404, not an em
 
 // Validation is enforced on the STORED row at start time, not only at import: a board that was sound
 // when published and has since been corrupted must not reach a table.
-tables.club_board_collections.push({ id: 'c-bad-live', club_id: '10', name: 'Corrupted after publish', status: 'published' });
+tables.club_board_collections.push({ id: 'c-bad-live', club_id: '10', title: 'Corrupted after publish', publication_status: 'published', created_by_user_id: '2' });
 tables.club_collection_boards.push({
   id: 'bl1', collection_id: 'c-bad-live', board_number: '77', dealer: 'North', vulnerability: 'None',
   hands_json: JSON.stringify({ North: ['2S'], East: [], South: [], West: [] })
@@ -1462,7 +1466,7 @@ const renewing = await serveIsolated({
       const table = target.split('/data/')[1].split('?')[0].split('/')[1];
       // Rich enough for the request to reach a 200: the caller must actually be a system admin,
       // otherwise every arm here would measure a 403 and prove nothing about the token lifecycle.
-      const rows = table === 'clubs' ? [{ id: '10', name: 'Glyfada BC', status: 'active' }]
+      const rows = table === 'clubs' ? [{ id: '10', name: 'Glyfada BC', active: 1 }]
         : table === 'system_admins' ? [{ id: 'sa1', user_id: '1' }] : [];
       return json({ status: 'success', data: rows });
     }
@@ -1509,6 +1513,141 @@ check('13f. the failed sign-in detail never echoes the configured credential',
   !hostileEcho.includes(CLUB_PASSWORD) && !hostileEcho.includes(CLUB_ACCOUNT_EMAIL),
   hostileEcho.slice(0, 160));
 await hostile.close();
+
+// ── 13. the live-schema adapter: names and value shapes NCB actually has ─────
+// Sections 1-12 prove the FEATURE works while the fixture speaks the production column names, which
+// is indirect evidence. This section reads the wire: what bytes the relay actually sends NCB, and
+// what it accepts back. A column-name or value-representation bug is invisible to feature tests when
+// both sides use one wrong mapping consistently, so the mapping itself is what is asserted here.
+const { clubStatusCodec } = require(path.join(ROOT, 'clubs', 'clubSchema.js'));
+
+// (7) The codec alone: numeric, string-numeric and boolean are one flag, and nothing unknown may
+// ever mean 'active'.
+const codec = clubStatusCodec({ active: 1, inactive: 0 });
+check('13a. the numeric flag decodes 1, "1" and true identically and round-trips',
+  codec.decode(1) === 'active' && codec.decode('1') === 'active' && codec.decode(true) === 'active'
+  && codec.decode(0) === 'inactive' && codec.decode(false) === 'inactive'
+  && codec.encode('active') === 1 && codec.encode('inactive') === 0,
+  [codec.decode(1), codec.decode('1'), codec.decode(true), codec.decode(0), codec.encode('active')].join('/'));
+check('13b. an unrecognised flag never decodes to active (fail closed on a new NCB value)',
+  ['2', 'yes', '', null, undefined, 7].every((v) => codec.decode(v) !== 'active'),
+  [1, 2, 'yes', '', null].map((v) => String(codec.decode(v))).join('/'));
+const identity = clubStatusCodec(null);
+check('13c. with no values block declared the mapping is the identity, not a silent 1/0',
+  identity.encode('active') === 'active' && identity.decode('active') === 'active' && identity.decode(1) !== 'active',
+  `${String(identity.encode('active'))}/${String(identity.decode(1))}`);
+
+// (1) Numeric status through the real store.
+const callsBeforeSchema = dataCalls.length;
+const numericClub = await ask('POST', '/clubs', { token: CALLER_TOKEN, body: { name: 'Numeric Flag BC' } });
+const createClubCall = dataCalls.slice(callsBeforeSchema).find((row) => row.method === 'POST' && row.pathname.includes('/data/create/clubs'));
+check('13d. creating a club writes the NUMERIC flag, not the text "active" (item 1)',
+  numericClub.status === 200 && createClubCall?.body?.active === 1,
+  `sent=${JSON.stringify(createClubCall?.body)}`);
+check('13e. and the API still reports the domain value the client expects',
+  numericClub.body?.data?.status === 'active', JSON.stringify(numericClub.body?.data));
+
+const optionsCallsBefore = dataCalls.length;
+const activeOptions = await ask('GET', '/clubs/options', { token: 'tok-member10' });
+// Several `/read/clubs` calls happen in one request (the caller's club status is read first), so
+// assert over all of them rather than taking whichever came first.
+const clubReads = dataCalls.slice(optionsCallsBefore).filter((row) => row.pathname.endsWith('/read/clubs'));
+check('13f. the active-clubs filter queries active=1, never active=active (item 1)',
+  activeOptions.status === 200 && clubReads.some((row) => /(^|&)active=1(&|$)/.test(row.search))
+  && !clubReads.some((row) => /active=active/.test(row.search)),
+  clubReads.map((row) => row.search).join(' ;; '));
+check('13g. and it returns the active clubs only, with the inactive one filtered not mislabelled',
+  activeOptions.status === 200 && activeOptions.body.data.every((row) => row.id !== '12' && row.id !== '13'),
+  JSON.stringify(activeOptions.body.data.map((row) => row.id)));
+
+const setInactive = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'active' } });
+const setBack = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'inactive' } });
+const club12Row = tables.clubs.find((row) => row.id === '12');
+check('13h. a status change round-trips through the numeric column and reads back correctly',
+  setInactive.status === 200 && setInactive.body?.data?.status === 'active'
+  && setBack.status === 200 && setBack.body?.data?.status === 'inactive' && club12Row.active === 0,
+  `${JSON.stringify(setInactive.body?.data)}/${JSON.stringify(setBack.body?.data)}/stored=${club12Row.active}`);
+
+// (2)(3)(4) A collection insert must carry the live column names and the verified author.
+const callsBeforeImport = dataCalls.length;
+const schemaImport = await ask('POST', '/clubs/10/board-collections', {
+  token: 'tok-admin10',
+  body: { name: 'Schema probe', boards: [legalBoard(700), { ...legalBoard(701), source: 'N:AKQJ.T98.742.5 -' }] }
+});
+const colCreate = dataCalls.slice(callsBeforeImport).find((row) => row.method === 'POST' && row.pathname.includes('/data/create/club_board_collections'));
+const boardCreates = dataCalls.slice(callsBeforeImport).filter((row) => row.method === 'POST' && row.pathname.includes('/data/create/club_collection_boards'));
+check('13i. a collection is created with title, publication_status and created_by_user_id (items 2,3,4)',
+  schemaImport.status === 200 && colCreate?.body?.title === 'Schema probe'
+  && colCreate?.body?.publication_status === 'draft' && colCreate?.body?.created_by_user_id === '2',
+  JSON.stringify(colCreate?.body));
+check('13j. the author is the SESSION identity and no legacy "name" column was sent (item 4)',
+  colCreate?.body?.created_by_user_id === '2' && !('name' in (colCreate?.body ?? {})),
+  `author=${colCreate?.body?.created_by_user_id} keys=${Object.keys(colCreate?.body ?? {}).join(',')}`);
+check('13k. no board insert references source_pbn or tags_json (items 5,6)',
+  boardCreates.length === 2 && boardCreates.every((row) => !('source_pbn' in row.body) && !('tags_json' in row.body)
+    && Object.keys(row.body).sort().join(',') === 'board_number,collection_id,dealer,hands_json,vulnerability'),
+  JSON.stringify(boardCreates[0]?.body ?? {}).slice(0, 160));
+
+// (5) board_number is VARCHAR(10).
+const longNumber = await ask('POST', '/clubs/10/board-collections', {
+  token: 'tok-admin10', body: { name: 'Long number', boards: [{ ...legalBoard(1), board_number: '12345678901' }] }
+});
+check('13l. a board number longer than the VARCHAR(10) column is refused before any write (item 5)',
+  longNumber.status === 400 && longNumber.body.error === 'invalid_board_record',
+  `${longNumber.status} ${longNumber.text.slice(0, 140)}`);
+const longStart = await ask('POST', '/clubs/collections/c-pub/boards/12345678901/start', { token: 'tok-member10', body: { original_seat: 'North' } });
+check('13m. and the start route refuses the same over-long number rather than 404-ing it',
+  longStart.status === 400 && longStart.body.error === 'bad_request',
+  `${longStart.status} ${longStart.text.slice(0, 120)}`);
+const tenChar = await ask('POST', '/clubs/10/board-collections', {
+  token: 'tok-admin10', body: { name: 'Ten chars', boards: [{ ...legalBoard(1), board_number: '1234567890' }] }
+});
+check('13n. exactly 10 characters still imports (the cap is the column width, not a rounder number)',
+  tenChar.status === 200, `${tenChar.status} ${tenChar.text.slice(0, 120)}`);
+
+// (6)(7) A phantom column in the config is refused rather than silently ignored.
+const phantomColumn = clubSchemaConfig({
+  CLUB_NCB_SCHEMA_JSON: JSON.stringify({
+    tables: SCHEMA_OBJECT.tables,
+    columns: { ...SCHEMA_OBJECT.columns, boards: { ...SCHEMA_OBJECT.columns.boards, sourcePbn: 'source_pbn' } },
+    values: SCHEMA_OBJECT.values
+  })
+});
+check('13o. configuring a sourcePbn column is refused, so the phantom column cannot come back (item 6)',
+  phantomColumn.ok === false && phantomColumn.problems.some((p) => /sourcePbn/.test(p)),
+  JSON.stringify(phantomColumn.problems).slice(0, 170));
+
+const halfValues = clubSchemaConfig({
+  CLUB_NCB_SCHEMA_JSON: JSON.stringify({
+    tables: SCHEMA_OBJECT.tables,
+    columns: SCHEMA_OBJECT.columns,
+    values: { clubs: { status: { active: 1 } } }
+  })
+});
+check('13p. a half-declared flag mapping is refused (the missing half would write text to a number)',
+  halfValues.ok === false && halfValues.problems.some((p) => /values\.clubs\.status\.inactive/.test(p)),
+  JSON.stringify(halfValues.problems).slice(0, 170));
+
+const textValues = clubSchemaConfig({
+  CLUB_NCB_SCHEMA_JSON: JSON.stringify({
+    tables: SCHEMA_OBJECT.tables,
+    columns: { ...SCHEMA_OBJECT.columns, clubs: { id: 'id', name: 'name', status: 'status' } }
+  })
+});
+check('13q. a text-flagged club column still validates, so the adapter is not numeric-only',
+  textValues.ok === true && textValues.schema.clubStatus.encode('active') === 'active',
+  JSON.stringify(textValues.problems));
+
+const noAuthorColumn = clubSchemaConfig({
+  CLUB_NCB_SCHEMA_JSON: JSON.stringify({
+    tables: SCHEMA_OBJECT.tables,
+    columns: { ...SCHEMA_OBJECT.columns, collections: { id: 'id', clubId: 'club_id', name: 'title', status: 'publication_status' } },
+    values: SCHEMA_OBJECT.values
+  })
+});
+check('13r. a collections mapping without created_by_user_id is refused at boot (item 4)',
+  noAuthorColumn.ok === false && noAuthorColumn.problems.some((p) => /collections\.createdBy/.test(p)),
+  JSON.stringify(noAuthorColumn.problems).slice(0, 170));
 
 // ── the shipped shape: could this actually run where NodeSend runs? ─────────
 const fs = require('node:fs');

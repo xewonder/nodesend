@@ -51,9 +51,69 @@ const REQUIRED_COLUMNS = Object.freeze({
   systemAdmins: ['userId'],
   clubs: ['id', 'name', 'status'],
   memberships: ['id', 'userId', 'clubId', 'role', 'status'],
-  collections: ['id', 'clubId', 'name', 'status'],
+  collections: ['id', 'clubId', 'name', 'status', 'createdBy'],
   boards: ['id', 'collectionId', 'boardNumber', 'dealer', 'vulnerability', 'handsJson']
 });
+
+/**
+ * Optional board columns a deployment may offer. Deliberately EMPTY, and the reason belongs here:
+ * the live `club_collection_boards` table has `tags_json` (free-form, unused by this relay) and NO
+ * `source_pbn` at all. The earlier contract named `sourcePbn` and would have written a column that
+ * does not exist, so it is removed rather than left optional — an optional column that is not there
+ * is a runtime failure waiting for someone to set it. `tags_json` is not referenced at all: reading
+ * or writing a column whose meaning this feature does not define would invent semantics nobody
+ * agreed to.
+ */
+const OPTIONAL_BOARD_COLUMNS = Object.freeze([]);
+
+/**
+ * The club's activity flag, as the rest of this relay names it. The DOMAIN vocabulary is
+ * 'active'/'inactive' everywhere in the code — authorization, responses, this file's predicates —
+ * and the storage representation is translated only at the boundary (see encode/decode below).
+ * Keeping the domain separate is what lets a numeric column and a text column both be served
+ * without a single authorization rule changing.
+ */
+const CLUB_ACTIVE = 'active';
+const CLUB_INACTIVE = 'inactive';
+
+/**
+ * Value translation for `clubs.status`.
+ *
+ * The live NCB column is `active`, a numeric 1/0 — not a text status. Translation lives here, one
+ * place for reads, writes and query filters, because three separate string comparisons spread across
+ * the store is how a filter keeps saying `active='active'` while every write says `1`.
+ *
+ * The raw values come from the deployment's `values.clubs.status` block, so no column representation
+ * is guessed by this code. Absent that block means the column really does hold 'active'/'inactive'
+ * text, and the mapping is the identity — which is what a text-shaped deployment needs and why
+ * identity, not a default of 1/0, is the safe fallback.
+ */
+function clubStatusCodec(declaredValues) {
+  const toDomain = Object.create(null);
+  const toStorage = Object.create(null);
+  for (const [domain, raw] of Object.entries(declaredValues ?? {})) {
+    toStorage[domain] = raw;
+    toDomain[normalizeFlag(raw)] = domain;
+  }
+  return {
+    encode: (domain) => (domain in toStorage ? toStorage[domain] : domain),
+    decode: (raw) => {
+      const key = normalizeFlag(raw);
+      if (key in toDomain) return toDomain[key];
+      // Unrecognised is returned as-is and therefore fails every `=== 'active'` test. Mapping an
+      // unknown value to 'active' would activate a club on a representation change.
+      return key === '' ? '' : String(raw);
+    }
+  };
+}
+
+// MySQL drivers hand back 1, "1" or true for the same column depending on the route. They are one
+// value, and treating them as three is how a decoded status silently stops matching.
+function normalizeFlag(raw) {
+  if (raw === true) return '1';
+  if (raw === false || raw === null || raw === undefined) return '0';
+  return String(raw).trim();
+}
 
 /**
  * The membership lifecycle. `club_memberships.status` is REQUIRED, not optional: it is what makes
@@ -81,9 +141,6 @@ const ACTIVE_CLUB_STATUS = 'active';
 function isEffectiveMembership({ status, clubStatus } = {}) {
   return status === APPROVED_MEMBERSHIP_STATUS && clubStatus === ACTIVE_CLUB_STATUS;
 }
-
-/** Optional board columns a deployment may offer; used only when present. */
-const OPTIONAL_BOARD_COLUMNS = Object.freeze(['sourcePbn']);
 
 /**
  * The storage rule the whole authorization model rests on. Membership is one row PER USER, not
@@ -178,11 +235,43 @@ function readClubSchemaConfig(env = {}, deps = {}) {
     columns[role] = resolved;
   }
 
+  // An unknown column key is refused, not ignored. `sourcePbn` is the case this exists for: the
+  // column does not exist in NCB, and a leftover config entry that was silently dropped would sit
+  // there looking like a supported feature until someone wondered why the source was never stored.
+  // The accepted keys are the required ones plus the documented optional set, per role.
+  for (const [role, declared] of Object.entries(declaredColumns)) {
+    if (!AGREED_TABLE_ROLES[role] || !declared || typeof declared !== 'object') continue;
+    const allowed = new Set([
+      ...(REQUIRED_COLUMNS[role] ?? []),
+      ...(role === 'boards' ? OPTIONAL_BOARD_COLUMNS : [])
+    ]);
+    for (const field of Object.keys(declared)) {
+      if (!allowed.has(field)) problems.push(`columns.${role}.${field} is not a column this contract uses (allowed: ${[...allowed].join(', ')})`);
+    }
+  }
+
   // Two roles on one table means one read answers for two different questions. `clubs` and
   // `collections` sharing a name would, for example, make a club status read decide whether a
   // collection is published — a wrong answer that looks exactly like a right one.
   const names = Object.values(tables).map(eq).filter(Boolean);
   if (new Set(names).size !== names.length) problems.push('two schema roles point at the same table');
+
+  // Optional value translation, currently only for the club activity flag. A HALF-SPECIFIED mapping
+  // is refused: `{ "active": 1 }` alone would leave 'inactive' writing the literal text into a
+  // numeric column, which is the exact mismatch this block exists to prevent, and it would fail on
+  // the second-ever club rather than the first.
+  const declaredValues = raw.values && typeof raw.values === 'object' ? raw.values : {};
+  const declaredClubStatusValues = declaredValues.clubs?.status;
+  let clubStatus = clubStatusCodec(null);
+  if (declaredClubStatusValues !== undefined && declaredClubStatusValues !== null) {
+    const map = declaredClubStatusValues;
+    for (const domain of [CLUB_ACTIVE, CLUB_INACTIVE]) {
+      if (map[domain] === undefined || map[domain] === null || eq(map[domain]) === '') {
+        problems.push(`values.clubs.status.${domain} is required once values.clubs.status is declared (a half-mapped flag writes literal text into a numeric column)`);
+      }
+    }
+    if (!problems.some((p) => p.startsWith('values.clubs.status'))) clubStatus = clubStatusCodec(map);
+  }
 
   if (problems.length) return { ok: false, schema: null, problems };
 
@@ -191,6 +280,9 @@ function readClubSchemaConfig(env = {}, deps = {}) {
     schema: {
       tables,
       columns,
+      // The one codec the storage layer uses for the club activity flag. Kept on the schema rather
+      // than imported ad hoc so no call site can reach the store without it.
+      clubStatus,
       rowLimit: clampRowLimit(env.CLUB_NCB_ROW_LIMIT),
       problems: []
     },
@@ -210,10 +302,14 @@ function clampRowLimit(value) {
 module.exports = {
   AGREED_TABLE_ROLES,
   REQUIRED_COLUMNS,
+  OPTIONAL_BOARD_COLUMNS,
   MEMBERSHIP_UNIQUE_KEY,
   MEMBERSHIP_STATUSES,
   APPROVED_MEMBERSHIP_STATUS,
   ACTIVE_CLUB_STATUS,
+  CLUB_ACTIVE,
+  CLUB_INACTIVE,
   isEffectiveMembership,
+  clubStatusCodec,
   readClubSchemaConfig
 };

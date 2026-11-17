@@ -41,11 +41,14 @@ const SUITS = Object.freeze(['S', 'H', 'D', 'C']);
 const CARDS_PER_HAND = 13;
 const CARDS_PER_BOARD = 52;
 const MAX_BOARDS_PER_COLLECTION = 200;
-const MAX_BOARD_NUMBER_CHARS = 32;
-const MAX_BOARD_SOURCE_CHARS = 4000;
+// The live column is `board_number VARCHAR(10)`. Accepting more would reach NCB as a truncated or
+// refused insert and surface as an unexplained import failure, so the limit is enforced here with a
+// named reason instead. Standard duplicate movements number boards 1..28, so 10 characters is not a
+// practical constraint on real files.
+const MAX_BOARD_NUMBER_CHARS = 10;
 
-// Same ID grammar as every other path parameter these routes take.
-const BOARD_NUMBER = /^[A-Za-z0-9_-]{1,32}$/;
+// Same ID grammar as every other path parameter these routes take, bounded to the column width.
+const BOARD_NUMBER = new RegExp(`^[A-Za-z0-9_-]{1,${MAX_BOARD_NUMBER_CHARS}}$`);
 // Character classes, not capture groups: `^(2345...)(SHDC)$` would match one literal 21-character
 // string and reject every real card, which is the kind of defect that makes a validation gate pass
 // for exactly the wrong reason.
@@ -106,10 +109,9 @@ function validateBoardRecord(board) {
     return { ok: false, reason: 'incomplete_hands', detail: `board ${boardNumber}: ${seen.size} distinct cards of ${total}; a board must hold the 52-card deck exactly` };
   }
 
-  if (board.source !== undefined && board.source !== null && text(board.source).length > MAX_BOARD_SOURCE_CHARS) {
-    return { ok: false, reason: 'invalid_board_record', detail: `board ${boardNumber}: the verbatim source text is too large to store` };
-  }
-
+  // The verbatim `source` the browser sends is NOT stored (there is no source column), so it is
+  // ignored rather than measured. Refusing a payload over a field this relay discards would be a
+  // limit that rejects files which previously imported.
   return { ok: true, boardNumber };
 }
 
@@ -153,6 +155,15 @@ function validateBoardSubmission(boards, { maxBoards = MAX_BOARDS_PER_COLLECTION
   return { ok: true, boards, rejected: [] };
 }
 
+/**
+ * True for a board number this relay can both STORE (VARCHAR(10)) and ADDRESS — the start route's
+ * `:boardNumber` parameter is checked with the same grammar, so no board can be imported that the
+ * route cannot reach, and none can be sought with a number too long to have been stored.
+ */
+function isBoardNumber(value) {
+  return BOARD_NUMBER.test(String(value ?? '').trim());
+}
+
 module.exports = {
   SEATS,
   DEALERS,
@@ -163,7 +174,7 @@ module.exports = {
   CARDS_PER_BOARD,
   MAX_BOARDS_PER_COLLECTION,
   MAX_BOARD_NUMBER_CHARS,
-  MAX_BOARD_SOURCE_CHARS,
+  isBoardNumber,
   validateBoardRecord,
   validateBoardSubmission
 };

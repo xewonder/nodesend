@@ -34,7 +34,9 @@
  */
 
 const { validateBoardRecord } = require('./clubBoardValidator.js');
-const { MEMBERSHIP_STATUSES, APPROVED_MEMBERSHIP_STATUS, isEffectiveMembership } = require('./clubSchema.js');
+const {
+  MEMBERSHIP_STATUSES, APPROVED_MEMBERSHIP_STATUS, isEffectiveMembership, CLUB_ACTIVE
+} = require('./clubSchema.js');
 
 const READ = (table, query) => ({ group: 'data', path: `read/${table}${query ? `?${query}` : ''}`, method: 'GET' });
 const CREATE = (table, body) => ({ group: 'data', path: `create/${table}`, method: 'POST', body });
@@ -113,9 +115,12 @@ function createClubNcbStore({ client, schema }) {
     return { clubId, role: eq(row[C.memberships.role]), status: eq(row[C.memberships.status]) };
   }
 
+  // Every club-status read and write in this file goes through these two, so the numeric live
+  // column and the 'active'/'inactive' domain cannot drift apart at one call site and quietly
+  // leave another comparing text against 1.
   async function clubStatus(clubId) {
     const row = await one(T.clubs, `${C.clubs.id}=${encodeURIComponent(clubId)}`);
-    return row ? eq(row[C.clubs.status]) : null;
+    return row ? schema.clubStatus.decode(row[C.clubs.status]) : null;
   }
 
   async function collectionScope(collectionId) {
@@ -145,24 +150,32 @@ function createClubNcbStore({ client, schema }) {
     const shaped = (Array.isArray(rows) ? rows : []).map((row) => ({
       id: eq(row[C.clubs.id]),
       name: eq(row[C.clubs.name]),
-      status: eq(row[C.clubs.status])
+      // Decoded, so the admin screen and the authorization rule see the same domain value.
+      status: schema.clubStatus.decode(row[C.clubs.status])
     }));
     const needle = String(search ?? '').trim().toLowerCase();
     return needle ? shaped.filter((club) => club.name.toLowerCase().includes(needle)) : shaped;
   }
 
   async function listActiveClubs() {
-    const rows = await find(T.clubs, `${C.clubs.status}=active&limit=${schema.rowLimit}`);
-    return (Array.isArray(rows) ? rows : []).map((row) => ({ id: eq(row[C.clubs.id]), name: eq(row[C.clubs.name]) }));
+    // The FILTER is encoded too. A query of `active=active` matches no row and would return an
+    // empty club picker that looks like a legitimately empty database.
+    const activeRaw = schema.clubStatus.encode(CLUB_ACTIVE);
+    const rows = await find(T.clubs, `${C.clubs.status}=${encodeURIComponent(activeRaw)}&limit=${schema.rowLimit}`);
+    return (Array.isArray(rows) ? rows : [])
+      .filter((row) => schema.clubStatus.decode(row[C.clubs.status]) === CLUB_ACTIVE)
+      .map((row) => ({ id: eq(row[C.clubs.id]), name: eq(row[C.clubs.name]) }));
   }
 
   async function createClub({ name }) {
-    const result = await run(CREATE(T.clubs, { [C.clubs.name]: name, [C.clubs.status]: 'active' }));
+    const result = await run(CREATE(T.clubs, {
+      [C.clubs.name]: name, [C.clubs.status]: schema.clubStatus.encode(CLUB_ACTIVE)
+    }));
     if (!result.ok) return { error: result.reason, detail: result.detail };
     const id = newIdOf(result.body);
     const row = id ? await one(T.clubs, `${C.clubs.id}=${encodeURIComponent(id)}`) : null;
     if (!row) return { error: 'write_unverified', detail: 'the club row could not be read back' };
-    return { id: eq(row[C.clubs.id]), name: eq(row[C.clubs.name]), status: eq(row[C.clubs.status]) };
+    return { id: eq(row[C.clubs.id]), name: eq(row[C.clubs.name]), status: schema.clubStatus.decode(row[C.clubs.status]) };
   }
 
   async function updateClub({ clubId, name }) {
@@ -171,15 +184,18 @@ function createClubNcbStore({ client, schema }) {
     const row = await one(T.clubs, `${C.clubs.id}=${encodeURIComponent(clubId)}`);
     if (!row) return { error: 'write_unverified', detail: 'the club row could not be read back after the update' };
     const storedName = eq(row[C.clubs.name]);
-    return { id: eq(row[C.clubs.id]), name: storedName, status: eq(row[C.clubs.status]), unverified: storedName !== name };
+    return { id: eq(row[C.clubs.id]), name: storedName, status: schema.clubStatus.decode(row[C.clubs.status]), unverified: storedName !== name };
   }
 
   async function setClubStatus({ clubId, status }) {
-    const result = await run(UPDATE(T.clubs, clubId, { [C.clubs.status]: status }));
+    const result = await run(UPDATE(T.clubs, clubId, { [C.clubs.status]: schema.clubStatus.encode(status) }));
     if (!result.ok) return { error: result.reason, detail: result.detail };
     const row = await one(T.clubs, `${C.clubs.id}=${encodeURIComponent(clubId)}`);
     if (!row) return { error: 'write_unverified', detail: 'the club row could not be read back after the update' };
-    return { id: eq(row[C.clubs.id]), status: eq(row[C.clubs.status]) };
+    const stored = schema.clubStatus.decode(row[C.clubs.status]);
+    // Compare the decoded value: `1` written and `1` read back are equal, but a raw string compare
+    // against the domain 'active' would report every successful change as unverified.
+    return { id: eq(row[C.clubs.id]), status: stored, unverified: stored !== status };
   }
 
   async function listMembers({ clubId }) {
@@ -383,7 +399,8 @@ function createClubNcbStore({ client, schema }) {
       hands,
       row_id: eq(row[C.boards.id])
     };
-    if (C.boards.sourcePbn) board.source = eq(row[C.boards.sourcePbn]);
+    // No verbatim-source field: the live table has no `source_pbn`, and the board a player receives
+    // is fully described by the four hands, the dealer and the vulnerability.
     return board;
   }
 
@@ -402,9 +419,19 @@ function createClubNcbStore({ client, schema }) {
    * board-number identity. This method never publishes — publishing is a separate authorised call
    * that this verification then permits.
    */
-  async function createCollection({ clubId, name, boards }) {
+  async function createCollection({ clubId, name, boards, createdBy }) {
+    // NCB requires `created_by_user_id` on this insert. It is the VERIFIED caller id passed down
+    // from the router's session resolution — never a body field — and it is refused here rather
+    // than sent as an empty value, because an empty author column is worse than a failed import:
+    // it produces a collection that looks published-by-nobody and cannot be traced.
+    const author = eq(createdBy);
+    if (author === '') return { error: 'bad_request', detail: 'the verified caller identity is required to create a collection' };
+
     const created = await run(CREATE(T.collections, {
-      [C.collections.clubId]: clubId, [C.collections.name]: name, [C.collections.status]: 'draft'
+      [C.collections.clubId]: clubId,
+      [C.collections.name]: name,
+      [C.collections.status]: 'draft',
+      [C.collections.createdBy]: author
     }));
     if (!created.ok) return { error: created.reason, detail: created.detail };
     const collectionId = newIdOf(created.body);
@@ -417,8 +444,7 @@ function createClubNcbStore({ client, schema }) {
         [C.boards.boardNumber]: eq(board.board_number),
         [C.boards.dealer]: eq(board.dealer),
         [C.boards.vulnerability]: eq(board.vulnerability),
-        [C.boards.handsJson]: JSON.stringify(board.hands),
-        ...(C.boards.sourcePbn && board.source ? { [C.boards.sourcePbn]: eq(board.source) } : {})
+        [C.boards.handsJson]: JSON.stringify(board.hands)
       }));
       if (!result.ok) {
         const before = await listBoards({ collectionId });

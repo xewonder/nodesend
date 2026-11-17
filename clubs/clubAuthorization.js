@@ -51,7 +51,10 @@
  */
 
 const { Router } = require('express');
-const { validateBoardSubmission, validateBoardRecord, MAX_BOARDS_PER_COLLECTION, SEATS } = require('./clubBoardValidator.js');
+const {
+  validateBoardSubmission, validateBoardRecord, isBoardNumber,
+  MAX_BOARDS_PER_COLLECTION, MAX_BOARD_NUMBER_CHARS, SEATS
+} = require('./clubBoardValidator.js');
 const { MEMBERSHIP_STATUSES, APPROVED_MEMBERSHIP_STATUS, isEffectiveMembership } = require('./clubSchema.js');
 
 const ID = /^[A-Za-z0-9_-]{1,32}$/;
@@ -715,7 +718,9 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
     if (!isId(req.params.clubId)) return void res.status(400).json({ error: 'bad_request', detail: 'clubId is invalid.' });
     return guarded('importCollection', req, res, { targetClubId: req.params.clubId },
       (context, value) => store.createCollection({
-        clubId: req.params.clubId, name: value.name, boards: value.boards, importedBy: context.userId
+        // `createdBy` is the id THIS relay proved from the caller's session. The client never sends
+        // an author, and `created_by_user_id` is refused upstream if this is ever empty.
+        clubId: req.params.clubId, name: value.name, boards: value.boards, createdBy: context.userId
       }));
   });
 
@@ -765,6 +770,11 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
     if (!isId(req.params.collectionId) || !isId(req.params.boardNumber)) {
       return void res.status(400).json({ error: 'bad_request', detail: 'collectionId/boardNumber is invalid.' });
     }
+    // The board number has its own, tighter grammar than an id: it must fit the column it was
+    // stored in as well as the route it is addressed by.
+    if (!isBoardNumber(req.params.boardNumber)) {
+      return void res.status(400).json({ error: 'bad_request', detail: `boardNumber must be 1-${MAX_BOARD_NUMBER_CHARS} characters.` });
+    }
     return guarded('startClubBoard', req, res, { collectionId: req.params.collectionId },
       async (context, value) => {
         const collectionId = req.params.collectionId;
@@ -785,8 +795,7 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
           hands: board.hands,
           original_seat: value.originalSeat,
           club_id: context.decision.scope.clubId,
-          collection_id: collectionId,
-          ...(board.source ? { source: board.source } : {})
+          collection_id: collectionId
         };
       });
   });
