@@ -56,6 +56,10 @@ const express = require("express");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+// Clubs lives in its own directory rather than inline here, so the authority rules, the dedicated
+// account client and the storage adapter can be read and tested without wading through the relay.
+// bridge.js contributes one thing this file cannot: its own session resolver.
+const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs");
 
 const app = express();
 // `x-quota-reservation` is exposed so a browser can read whether its call was charged or
@@ -2407,7 +2411,15 @@ app.get("/", (req, res) => res.json({
     // any response body: the route is described by what it does, not by where it reads.
     invitationValidate: "POST /auth/validate-invitation",
     invitationConsume: "POST /auth/consume-invitation",
-    quota: "GET|POST /quota"
+    quota: "GET|POST /quota",
+    // Named so an operator can see the surface exists. The club routes are unprefixed like every
+    // other route here — the browser-side transport strips the `/api` prefix it uses against the
+    // local Express server, so the two applications agree on `/clubs/...` and `/me/club/...`.
+    clubs: "GET|POST /clubs, PATCH /clubs/:clubId, POST /clubs/:clubId/status",
+    clubMembers: "GET /clubs/:clubId/members, POST /clubs/:clubId/members/:userId/status, POST /clubs/:clubId/admins, DELETE /clubs/:clubId/admins/:userId",
+    clubCollections: "GET|POST /clubs/:clubId/board-collections, PATCH|DELETE /clubs/collections/:collectionId, POST /clubs/collections/:collectionId/publish|unpublish",
+    clubBoards: "GET /clubs/collections/:collectionId/boards, POST /clubs/collections/:collectionId/boards/:boardNumber/start",
+    myClub: "GET|POST|DELETE /me/club, GET /me/club/board-collections, GET /clubs/options"
   },
   auth: {
     ai: "BridgeMind Bearer session", aiQuotaConfig: "Bearer session + admin role",
@@ -2416,7 +2428,11 @@ app.get("/", (req, res) => res.json({
     // reasons: validation is unauthenticated by necessity (it runs before sign-up) and
     // answers a boolean only; consumption requires the session.
     invitationValidate: "none (pre-registration) — boolean answer only",
-    invitationConsume: "BridgeMind Bearer session"
+    invitationConsume: "BridgeMind Bearer session",
+    // The caller's session decides WHO; the dedicated club account decides nothing about the
+    // caller and is used only to read and write the club rows. Both halves are required, and a
+    // client-supplied role or user id is refused rather than consulted.
+    clubs: "BridgeMind Bearer session + server-side club membership (system_admins / club_memberships)"
   },
   trickster: { auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
   quota: quotaLedgerState(),
@@ -2444,6 +2460,12 @@ app.get("/health", (req, res) => res.json({
   // makes the count wrong — multi-replica quota counting is unsupported.
   ...quotaLedgerFields(),
   quota: quotaLedgerState(),
+  // Clubs reports its own state apart from everything else, because its two failure modes look
+  // identical from the outside and are not: `configured:false` means the account or the agreed
+  // schema has not been supplied (a deployment fact, nothing to page about), while
+  // `configured:true, sessionActive:false` means a sign-in is not currently held (a live fact).
+  // No credential, email, table name or row ever appears here.
+  clubs: clubHealth(clubMount),
   providers: { alibaba: true, openai: true }
 }));
 
@@ -2768,6 +2790,34 @@ app.post("/trickster/play/suggest-card", requireBridgeSession, (req, res) => pro
 app.get("/trickster/bid/suggest-bid", requireBridgeSession, tricksterMethodNotAllowed);
 app.get("/trickster/play/suggest-card", requireBridgeSession, tricksterMethodNotAllowed);
 
+/* ── CLUBS ────────────────────────────────────────────────────────────────────
+ * Mounted UNCONDITIONALLY, before the 404 catch-all, and deliberately so. Registering the routes
+ * only once the club account and schema are configured would make an unconfigured deployment answer
+ * 404, which reads as "NodeSend has no club feature" — a false statement that sends the browser to
+ * "you have no club" and sends an operator looking for a deployment that never happened. With the
+ * routes present and no store, every club request is authenticated, validated, and then answered
+ * 503 `club_store_unavailable`. Nothing about the missing backend can be mistaken for an empty
+ * result set.
+ *
+ * What this adds to the relay's authority surface is one thing: a second NCB identity, the dedicated
+ * club account, used ONLY behind these routes and never for anything else. The caller's identity is
+ * still resolved by `resolveSessionUser`, the same function every AI, quota, Trickster and
+ * invitation route uses — a forged `user_id` or `role` in a body is refused by these routes'
+ * positive field list before it is ever looked at.
+ */
+const clubMount = buildClubMount({
+  env: process.env,
+  // The relay's ONE session resolver, adapted to the shape the club router expects. The status is
+  // carried through rather than flattened: an unreachable session authority is 503, a bad token is
+  // 401, and collapsing the two would make a client discard a valid session on a transient failure.
+  authenticate: async (req) => {
+    const resolved = await resolveSessionUser(req);
+    if (!resolved.ok) return { ok: false, status: resolved.status, code: resolved.code };
+    return { ok: true, id: resolved.userId, role: resolved.role };
+  }
+});
+app.use(clubMount.router);
+
 app.use((req, res) => res.status(404).json({ success: false, error: "Endpoint not found" }));
 
 if (require.main === module) {
@@ -2778,7 +2828,10 @@ if (require.main === module) {
       privateKeySource: PRIVATE_KEY_B64 ? "base64" : PRIVATE_KEY_PEM_RAW ? "pem" : "none",
       plaintextAIKeysAllowed: ALLOW_PLAINTEXT_AI_KEYS,
       quotaConfigured: Boolean(NODESEND_QUOTA_URL),
-      ...quotaLedgerFields()
+      ...quotaLedgerFields(),
+      // Printed at boot because "club storage is inert" must be visible to whoever starts the
+      // container, not discovered by a player being told they have no club.
+      clubs: describeClubStoreState()
     });
   });
   // No quota probe at boot, deliberately. Every quota decision is made as the caller, with
@@ -2842,5 +2895,19 @@ module.exports = {
   // HTTP through `app`, which is what proves the session guard is attached.
   TRICKSTER_UPSTREAMS, TRICKSTER_RESPONSE_SHAPES, tricksterBaseUrl, tricksterTimeoutMs,
   tricksterUpstreamHeaders, tricksterSafeError, tricksterShapeOk, tricksterConfiguredState,
-  isBridgeAdminRole
+  isBridgeAdminRole,
+  // Clubs: exported for the same reason every other predicate here is. The harness must exercise the
+  // REAL authority decision, the REAL storage adapter and the REAL mounted router — not a copy that
+  // could drift from what actually ships. `clubMount` is the live instance these routes serve.
+  buildClubMount, describeClubStoreState, clubHealth, clubMount,
+  clubAuthorize: require("./clubs/clubAuthorization.js").authorizeClubOperation,
+  clubValidateShape: require("./clubs/clubAuthorization.js").validateRequestShape,
+  clubValidateInput: require("./clubs/clubAuthorization.js").validateClubInput,
+  clubRoutes: require("./clubs/clubAuthorization.js").CLUB_ROUTES,
+  clubBoardValidate: require("./clubs/clubBoardValidator.js").validateBoardSubmission,
+  clubBoardValidateOne: require("./clubs/clubBoardValidator.js").validateBoardRecord,
+  clubAccountConfig: require("./clubs/ncbAccountClient.js").readClubAccountConfig,
+  clubSchemaConfig: require("./clubs/clubSchema.js").readClubSchemaConfig,
+  createClubNcbStore: require("./clubs/clubNcbStore.js").createClubNcbStore,
+  createNcbAccountClient: require("./clubs/ncbAccountClient.js").createNcbAccountClient
 };
