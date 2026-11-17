@@ -1540,7 +1540,7 @@ check('13f. the failed sign-in detail never echoes the configured credential',
   hostileEcho.slice(0, 160));
 await hostile.close();
 
-// ── 13. the live-schema adapter: names and value shapes NCB actually has ─────
+// ── 18. the live-schema adapter: names and value shapes NCB actually has ─────
 // Sections 1-12 prove the FEATURE works while the fixture speaks the production column names, which
 // is indirect evidence. This section reads the wire: what bytes the relay actually sends NCB, and
 // what it accepts back. A column-name or value-representation bug is invisible to feature tests when
@@ -1550,16 +1550,16 @@ const { clubStatusCodec } = require(path.join(ROOT, 'clubs', 'clubSchema.js'));
 // (7) The codec alone: numeric, string-numeric and boolean are one flag, and nothing unknown may
 // ever mean 'active'.
 const codec = clubStatusCodec({ active: 1, inactive: 0 });
-check('13a. the numeric flag decodes 1, "1" and true identically and round-trips',
+check('18a. the numeric flag decodes 1, "1" and true identically and round-trips',
   codec.decode(1) === 'active' && codec.decode('1') === 'active' && codec.decode(true) === 'active'
   && codec.decode(0) === 'inactive' && codec.decode(false) === 'inactive'
   && codec.encode('active') === 1 && codec.encode('inactive') === 0,
   [codec.decode(1), codec.decode('1'), codec.decode(true), codec.decode(0), codec.encode('active')].join('/'));
-check('13b. an unrecognised flag never decodes to active (fail closed on a new NCB value)',
+check('18b. an unrecognised flag never decodes to active (fail closed on a new NCB value)',
   ['2', 'yes', '', null, undefined, 7].every((v) => codec.decode(v) !== 'active'),
   [1, 2, 'yes', '', null].map((v) => String(codec.decode(v))).join('/'));
 const identity = clubStatusCodec(null);
-check('13c. with no values block declared the mapping is the identity, not a silent 1/0',
+check('18c. with no values block declared the mapping is the identity, not a silent 1/0',
   identity.encode('active') === 'active' && identity.decode('active') === 'active' && identity.decode(1) !== 'active',
   `${String(identity.encode('active'))}/${String(identity.decode(1))}`);
 
@@ -1567,10 +1567,10 @@ check('13c. with no values block declared the mapping is the identity, not a sil
 const callsBeforeSchema = dataCalls.length;
 const numericClub = await ask('POST', '/clubs', { token: CALLER_TOKEN, body: { name: 'Numeric Flag BC' } });
 const createClubCall = dataCalls.slice(callsBeforeSchema).find((row) => row.method === 'POST' && row.pathname.includes('/data/create/clubs'));
-check('13d. creating a club writes the NUMERIC flag, not the text "active" (item 1)',
+check('18d. creating a club writes the NUMERIC flag, not the text "active" (item 1)',
   numericClub.status === 200 && createClubCall?.body?.active === 1,
   `sent=${JSON.stringify(createClubCall?.body)}`);
-check('13e. and the API still reports the domain value the client expects',
+check('18e. and the API still reports the domain value the client expects',
   numericClub.body?.data?.status === 'active', JSON.stringify(numericClub.body?.data));
 
 const optionsCallsBefore = dataCalls.length;
@@ -1578,18 +1578,18 @@ const activeOptions = await ask('GET', '/clubs/options', { token: 'tok-member10'
 // Several `/read/clubs` calls happen in one request (the caller's club status is read first), so
 // assert over all of them rather than taking whichever came first.
 const clubReads = dataCalls.slice(optionsCallsBefore).filter((row) => row.pathname.endsWith('/read/clubs'));
-check('13f. the active-clubs filter queries active=1, never active=active (item 1)',
+check('18f. the active-clubs filter queries active=1, never active=active (item 1)',
   activeOptions.status === 200 && clubReads.some((row) => /(^|&)active=1(&|$)/.test(row.search))
   && !clubReads.some((row) => /active=active/.test(row.search)),
   clubReads.map((row) => row.search).join(' ;; '));
-check('13g. and it returns the active clubs only, with the inactive one filtered not mislabelled',
+check('18g. and it returns the active clubs only, with the inactive one filtered not mislabelled',
   activeOptions.status === 200 && activeOptions.body.data.every((row) => row.id !== '12' && row.id !== '13'),
   JSON.stringify(activeOptions.body.data.map((row) => row.id)));
 
 const setInactive = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'active' } });
 const setBack = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'inactive' } });
 const club12Row = tables.clubs.find((row) => row.id === '12');
-check('13h. a status change round-trips through the numeric column and reads back correctly',
+check('18h. a status change round-trips through the numeric column and reads back correctly',
   setInactive.status === 200 && setInactive.body?.data?.status === 'active'
   && setBack.status === 200 && setBack.body?.data?.status === 'inactive' && club12Row.active === 0,
   `${JSON.stringify(setInactive.body?.data)}/${JSON.stringify(setBack.body?.data)}/stored=${club12Row.active}`);
@@ -1602,14 +1602,14 @@ const schemaImport = await ask('POST', '/clubs/10/board-collections', {
 });
 const colCreate = dataCalls.slice(callsBeforeImport).find((row) => row.method === 'POST' && row.pathname.includes('/data/create/club_board_collections'));
 const boardCreates = dataCalls.slice(callsBeforeImport).filter((row) => row.method === 'POST' && row.pathname.includes('/data/create/club_collection_boards'));
-check('13i. a collection is created with title, publication_status and created_by_user_id (items 2,3,4)',
+check('18i. a collection is created with title, publication_status and created_by_user_id (items 2,3,4)',
   schemaImport.status === 200 && colCreate?.body?.title === 'Schema probe'
   && colCreate?.body?.publication_status === 'draft' && colCreate?.body?.created_by_user_id === '2',
   JSON.stringify(colCreate?.body));
-check('13j. the author is the SESSION identity and no legacy "name" column was sent (item 4)',
+check('18j. the author is the SESSION identity and no legacy "name" column was sent (item 4)',
   colCreate?.body?.created_by_user_id === '2' && !('name' in (colCreate?.body ?? {})),
   `author=${colCreate?.body?.created_by_user_id} keys=${Object.keys(colCreate?.body ?? {}).join(',')}`);
-check('13k. no board insert references source_pbn or tags_json (items 5,6)',
+check('18k. no board insert references source_pbn or tags_json (items 5,6)',
   boardCreates.length === 2 && boardCreates.every((row) => !('source_pbn' in row.body) && !('tags_json' in row.body)
     && Object.keys(row.body).sort().join(',') === 'board_number,collection_id,dealer,hands_json,vulnerability'),
   JSON.stringify(boardCreates[0]?.body ?? {}).slice(0, 160));
@@ -1618,17 +1618,17 @@ check('13k. no board insert references source_pbn or tags_json (items 5,6)',
 const longNumber = await ask('POST', '/clubs/10/board-collections', {
   token: 'tok-admin10', body: { name: 'Long number', boards: [{ ...legalBoard(1), board_number: '12345678901' }] }
 });
-check('13l. a board number longer than the VARCHAR(10) column is refused before any write (item 5)',
+check('18l. a board number longer than the VARCHAR(10) column is refused before any write (item 5)',
   longNumber.status === 400 && longNumber.body.error === 'invalid_board_record',
   `${longNumber.status} ${longNumber.text.slice(0, 140)}`);
 const longStart = await ask('POST', '/clubs/collections/c-pub/boards/12345678901/start', { token: 'tok-member10', body: { original_seat: 'North' } });
-check('13m. and the start route refuses the same over-long number rather than 404-ing it',
+check('18m. and the start route refuses the same over-long number rather than 404-ing it',
   longStart.status === 400 && longStart.body.error === 'bad_request',
   `${longStart.status} ${longStart.text.slice(0, 120)}`);
 const tenChar = await ask('POST', '/clubs/10/board-collections', {
   token: 'tok-admin10', body: { name: 'Ten chars', boards: [{ ...legalBoard(1), board_number: '1234567890' }] }
 });
-check('13n. exactly 10 characters still imports (the cap is the column width, not a rounder number)',
+check('18n. exactly 10 characters still imports (the cap is the column width, not a rounder number)',
   tenChar.status === 200, `${tenChar.status} ${tenChar.text.slice(0, 120)}`);
 
 // (6)(7) A phantom column in the config is refused rather than silently ignored.
@@ -1639,7 +1639,7 @@ const phantomColumn = clubSchemaConfig({
     values: SCHEMA_OBJECT.values
   })
 });
-check('13o. configuring a sourcePbn column is refused, so the phantom column cannot come back (item 6)',
+check('18o. configuring a sourcePbn column is refused, so the phantom column cannot come back (item 6)',
   phantomColumn.ok === false && phantomColumn.problems.some((p) => /sourcePbn/.test(p)),
   JSON.stringify(phantomColumn.problems).slice(0, 170));
 
@@ -1650,7 +1650,7 @@ const halfValues = clubSchemaConfig({
     values: { clubs: { status: { active: 1 } } }
   })
 });
-check('13p. a half-declared flag mapping is refused (the missing half would write text to a number)',
+check('18p. a half-declared flag mapping is refused (the missing half would write text to a number)',
   halfValues.ok === false && halfValues.problems.some((p) => /values\.clubs\.status\.inactive/.test(p)),
   JSON.stringify(halfValues.problems).slice(0, 170));
 
@@ -1660,7 +1660,7 @@ const textValues = clubSchemaConfig({
     columns: { ...SCHEMA_OBJECT.columns, clubs: { id: 'id', name: 'name', status: 'status' } }
   })
 });
-check('13q. a text-flagged club column still validates, so the adapter is not numeric-only',
+check('18q. a text-flagged club column still validates, so the adapter is not numeric-only',
   textValues.ok === true && textValues.schema.clubStatus.encode('active') === 'active',
   JSON.stringify(textValues.problems));
 
@@ -1671,7 +1671,7 @@ const noAuthorColumn = clubSchemaConfig({
     values: SCHEMA_OBJECT.values
   })
 });
-check('13r. a collections mapping without created_by_user_id is refused at boot (item 4)',
+check('18r. a collections mapping without created_by_user_id is refused at boot (item 4)',
   noAuthorColumn.ok === false && noAuthorColumn.problems.some((p) => /collections\.createdBy/.test(p)),
   JSON.stringify(noAuthorColumn.problems).slice(0, 170));
 
@@ -1690,6 +1690,10 @@ function makeClubNcb(seed = {}) {
     failSystemAdminCreate: false,
     swallowSystemAdminCreate: false,
     duplicateAfterInsert: false,
+    // When set, the system_admins read answers HTTP 200 with this body instead of a row set.
+    // This is the shape of the production incident: a refusal or an unexpected payload that arrives
+    // as a success status, which a naive parser can only read as "no rows".
+    systemAdminsEnvelope: null,
     // 15ms is long enough for a 6-way burst to interleave (measured) and short enough to add well
     // under a second to the whole gate.
     delayMs: 15,
@@ -1730,6 +1734,9 @@ function makeClubNcb(seed = {}) {
         // inside their own microtask queue, no interleaving would ever occur, and the single-flight
         // assertion below would pass while testing nothing.
         await new Promise((r) => setTimeout(r, state.delayMs));
+        // HTTP 200 with a non-row-set body: the exact mask that turned an unreadable authority table
+        // into a 403 "you are not a Super Admin".
+        if (state.systemAdminsEnvelope) return json(state.systemAdminsEnvelope, 200);
         return json({ status: 'success', data: rows });
       }
       if (action === 'create') {
@@ -1978,6 +1985,59 @@ for (const [seedIndex, seedCase] of [
   await srv.close();
 }
 
+// ── 17. an authority read that is not a row set must not look like "no rows" ─
+// The production symptom was a legitimate Super Admin getting 403. One way that happens without
+// anything being wrong with the row is NCB answering 2xx with a body that is not a success row set;
+// if the parser turns that into zero rows, "cannot read" and "is not an admin" collapse into the
+// same 403. These arms pin the distinction, and the last two prove the fix did not break the
+// ordinary cases — a genuinely empty table and a genuine match still behave exactly as before.
+const ENVELOPE_CASES = [
+  ['an RLS-style refusal inside a 200', { status: 'error', message: 'row-level security denied', data: [] }],
+  ['a null data field', { status: 'success', data: null }],
+  ['rows under an unexpected key', { status: 'success', rows: [{ user_id: OWNER_ID }] }],
+  ['an HTML error page body', { error: 'upstream' }]
+];
+for (const [envelopeIndex, [label, envelope]] of ENVELOPE_CASES.entries()) {
+  const ncb = makeClubNcb();
+  ncb.state.systemAdminsEnvelope = envelope;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('GET', '/clubs', { token: 'tok-owner', base: srv.base });
+  check(`17${'abcd'[envelopeIndex]}. a 200 carrying ${label} is a 503, never a 403`,
+    res.status === 503 && res.body.error === 'club_store_unavailable',
+    `${res.status} ${res.text.slice(0, 130)}`);
+  await srv.close();
+}
+
+{
+  const ncb = makeClubNcb();
+  ncb.state.systemAdminsEnvelope = { status: 'error', message: 'row-level security denied', data: [] };
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const refusedRead = await call('GET', '/clubs', { token: 'tok-owner', base: srv.base });
+  const attemptedGrant = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('17e. the bootstrap gate treats a masked refusal as UNREADABLE and inserts nothing',
+    refusedRead.status === 503 && attemptedGrant.status === 503
+    && attemptedGrant.body.error === 'club_store_unavailable'
+    && !ncb.state.dataCalls.some((row) => row.method === 'POST') && ncb.state.systemAdmins.length === 0,
+    `${refusedRead.status}/${attemptedGrant.status} inserts=${ncb.state.dataCalls.filter((r) => r.method === 'POST').length}`);
+  await srv.close();
+}
+{
+  // POSITIVE CONTROL: a real empty success is still an empty success. Without this, the fix could
+  // silently turn every legitimate 403 into a 503 and the suite would still look green.
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const genuinelyEmpty = await call('GET', '/clubs', { token: 'tok-owner', base: srv.base });
+  check('17f. a genuine empty system_admins success still answers 403 super_admin_required',
+    genuinelyEmpty.status === 403 && genuinelyEmpty.body.error === 'super_admin_required',
+    `${genuinelyEmpty.status} ${genuinelyEmpty.text.slice(0, 130)}`);
+  const grant = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  const afterGrant = await call('GET', '/clubs', { token: 'tok-owner', base: srv.base });
+  check('17g. and a normal bootstrap still succeeds and confers Super Admin on the verified id',
+    grant.status === 200 && afterGrant.status === 200 && ncb.state.systemAdmins.length === 1,
+    `${grant.status}/${afterGrant.status} rows=${JSON.stringify(ncb.state.systemAdmins)}`);
+  await srv.close();
+}
+
 // ── the shipped shape: could this actually run where NodeSend runs? ─────────
 const fs = require('node:fs');
 const clubDir = path.join(ROOT, 'clubs');
@@ -2017,6 +2077,23 @@ const bootLine = `${liveStartup.stdout ?? ''}${liveStartup.stderr ?? ''}`;
 check('14e. the relay still boots with Clubs mounted, and prints its club state',
   /club storage/i.test(bootLine) && !/Cannot find module|SyntaxError|ReferenceError/i.test(bootLine),
   bootLine.slice(0, 200));
+
+// The gate must catch its own failure modes. Six arms once silently shared labels 13a-13f, which
+// makes a printed FAIL ambiguous about which check actually broke — precisely the kind of defect
+// that survives because everything still says PASS. Asserted against this file's own source, so the
+// numbering cannot regress unnoticed.
+const ownLines = fs.readFileSync(path.join(ROOT, 'verify-clubs-gateway.mjs'), 'utf8').split(/\r?\n/);
+const ownLabels = [];
+ownLines.forEach((line, i) => {
+  const m = line.match(/check\(\s*[`'"]\s*([0-9]+[a-z0-9]*)\./);
+  if (m) ownLabels.push({ label: m[1], line: i + 1 });
+});
+const labelCounts = {};
+for (const entry of ownLabels) labelCounts[entry.label] = (labelCounts[entry.label] || 0) + 1;
+const duplicatedLabels = Object.keys(labelCounts).filter((label) => labelCounts[label] > 1);
+check('14f. no two checks share an arm label (a duplicate makes a FAIL ambiguous)',
+  ownLabels.length > 150 && duplicatedLabels.length === 0,
+  `duplicates: ${duplicatedLabels.join(',') || 'none'} of ${ownLabels.length} labeled arms`);
 
 // ── teardown and verdict ────────────────────────────────────────────────────
 await new Promise((resolve) => server.close(resolve));

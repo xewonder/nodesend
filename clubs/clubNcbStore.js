@@ -44,7 +44,32 @@ const UPDATE = (table, id, body) => ({ group: 'data', path: `update/${table}/${e
 const REMOVE = (table, id) => ({ group: 'data', path: `delete/${table}/${encodeURIComponent(id)}`, method: 'DELETE' });
 
 const eq = (value) => String(value ?? '').trim();
-const rowsOf = (body) => (Array.isArray(body?.data) ? body.data : (Array.isArray(body) ? body : []));
+
+/**
+ * Reads the row set out of an NCB response, and returns NULL when the response is not a row set.
+ *
+ * This is the same discipline `envelopeRows()` already applies to every quota read in bridge.js
+ * (bridge.js:821-830), and the club modules were not doing it. The consequence was silent and
+ * serious: NCB can answer HTTP 200 with a body that means "refused" or "unexpected" —
+ * `{ "status":"error", "message":"<refused>", "data":[] }`, or `{ "data": null }`, or a payload
+ * whose rows sit under another key. Treating any of those as ZERO ROWS makes a denied or malformed
+ * read indistinguishable from an empty table, and on an AUTHORITY table that is the difference
+ * between
+ * telling an operator "the club account could not read system_admins" (503, actionable) and telling
+ * a legitimate Super Admin "you are not one" (403, a dead end that invites someone to re-run a
+ * grant that may already have landed).
+ *
+ * A genuine empty success — `{status:'success', data:[]}` — still returns an empty array. Only
+ * "this is not a row set" becomes null.
+ */
+function rowsOf(body) {
+  if (body && typeof body === 'object' && !Array.isArray(body) && 'status' in body && body.status !== 'success') {
+    return null;
+  }
+  if (Array.isArray(body?.data)) return body.data;
+  if (Array.isArray(body)) return body;
+  return null;
+}
 
 // NCB reports a unique-index refusal in prose, and the prose is the only signal a sequential REST
 // layer passes back. Scoped to the duplicate-key families: a 500 that merely mentions "exist"
