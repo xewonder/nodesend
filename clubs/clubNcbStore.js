@@ -137,6 +137,40 @@ function createClubNcbStore({ client, schema }) {
     return { declared: true, available: true, isAdmin: rows.length > 0 };
   }
 
+  /**
+   * Reads the whole (bounded) system_admins set as user ids, for the bootstrap's empty-table test.
+   * Deliberately separate from `isSystemAdmin`, which answers one yes/no about one caller: a
+   * per-user probe cannot distinguish "the table is empty" from "the table holds somebody else",
+   * and that distinction is the entire safety property of the bootstrap.
+   * `available:false` means the READ FAILED, which the caller must treat as write-nothing.
+   */
+  async function readSystemAdmins() {
+    const rows = await find(T.systemAdmins, `limit=${Math.min(schema.rowLimit, 50)}`);
+    if (rows === null) return { available: false, userIds: [], reason: 'read_failed' };
+    return {
+      available: true,
+      userIds: rows.map((row) => eq(row[C.systemAdmins.userId])).filter((id) => id !== '')
+    };
+  }
+
+  /**
+   * Inserts one system_admins row, carrying only the column this contract declares (`user_id`):
+   * created_by/created_at are not in the agreed five-table schema, and writing an undeclared column
+   * is exactly the failure this whole adapter exists to prevent. Confirmed by reading the row back
+   * by that same column, because a 2xx from NCB is not evidence that a row exists.
+   */
+  async function createSystemAdmin(userId) {
+    const id = eq(userId);
+    if (id === '') return { error: 'bad_request', detail: 'a user id is required' };
+    const result = await run(CREATE(T.systemAdmins, { [C.systemAdmins.userId]: id }));
+    if (!result.ok) {
+      return { error: result.duplicate ? 'already_admin' : result.reason, detail: result.detail };
+    }
+    const confirmed = await one(T.systemAdmins, `${C.systemAdmins.userId}=${encodeURIComponent(id)}`);
+    if (!confirmed) return { error: 'write_unverified', detail: 'the system_admins row could not be read back' };
+    return { user_id: eq(confirmed[C.systemAdmins.userId]) };
+  }
+
   // ── SUPER ADMIN ───────────────────────────────────────────────────────────
 
   /**
@@ -588,6 +622,8 @@ function createClubNcbStore({ client, schema }) {
     clubStatus,
     collectionScope,
     isSystemAdmin,
+    readSystemAdmins,
+    createSystemAdmin,
     listClubs,
     listActiveClubs,
     createClub,

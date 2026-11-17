@@ -30,6 +30,7 @@ const { createNcbAccountClient, readClubAccountConfig, assertNotFrontendFacing }
 const { createClubNcbStore } = require('./clubNcbStore.js');
 const { readClubSchemaConfig, AGREED_TABLE_ROLES } = require('./clubSchema.js');
 const { createClubRouter, CLUB_ROUTES } = require('./clubAuthorization.js');
+const { createClubBootstrapRouter, BOOTSTRAP_ROUTES } = require('./clubBootstrap.js');
 
 /**
  * @param {object} options
@@ -73,12 +74,20 @@ function buildClubMount({ env = process.env, authenticate, fetchImpl, limits } =
   return finish({ authenticate, store, client, reason, detail, limits });
 
   function finish({ store: builtStore, client: builtClient, reason: why, detail: whyDetail }) {
+    // The bootstrap is mounted INSIDE the club router rather than as a second `app.use` in
+    // bridge.js. That is not tidiness: bridge.js carries the owner's uncommitted work, and a
+    // composition that needs no edit there keeps the shipped diff to the Clubs modules alone.
+    const clubRouter = createClubRouter({ store: builtStore, authenticate, limits });
+    const bootstrap = createClubBootstrapRouter({ store: builtStore, authenticate, env });
+    clubRouter.use(bootstrap);
     return {
-      router: createClubRouter({ store: builtStore, authenticate, limits }),
+      router: clubRouter,
       configured: Boolean(builtStore),
       reason: builtStore ? null : (why || 'club_store_unavailable'),
       detail: builtStore ? '' : String(whyDetail || ''),
       routes: CLUB_ROUTES,
+      bootstrapRoutes: BOOTSTRAP_ROUTES,
+      bootstrapState: () => bootstrap.__bootstrapState(),
       status() {
         return {
           configured: Boolean(builtStore),
@@ -86,7 +95,8 @@ function buildClubMount({ env = process.env, authenticate, fetchImpl, limits } =
           // An account PRESENCE flag and the client's own booleans: no email, no password, no
           // token, no table contents. Safe to print at boot and to serve from /health.
           account: builtClient ? builtClient.status() : { configured: false, sessionActive: false, identityVerified: false },
-          routes: CLUB_ROUTES.length
+          routes: CLUB_ROUTES.length,
+          bootstrap: bootstrap.__bootstrapState()
         };
       }
     };
@@ -116,6 +126,11 @@ function clubHealth(mount) {
     configured: state.configured,
     reason: state.reason,
     routes: state.routes,
+    // Two booleans only, and deliberately no id: whether the temporary first-run grant is currently
+    // switchable and whether it has been used. Neither names a person, and neither is needed to
+    // attempt the operation (which is closed by the table, not by this field).
+    bootstrapEnabled: state.bootstrap?.enabled === true,
+    bootstrapCompleted: state.bootstrap?.completed === true,
     // No table or column name appears here, in line with every other route in this relay: the
     // surface is described by what it does, not by where it reads. `/health` is unauthenticated,
     // and a published schema is a map of what an attacker should try to write to.
@@ -129,6 +144,7 @@ module.exports = {
   describeClubStoreState,
   clubHealth,
   CLUB_ROUTES,
+  BOOTSTRAP_ROUTES,
   AGREED_TABLE_ROLES,
   readClubAccountConfig,
   readClubSchemaConfig

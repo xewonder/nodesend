@@ -1206,22 +1206,31 @@ const CLIENT_EXPECTED = Object.freeze([
 ]);
 
 // Read the surface off the REAL Express stack rather than off the declaration, so a route added to
-// the list but not mounted — or mounted but not listed — reddens this arm.
+// the list but not mounted — or mounted but not listed — reddens this arm. The walk RECURSES into
+// nested routers: the bootstrap is mounted inside the club router, and a walker that only looked one
+// level deep would report a clean parity check while an undeclared route sat unnoticed underneath.
 function mountedClubPaths() {
-  const found = [];
+  const direct = [];
+  const nested = [];
+  const walk = (stack, depth) => {
+    for (const layer of stack) {
+      const entry = layer?.route;
+      if (entry) {
+        for (const method of Object.keys(entry.methods ?? {})) {
+          (depth === 0 ? direct : nested).push(`${method.toUpperCase()} ${entry.path}`);
+        }
+        continue;
+      }
+      if (layer?.handle?.stack && Array.isArray(layer.handle.stack)) walk(layer.handle.stack, depth + 1);
+    }
+  };
   for (const layer of app._router.stack) {
     if (layer.name !== 'router' || !layer.handle?.stack) continue;
-    for (const route of layer.handle.stack) {
-      const entry = route?.route;
-      if (!entry) continue;
-      for (const method of Object.keys(entry.methods ?? {})) {
-        found.push(`${method.toUpperCase()} ${entry.path}`);
-      }
-    }
+    walk(layer.handle.stack, 0);
   }
-  return found;
+  return { direct, nested };
 }
-const mounted = mountedClubPaths();
+const { direct: mounted, nested: mountedNested } = mountedClubPaths();
 const declared = clubRoutes.map((route) => `${route.method} ${route.path}`);
 const notMounted = declared.filter((route) => !mounted.includes(route));
 const undeclared = mounted.filter((route) => !declared.includes(route));
@@ -1255,6 +1264,23 @@ check('10f. club routes are unprefixed, so /api/clubs is NOT served here',
   mounted.every((route) => !route.includes('/api/'))
   && !mounted.some((route) => route.endsWith(' /api/clubs')),
   mounted.filter((route) => route.includes('/api/')).join(' | '));
+
+// The nested layer is a real part of the mounted surface, so it is declared and asserted rather
+// than left outside the parity check by a walker that cannot see it.
+const { BOOTSTRAP_ROUTES } = require(path.join(ROOT, 'clubs', 'index.js'));
+const declaredNested = BOOTSTRAP_ROUTES.map((route) => `${route.method} ${route.path}`);
+check('10g. the nested surface is exactly the declared bootstrap route, and nothing else hides there',
+  mountedNested.length === declaredNested.length
+  && declaredNested.every((route) => mountedNested.includes(route))
+  && mountedNested.every((route) => declaredNested.includes(route))
+  && mountedNested.length === 1,
+  `mounted=[${mountedNested.join(', ')}] declared=[${declaredNested.join(', ')}]`);
+check('10h. the bootstrap is not part of the permanent client contract',
+  !CLIENT_EXPECTED.some((route) => /bootstrap/.test(route)) && !declared.some((route) => /bootstrap/.test(route)),
+  'bootstrap must not appear in CLUB_ROUTES or the client list');
+check('10i. /health.clubs.routes still counts only the 21 contract routes',
+  (bridge.clubHealth(bridge.clubMount).routes === 21) && mounted.length === 21,
+  `health=${bridge.clubHealth(bridge.clubMount).routes} mounted=${mounted.length}`);
 
 // ── pure authority decision, without any I/O at all ─────────────────────────
 const pureDenials = [
@@ -1649,6 +1675,309 @@ check('13r. a collections mapping without created_by_user_id is refused at boot 
   noAuthorColumn.ok === false && noAuthorColumn.problems.some((p) => /collections\.createdBy/.test(p)),
   JSON.stringify(noAuthorColumn.problems).slice(0, 170));
 
+// ── 16. the one-time super-admin bootstrap ───────────────────────────────────
+// The bootstrap is the only code path in NodeSend that WRITES system_admins, i.e. the only place a
+// Super Admin can come from at all. It is tested against the real store and the real club account
+// client over an emulated NCB, because a stub of the store would prove the router calls a function
+// rather than that the grant is safe.
+//
+// `sessions` maps bearer -> the id the relay will VERIFY from get-session. The id the caller claims
+// to be is irrelevant: nothing here reads a body or query field, and a forged one must be refused.
+function makeClubNcb(seed = {}) {
+  const state = {
+    systemAdmins: Array.isArray(seed.systemAdmins) ? seed.systemAdmins.slice() : [],
+    failSystemAdminRead: false,
+    failSystemAdminCreate: false,
+    swallowSystemAdminCreate: false,
+    duplicateAfterInsert: false,
+    // 15ms is long enough for a 6-way burst to interleave (measured) and short enough to add well
+    // under a second to the whole gate.
+    delayMs: 15,
+    signIns: 0,
+    dataCalls: []
+  };
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    const method = String(init.method ?? 'GET').toUpperCase();
+    const bearer = String(init?.headers?.Authorization ?? '').replace(/^Bearer\s+/, '');
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (target.includes('/auth/sign-in/email')) {
+      state.signIns += 1;
+      return json({ token: CLUB_SESSION_TOKEN });
+    }
+    if (target.includes('/auth/get-session')) {
+      return json({ data: { user: { id: CLUB_ACCOUNT_ID, email: CLUB_ACCOUNT_EMAIL } } });
+    }
+    if (target.includes('/data/')) {
+      state.dataCalls.push({ method, path: target.split('?')[0].replace('https://ncb.test.invalid', ''), bearer, body });
+      if (bearer !== CLUB_SESSION_TOKEN) return json({ status: 'error', message: 'non-club bearer reached club data' }, 403);
+      const afterData = target.split('/data/')[1];
+      const table = afterData.split('?')[0].split('/')[1];
+      const action = afterData.split('?')[0].split('/')[0];
+      if (table !== 'system_admins') return json({ status: 'success', data: [] });
+      // Filters are honoured, exactly as NCB applies them. An emulator that returned the whole
+      // table for every query would make "nobody else becomes a Super Admin" unpassable — and, far
+      // worse, would have PASSED it against a server whose own per-user lookup was broken.
+      const params = new URL(`https://x/${afterData}`).searchParams;
+      const wanted = params.get('user_id');
+      const rows = state.systemAdmins
+        .filter((user_id) => wanted === null || user_id === wanted)
+        .map((user_id) => ({ id: `sa-${user_id}`, user_id }));
+      if (action === 'read') {
+        if (state.failSystemAdminRead) return json({ status: 'error', message: 'read denied' }, 500);
+        // A real NCB round trip takes time, and that gap is the whole reason a read-then-write
+        // guard needs a lock. Without a pause here the six concurrent bootstraps would each finish
+        // inside their own microtask queue, no interleaving would ever occur, and the single-flight
+        // assertion below would pass while testing nothing.
+        await new Promise((r) => setTimeout(r, state.delayMs));
+        return json({ status: 'success', data: rows });
+      }
+      if (action === 'create') {
+        if (state.failSystemAdminCreate) return json({ status: 'error', message: 'insert denied' }, 500);
+        await new Promise((r) => setTimeout(r, state.delayMs));
+        if (!state.swallowSystemAdminCreate) {
+          state.systemAdmins.push(body.user_id);
+          if (state.duplicateAfterInsert) state.systemAdmins.push(body.user_id);
+        }
+        return json({ status: 'success', data: { id: 'sa-new', ...body } });
+      }
+    }
+    return json({ status: 'error', message: 'unexpected' }, 500);
+  };
+  return { state, fetchImpl };
+}
+
+async function serveBootstrap({ bootstrapId, sessions, ncb, envExtra = {} } = {}) {
+  const instance = expressLib();
+  instance.use(expressLib.json({ limit: '1mb' }));
+  const mount = buildClubMount({
+    env: {
+      ...READY_ENV,
+      ...(bootstrapId === null ? {} : { CLUB_BOOTSTRAP_SUPER_ADMIN_USER_ID: bootstrapId }),
+      ...envExtra
+    },
+    fetchImpl: ncb.fetchImpl,
+    authenticate: async (req) => {
+      const token = String(req.get('authorization') ?? '').replace(/^Bearer\s+/, '');
+      // The id comes from the SESSION lookup, exactly as in production. A body field never enters.
+      const verified = sessions[token];
+      return verified
+        ? { ok: true, id: String(verified), role: 'user' }
+        : { ok: false, status: 401, code: 'authentication_required' };
+    }
+  });
+  instance.use(mount.router);
+  const listener = instance.listen(0, '127.0.0.1');
+  await new Promise((resolve) => listener.once('listening', resolve));
+  return {
+    mount,
+    base: `http://127.0.0.1:${listener.address().port}`,
+    close: () => new Promise((resolve) => listener.close(resolve))
+  };
+}
+
+const OWNER_ID = '100042';
+const STRANGER_ID = '999999';
+
+// (Item 10) With the variable unset the endpoint is inert. This is measured on the MAIN app, which
+// boots with no bootstrap id configured, i.e. the shipped steady state.
+const disabledBootstrap = await ask('POST', '/clubs/bootstrap/super-admin', { token: CALLER_TOKEN, body: {} });
+check('16a. with no CLUB_BOOTSTRAP_SUPER_ADMIN_USER_ID the endpoint refuses and grants nothing (item 10)',
+  disabledBootstrap.status === 503 && disabledBootstrap.body.error === 'club_bootstrap_disabled'
+  && bridge.clubMount.bootstrapState().enabled === false,
+  `${disabledBootstrap.status} ${disabledBootstrap.text.slice(0, 130)}`);
+
+// The happy path, then every way it must refuse.
+{
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({
+    bootstrapId: OWNER_ID,
+    sessions: { 'tok-owner': OWNER_ID, 'tok-stranger': STRANGER_ID },
+    ncb
+  });
+  const before = ncb.state.dataCalls.length;
+  const good = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  const writes = ncb.state.dataCalls.slice(before).filter((row) => row.method === 'POST');
+  check('16b. the configured, session-verified user bootstraps successfully exactly once',
+    good.status === 200 && good.body?.data?.bootstrapped === true
+    && good.body?.data?.user_id === OWNER_ID && good.body?.data?.system_admin_rows === 1
+    && ncb.state.systemAdmins.length === 1 && ncb.state.systemAdmins[0] === OWNER_ID,
+    `${good.status} ${good.text.slice(0, 150)} table=${JSON.stringify(ncb.state.systemAdmins)}`);
+  check('16c. the row was written BY THE DEDICATED CLUB ACCOUNT, one write, no caller bearer',
+    writes.length === 1 && writes[0].bearer === CLUB_SESSION_TOKEN && /create\/system_admins/.test(writes[0].path),
+    JSON.stringify(writes.map((w) => `${w.method} ${w.path} bearer=${w.bearer === CLUB_SESSION_TOKEN ? 'club' : 'CALLER'}`)));
+  check('16d. the insert carried only the declared user_id column, taken from the SERVER env',
+    writes[0]?.body && Object.keys(writes[0].body).join(',') === 'user_id' && writes[0].body.user_id === OWNER_ID,
+    JSON.stringify(writes[0]?.body));
+  const again = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  const strangerAfter = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', base: srv.base });
+  check('16e. after success the route refuses further grants, including to the same user (item 11)',
+    again.status === 409 && again.body.error === 'bootstrap_already_completed'
+    && strangerAfter.status === 409 && ncb.state.systemAdmins.length === 1,
+    `${again.status}/${strangerAfter.status} table=${JSON.stringify(ncb.state.systemAdmins)}`);
+  check('16f. the mount reports the bootstrap as completed',
+    srv.mount.bootstrapState().completed === true, JSON.stringify(srv.mount.bootstrapState()));
+  await srv.close();
+}
+
+// Wrong session.
+{
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-stranger': STRANGER_ID }, ncb });
+  const wrong = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', base: srv.base });
+  check('16g. a different authenticated user is rejected and nothing is written (item 4)',
+    wrong.status === 403 && wrong.body.error === 'bootstrap_caller_mismatch' && ncb.state.systemAdmins.length === 0,
+    `${wrong.status} ${wrong.text.slice(0, 140)} table=${JSON.stringify(ncb.state.systemAdmins)}`);
+  check('16h. the mismatch names only the caller\'s OWN verified id, never the configured one',
+    wrong.body?.own_user_id === STRANGER_ID && !wrong.text.includes(OWNER_ID),
+    wrong.text.slice(0, 140));
+  const forgedBody = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', body: { user_id: STRANGER_ID }, base: srv.base });
+  check('16i. a forged user_id in the body is refused outright, before any read (item 5, 9)',
+    forgedBody.status === 400 && forgedBody.body.error === 'client_identity_refused' && ncb.state.systemAdmins.length === 0,
+    `${forgedBody.status} ${forgedBody.text.slice(0, 130)}`);
+  const forgedQuery = await call('POST', '/clubs/bootstrap/super-admin?user_id=7', { token: 'tok-stranger', base: srv.base });
+  check('16j. and a forged query parameter is refused too',
+    forgedQuery.status === 400 && forgedQuery.body.error === 'client_identity_refused',
+    `${forgedQuery.status}`);
+  // Measured as a DELTA: the wrong-user call above legitimately reads the table (the emptiness gate
+  // runs before the identity comparison), so a cumulative count would blame the anonymous request
+  // for someone else's read — and would hide a real anonymous-time data call all the same.
+  const callsBeforeAnon = ncb.state.dataCalls.length;
+  const anon = await call('POST', '/clubs/bootstrap/super-admin', { base: srv.base });
+  check('16k. an anonymous caller is rejected and NOT ONE club-data call was made',
+    anon.status === 401 && ncb.state.dataCalls.length === callsBeforeAnon,
+    `${anon.status} extraDataCalls=${ncb.state.dataCalls.length - callsBeforeAnon}`);
+  await srv.close();
+}
+
+// A table that already has an authority, whatever it contains.
+for (const [seedIndex, seedCase] of [
+  { label: 'an unrelated admin', systemAdmins: [STRANGER_ID] },
+  { label: 'the configured id already present', systemAdmins: [OWNER_ID] }
+].entries()) {
+  const ncb = makeClubNcb(seedCase);
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check(`16l${seedIndex + 1}. bootstrap refuses when system_admins already holds ${seedCase.label} (items 7, 9)`,
+    res.status === 409 && res.body.error === 'bootstrap_already_completed'
+    && !ncb.state.dataCalls.some((row) => row.method === 'POST')
+    && ncb.state.systemAdmins.length === 1,
+    `${res.status} ${res.text.slice(0, 120)} table=${JSON.stringify(ncb.state.systemAdmins)}`);
+  await srv.close();
+}
+
+// Fail-closed reads and writes.
+{
+  const ncb = makeClubNcb();
+  ncb.state.failSystemAdminRead = true;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('16m. an unreadable system_admins is a 503 with NOTHING written, never an assumed-empty read',
+    res.status === 503 && res.body.error === 'club_store_unavailable'
+    && !ncb.state.dataCalls.some((row) => row.method === 'POST') && ncb.state.systemAdmins.length === 0,
+    `${res.status} ${res.text.slice(0, 130)}`);
+  await srv.close();
+}
+{
+  const ncb = makeClubNcb();
+  ncb.state.failSystemAdminCreate = true;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('16n. an NCB write failure fails closed and reports it, with no row and no false success',
+    res.status === 502 && res.body.error === 'bootstrap_write_failed' && ncb.state.systemAdmins.length === 0,
+    `${res.status} ${res.text.slice(0, 130)}`);
+  // The latched-completed flag must NOT be set by a failure, or a transient outage would look done.
+  check('16o. a failed write does not mark the bootstrap completed (a retry is still possible)',
+    srv.mount.bootstrapState().completed === false, JSON.stringify(srv.mount.bootstrapState()));
+  await srv.close();
+}
+{
+  const ncb = makeClubNcb();
+  ncb.state.swallowSystemAdminCreate = true;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('16p. a write that cannot be read back is bootstrap_unverified, not a success (item 8)',
+    res.status === 502 && res.body.error === 'bootstrap_unverified'
+    && /Inspect system_admins before retrying/.test(res.body.detail ?? ''),
+    `${res.status} ${res.text.slice(0, 140)}`);
+  await srv.close();
+}
+{
+  const ncb = makeClubNcb();
+  ncb.state.duplicateAfterInsert = true;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('16q. an ambiguous resulting table (two rows) is refused, never silently accepted (item 7)',
+    res.status === 502 && res.body.error === 'bootstrap_unverified' && /exactly one/.test(res.body.detail ?? ''),
+    `${res.status} ${res.text.slice(0, 160)}`);
+  await srv.close();
+}
+{
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({ bootstrapId: 'not a valid id!!', sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const res = await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  check('16r. a malformed configured id disables the grant rather than inserting garbage',
+    res.status === 503 && res.body.error === 'club_bootstrap_misconfigured' && ncb.state.systemAdmins.length === 0,
+    `${res.status} ${res.text.slice(0, 130)}`);
+  await srv.close();
+}
+
+// (Item 7) Simultaneous requests must not produce competing grants.
+{
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID }, ncb });
+  const burst = await Promise.all([1, 2, 3, 4, 5, 6].map(() => call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base })));
+  const creates = ncb.state.dataCalls.filter((row) => row.method === 'POST');
+  // The property is ONE write and ONE row. The shared 200 is deliberate: six callers all asked for
+  // the same env-pinned grant and it happened, so telling five of them "failed" would be the lie.
+  // Competing inserts are what is prevented — and a foreign grant is impossible anyway, because no
+  // caller can name anyone other than the configured id.
+  check('16s. six simultaneous bootstraps caused exactly ONE insert and one row (item 7)',
+    creates.length === 1 && ncb.state.systemAdmins.length === 1
+    && ncb.state.systemAdmins[0] === OWNER_ID
+    && burst.every((r) => r.status === 200),
+    `creates=${creates.length} rows=${JSON.stringify(ncb.state.systemAdmins)} statuses=${burst.map((r) => r.status).join(',')}`);
+  await srv.close();
+}
+
+// (Item 9) The bootstrap must not disturb ordinary club authorization.
+{
+  const ncb = makeClubNcb();
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-owner': OWNER_ID, 'tok-stranger': STRANGER_ID }, ncb });
+  await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-owner', base: srv.base });
+  const ownerNow = await call('GET', '/clubs', { token: 'tok-owner', base: srv.base });
+  const strangerNow = await call('GET', '/clubs', { token: 'tok-stranger', base: srv.base });
+  check('16u. after the bootstrap the granted id is a Super Admin and nobody else becomes one',
+    ownerNow.status === 200 && strangerNow.status === 403
+    && strangerNow.body.error === 'super_admin_required',
+    `${ownerNow.status}/${strangerNow.status} ${strangerNow.text.slice(0, 110)}`);
+  await srv.close();
+}
+
+// (Item 12) Nothing secret may come back on any bootstrap path.
+{
+  const ncb = makeClubNcb();
+  ncb.state.failSystemAdminCreate = true;
+  const srv = await serveBootstrap({ bootstrapId: OWNER_ID, sessions: { 'tok-stranger': STRANGER_ID }, ncb });
+  const bodies = [];
+  for (const request of [
+    () => call('POST', '/clubs/bootstrap/super-admin', { base: srv.base }),
+    () => call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', base: srv.base }),
+    () => call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', body: { user_id: STRANGER_ID }, base: srv.base })
+  ]) {
+    const r = await request();
+    bodies.push(r.text);
+  }
+  await call('POST', '/clubs/bootstrap/super-admin', { token: 'tok-stranger', base: srv.base });
+  const blob = bodies.join('\n') + JSON.stringify(srv.mount.status());
+  const leaks = [CLUB_PASSWORD, CLUB_SESSION_TOKEN, CLUB_ACCOUNT_EMAIL, 'ncb.test.invalid']
+    .filter((secret) => blob.includes(secret));
+  check('16t. no bootstrap response or status view leaks the club password, token, address or host',
+    leaks.length === 0 && !blob.includes(OWNER_ID),
+    `leaked=${leaks.map((x) => x.slice(0, 6)).join(',')}`);
+  await srv.close();
+}
+
 // ── the shipped shape: could this actually run where NodeSend runs? ─────────
 const fs = require('node:fs');
 const clubDir = path.join(ROOT, 'clubs');
@@ -1667,9 +1996,11 @@ const clubCode = clubSource.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\
 check('14b. no club module reaches for an MCP secret_key or a database credential in code',
   !/\.\s*secret_key\b|\[['"]secret_key['"]\]|DATABASE_URL/.test(clubCode),
   (clubCode.match(/\.\s*secret_key|DATABASE_URL/gi) ?? []).slice(0, 3).join(','));
+const EXPECTED_CLUB_FILES = ['clubAuthorization.js', 'clubBoardValidator.js', 'clubBootstrap.js', 'clubNcbStore.js', 'clubSchema.js', 'index.js', 'ncbAccountClient.js'];
 check('14c. every club module is CommonJS, because the relay is loaded with require()',
   clubFiles.every((name) => !/^\s*(import|export)\s/m.test(fs.readFileSync(path.join(clubDir, name), 'utf8')))
-  && clubFiles.length === 6,
+  && clubFiles.length === EXPECTED_CLUB_FILES.length
+  && JSON.stringify(clubFiles) === JSON.stringify(EXPECTED_CLUB_FILES),
   clubFiles.join(','));
 // NodeSend's image copies named files, not the whole WORKDIR. A module the Dockerfile forgets
 // builds green and dies at container start, which is the worst time to discover an integration.
