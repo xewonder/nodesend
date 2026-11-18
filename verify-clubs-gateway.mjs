@@ -133,6 +133,22 @@ let failBoardCreateNumber = null;
 // How many consecutive club-data reads answer "no rows" while the rows exist, which is how a
 // read-back disagreement between write and verify is reproduced.
 let hideBoardReads = 0;
+// The columns each live table actually has, exactly as .env.example records them. The mock needs
+// this list because NCB treats an unrecognised query name as a COLUMN FILTER and fails the whole
+// read. Deriving the columns from the fixture rows instead would make an empty table answer
+// "unknown column" for a filter production accepts happily.
+const TABLE_COLUMNS = {
+  system_admins: ['id', 'user_id'],
+  clubs: ['id', 'name', 'active'],
+  club_memberships: ['id', 'user_id', 'club_id', 'role', 'status'],
+  club_board_collections: ['id', 'club_id', 'title', 'publication_status', 'created_by_user_id'],
+  club_collection_boards: ['id', 'collection_id', 'board_number', 'dealer', 'vulnerability', 'hands_json']
+};
+// Set to { table, fragment, status, body } to make the read of THAT table whose query matches THAT
+// fragment answer THAT response. Scoped by table AND query fragment on purpose: a knob that refused
+// every read of a table would trip the membership read that runs before the list read, and the arm
+// would then be measuring a different refusal than the one it names.
+let clubReadRefusal = null;
 
 const realFetch = globalThis.fetch;
 const json = (data, status = 200) => new Response(JSON.stringify(data), {
@@ -198,9 +214,21 @@ globalThis.fetch = async (url, init = {}) => {
     if (!rows) return ncbError(`unknown table ${table}`, 404);
 
     if (action === 'read') {
+      // THE LIVE READ GRAMMAR, measured against the proxy on 2026-11-18 instead of assumed:
+      // `limit`, `page`, `sort` and `order` are parameters, and EVERY OTHER QUERY NAME IS A COLUMN
+      // FILTER. An unrecognised one therefore lands in the WHERE clause and the whole read fails —
+      // `?offset=1` and `?boguscol=zqx` each answered HTTP 500 {status:"failed"} with zero rows.
+      // The mock used to list `offset` as ignorable, which is the ONLY reason the club list looked
+      // healthy in this harness while production served an empty list for a table that had rows.
+      const RESERVED = ['limit', 'page', 'sort', 'order', 'Instance'];
+      const columns = TABLE_COLUMNS[table];
+      if (clubReadRefusal && clubReadRefusal.table === table && clubReadRefusal.fragment.test(searchParams.toString())) {
+        return json(clubReadRefusal.body, clubReadRefusal.status);
+      }
       const filters = {};
       for (const [key, value] of searchParams.entries()) {
-        if (['limit', 'offset', 'sort', 'order', 'Instance'].includes(key)) continue;
+        if (RESERVED.includes(key)) continue;
+        if (!columns.includes(key)) return json({ status: 'failed', error: `unknown column in filter: ${key}` }, 500);
         filters[key] = value;
       }
       let found = rows.filter((row) => matches(row, filters));
@@ -208,9 +236,17 @@ globalThis.fetch = async (url, init = {}) => {
         hideBoardReads -= 1;
         found = [];
       }
+      const sortColumn = searchParams.get('sort');
+      if (sortColumn !== null) {
+        if (!columns.includes(sortColumn)) return json({ status: 'failed', error: `unknown column in sort: ${sortColumn}` }, 500);
+        const direction = searchParams.get('order') === 'desc' ? -1 : 1;
+        found = found.slice().sort((a, b) => direction * String(a[sortColumn] ?? '').localeCompare(String(b[sortColumn] ?? '')));
+      }
       const limit = Number(searchParams.get('limit'));
-      if (Number.isFinite(limit)) found = found.slice(0, limit);
-      return json({ status: 'success', data: found });
+      const size = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : found.length;
+      const page = Number(searchParams.get('page'));
+      const start = Number.isFinite(page) && page > 1 ? (Math.floor(page) - 1) * size : 0;
+      return json({ status: 'success', data: found.slice(start, start + size) });
     }
 
     if (action === 'create') {
@@ -1674,6 +1710,109 @@ const noAuthorColumn = clubSchemaConfig({
 check('18r. a collections mapping without created_by_user_id is refused at boot (item 4)',
   noAuthorColumn.ok === false && noAuthorColumn.problems.some((p) => /collections\.createdBy/.test(p)),
   JSON.stringify(noAuthorColumn.problems).slice(0, 170));
+
+// ── 19. a created club must be LISTABLE, and a refused list read must never look empty ─────────
+// The production P0: `POST /clubs` answered 200 with id 3 and `GET /clubs` answered 200 with `[]`.
+// Two separate defects made that pair possible, and they need different arms:
+//   (a) the list read paged with `offset=`, which the live NCB does not know — an unrecognised query
+//       name is taken for a column filter, so the read answered HTTP 500 {status:"failed"};
+//   (b) the store turned any refused read into `[]`, and the router maps an array payload straight
+//       to a 200 success — so a backend failure was served as "there are no clubs".
+// 19a-19c measure (a), 19e-19i measure (b), and 19d measures the mock itself, because a harness that
+// silently ignored the query string is exactly what let this ship while 209 arms were green.
+{
+  const clubsHeld = tables.clubs.splice(0, tables.clubs.length);
+  tables.clubs.push(
+    { id: '901', name: 'Zeta Test Club', active: 1 },
+    { id: '902', name: 'Eta Test Club', active: 1 },
+    { id: '903', name: 'Alpha Test Club', active: 0 }
+  );
+
+  const callsBeforeCreate = dataCalls.length;
+  const created = await ask('POST', '/clubs', { token: CALLER_TOKEN, body: { name: 'Iota Created Club' } });
+  const createdId = String(created.body?.data?.id ?? '');
+  const listAfterCreate = await ask('GET', '/clubs?limit=50', { token: CALLER_TOKEN });
+  const listedIds = (listAfterCreate.body?.data ?? []).map((row) => row.id);
+  check('19a. a club created by POST /clubs is returned by the next GET /clubs, with its id and active status',
+    created.status === 200 && listAfterCreate.status === 200
+    && listedIds.includes(createdId)
+    && (listAfterCreate.body.data ?? []).find((row) => row.id === createdId)?.status === 'active'
+    && (listAfterCreate.body.data ?? []).find((row) => row.id === createdId)?.name === 'Iota Created Club',
+    `${created.status}/${listAfterCreate.status} created=${createdId} listed=${JSON.stringify(listedIds)}`);
+
+  const clubCreates = dataCalls.slice(callsBeforeCreate)
+    .filter((row) => row.method === 'POST' && row.pathname.endsWith('/create/clubs'));
+  check('19b. that creation wrote exactly one clubs row, so the empty list was not a duplicate-or-retry artefact (item 6)',
+    clubCreates.length === 1 && tables.clubs.filter((row) => row.name === 'Iota Created Club').length === 1,
+    `createCalls=${clubCreates.length} rows=${tables.clubs.filter((row) => row.name === 'Iota Created Club').length}`);
+
+  const pageOne = await ask('GET', '/clubs?limit=1&page=1', { token: CALLER_TOKEN });
+  const pageTwo = await ask('GET', '/clubs?limit=1&page=2', { token: CALLER_TOKEN });
+  const pageBeyond = await ask('GET', '/clubs?limit=1&page=99', { token: CALLER_TOKEN });
+  check('19c. the list pages on the parameters NCB honours: consecutive pages differ and a page past the end is an empty success',
+    pageOne.status === 200 && pageTwo.status === 200 && pageBeyond.status === 200
+    && pageOne.body.data.length === 1 && pageTwo.body.data.length === 1
+    && pageOne.body.data[0].id !== pageTwo.body.data[0].id
+    && pageBeyond.body.data.length === 0,
+    `${pageOne.status}/${pageTwo.status}/${pageBeyond.status} ${JSON.stringify([pageOne.body.data, pageTwo.body.data, pageBeyond.body.data]).slice(0, 160)}`);
+
+  // CONTROL ON THE INSTRUMENT. Every arm above could pass vacuously against a mock that answers
+  // whatever it likes, so the mock's own fidelity is measured here, positive and negative together:
+  // the two query names the live proxy rejected must be rejected here too, and the parameter it
+  // honoured must still work.
+  const clubDataUrl = (qs) => `https://ncb.test.invalid/data/read/clubs?Instance=55954_bridgemind&${qs}`;
+  const clubDataHeaders = { Authorization: `Bearer ${CLUB_SESSION_TOKEN}` };
+  const offsetProbe = await fetch(clubDataUrl('limit=5&offset=1'), { headers: clubDataHeaders });
+  const offsetProbeBody = await offsetProbe.json().catch(() => ({}));
+  const bogusProbe = await fetch(clubDataUrl('limit=5&not_a_column=zqx'), { headers: clubDataHeaders });
+  const bogusProbeBody = await bogusProbe.json().catch(() => ({}));
+  const pageProbe = await fetch(clubDataUrl('limit=1&page=1&sort=name&order=asc'), { headers: clubDataHeaders });
+  const pageProbeBody = await pageProbe.json().catch(() => ({}));
+  check('19d. control: the mock rejects an unrecognised query name and an unknown column exactly as the live proxy does, while still honouring page/sort/order',
+    offsetProbe.status === 500 && offsetProbeBody.status === 'failed'
+    && bogusProbe.status === 500 && bogusProbeBody.status === 'failed'
+    && pageProbe.status === 200 && Array.isArray(pageProbeBody.data) && pageProbeBody.data.length === 1,
+    `offset=${offsetProbe.status}/${offsetProbeBody.status} bogus=${bogusProbe.status}/${bogusProbeBody.status} page=${pageProbe.status}/${pageProbeBody?.data?.length}`);
+
+  clubReadRefusal = { table: 'clubs', fragment: /(^|&)page=/, status: 500, body: { status: 'failed', error: 'Unknown column offset in where clause' } };
+  const refusedByBackend = await ask('GET', '/clubs?limit=10', { token: CALLER_TOKEN });
+  clubReadRefusal = null;
+  check('19e. a club-list read the backend REFUSES answers 503 with the account reason, never a 200 carrying an empty list',
+    refusedByBackend.status === 503 && refusedByBackend.body.error === 'club_account_request_failed',
+    `${refusedByBackend.status} ${refusedByBackend.text.slice(0, 140)}`);
+
+  clubReadRefusal = { table: 'clubs', fragment: /(^|&)page=/, status: 200, body: { status: 'success', data: null } };
+  const notARowSet = await ask('GET', '/clubs?limit=10', { token: CALLER_TOKEN });
+  clubReadRefusal = null;
+  check('19f. a 200 whose body is not a row set is the same refusal (club_read_unreadable), because an unexpected payload is not an empty table',
+    notARowSet.status === 503 && notARowSet.body.error === 'club_read_unreadable',
+    `${notARowSet.status} ${notARowSet.text.slice(0, 140)}`);
+
+  // POSITIVE CONTROLS, one per refusal arm: without the knob the same call is a normal 200, and an
+  // actually-empty table is still an empty success. A fail-closed rule with no positive control
+  // silently turns every legitimate answer into a 503 and the suite stays green.
+  const restoredList = await ask('GET', '/clubs?limit=50', { token: CALLER_TOKEN });
+  check('19g. positive control: with the refusal removed, the same list call is a 200 with all four rows',
+    restoredList.status === 200 && Array.isArray(restoredList.body.data) && restoredList.body.data.length === 4
+    && ['901', '902', '903', createdId].every((id) => restoredList.body.data.some((row) => row.id === id)),
+    `${restoredList.status} ${JSON.stringify(restoredList.body.data?.map?.((row) => row.id))}`);
+
+  const emptyHeld = tables.clubs.splice(0, tables.clubs.length);
+  const genuinelyEmpty = await ask('GET', '/clubs?limit=10', { token: CALLER_TOKEN });
+  check('19h. and a genuinely empty clubs table still answers 200 with an empty list, so fail-closed did not become fail-always',
+    genuinelyEmpty.status === 200 && Array.isArray(genuinelyEmpty.body.data) && genuinelyEmpty.body.data.length === 0,
+    `${genuinelyEmpty.status} ${genuinelyEmpty.text.slice(0, 140)}`);
+  tables.clubs.push(...emptyHeld);
+
+  clubReadRefusal = { table: 'club_memberships', fragment: /(^|&)club_id=/, status: 500, body: { status: 'failed', error: 'read refused' } };
+  const membersRefused = await ask('GET', '/clubs/901/members', { token: CALLER_TOKEN });
+  clubReadRefusal = null;
+  check('19i. the rule holds for the member list too: a refused roster read is a 503, not an empty roster that looks like nobody joined',
+    membersRefused.status === 503 && membersRefused.body.error === 'club_account_request_failed',
+    `${membersRefused.status} ${membersRefused.text.slice(0, 140)}`);
+
+  tables.clubs.splice(0, tables.clubs.length, ...clubsHeld);
+}
 
 // ── 16. the one-time super-admin bootstrap ───────────────────────────────────
 // The bootstrap is the only code path in NodeSend that WRITES system_admins, i.e. the only place a

@@ -107,6 +107,28 @@ function createClubNcbStore({ client, schema }) {
     return result.ok ? rowsOf(result.body) : null;
   }
 
+  /**
+   * The same read as `find()`, for the methods whose caller would be told a LIE by an empty array.
+   *
+   * `find()` collapses "the backend refused" and "the table is empty" into null-vs-[] only weakly:
+   * it returns null for both a transport failure and a non-row-set body, and every list method that
+   * wrote `Array.isArray(rows) ? rows : []` turned that null into a successful empty list. On
+   * `GET /clubs` that is how a created club disappeared: NCB answered the paginated read HTTP 500
+   * `{status:"failed"}` (see `listClubs`), the store reported zero clubs, and the router — which
+   * maps a payload array straight to 200 — served `{"status":"success","data":[]}`.
+   *
+   * So a list read that could not be made returns an in-band refusal, and the router answers 503.
+   * `readSystemAdmins()` already did this for the authority table; this is the same rule applied to
+   * the reads that face a user.
+   */
+  async function rowsOrRefusal(table, query) {
+    const result = await run(READ(table, query));
+    if (!result.ok) return { refusal: result.reason || 'club_account_request_failed', detail: result.detail };
+    const rows = rowsOf(result.body);
+    if (rows === null) return { refusal: 'club_read_unreadable', detail: 'the club read returned a body that is not a row set' };
+    return { rows };
+  }
+
   async function one(table, query) {
     // `query` arrives as a bare filter (`id=7`) and READ() adds the `?`, so the separator here is
     // always `&`. Getting this wrong yields `id=7limit=1`, which reads as "no row" and would make
@@ -202,11 +224,21 @@ function createClubNcbStore({ client, schema }) {
    * NCB's read filter is an exact match, not a substring, so `search` is applied to the rows this
    * page returned. That means a search can report fewer clubs than exist rather than more — it can
    * never reveal a club the caller may not see, which is the only direction that would matter here.
+   *
+   * PAGINATION IS `page`, 1-BASED, NOT `offset`. Measured against the live proxy on 2026-11-18:
+   * `limit`, `page`, `sort` and `order` are honoured (`page=999&limit=1` returns zero rows), while
+   * any other query name is taken for a COLUMN filter — `offset=1` fails the read with HTTP 500
+   * `{status:"failed"}`, exactly like a filter on a column that does not exist. Every working read in
+   * this deployment already spells it this way (`BridgeMind src/services/adminExportService.js`
+   * builds `sort/order/page/limit`), and the club list was the only read that did not, which is why
+   * `POST /clubs` could succeed while `GET /clubs` answered an empty list.
    */
   async function listClubs({ search = '', page = 1, limit = 25 } = {}) {
     const size = Math.min(Number(limit) || 25, schema.rowLimit);
-    const rows = await find(T.clubs, `limit=${size}&offset=${(Math.max(1, Number(page) || 1) - 1) * size}&sort=${C.clubs.name}&order=asc`);
-    const shaped = (Array.isArray(rows) ? rows : []).map((row) => ({
+    const found = await rowsOrRefusal(T.clubs,
+      `limit=${size}&page=${Math.max(1, Number(page) || 1)}&sort=${C.clubs.name}&order=asc`);
+    if (found.refusal) return { error: found.refusal, detail: found.detail };
+    const shaped = found.rows.map((row) => ({
       id: eq(row[C.clubs.id]),
       name: eq(row[C.clubs.name]),
       // Decoded, so the admin screen and the authorization rule see the same domain value.
@@ -220,8 +252,9 @@ function createClubNcbStore({ client, schema }) {
     // The FILTER is encoded too. A query of `active=active` matches no row and would return an
     // empty club picker that looks like a legitimately empty database.
     const activeRaw = schema.clubStatus.encode(CLUB_ACTIVE);
-    const rows = await find(T.clubs, `${C.clubs.status}=${encodeURIComponent(activeRaw)}&limit=${schema.rowLimit}`);
-    return (Array.isArray(rows) ? rows : [])
+    const found = await rowsOrRefusal(T.clubs, `${C.clubs.status}=${encodeURIComponent(activeRaw)}&limit=${schema.rowLimit}`);
+    if (found.refusal) return { error: found.refusal, detail: found.detail };
+    return found.rows
       .filter((row) => schema.clubStatus.decode(row[C.clubs.status]) === CLUB_ACTIVE)
       .map((row) => ({ id: eq(row[C.clubs.id]), name: eq(row[C.clubs.name]) }));
   }
@@ -258,11 +291,12 @@ function createClubNcbStore({ client, schema }) {
   }
 
   async function listMembers({ clubId }) {
-    const rows = await find(T.memberships, `${C.memberships.clubId}=${encodeURIComponent(clubId)}&limit=${schema.rowLimit}`);
+    const found = await rowsOrRefusal(T.memberships, `${C.memberships.clubId}=${encodeURIComponent(clubId)}&limit=${schema.rowLimit}`);
+    if (found.refusal) return { error: found.refusal, detail: found.detail };
     // `status` rides along so a club admin sees the pending requests they are being asked to act on
     // through the SAME read that lists members. A separate requests endpoint would be a second
     // surface deciding the same thing.
-    return (Array.isArray(rows) ? rows : []).map((row) => ({
+    return found.rows.map((row) => ({
       user_id: eq(row[C.memberships.userId]),
       club_role: eq(row[C.memberships.role]),
       membership_status: eq(row[C.memberships.status]),
@@ -414,17 +448,19 @@ function createClubNcbStore({ client, schema }) {
   }
 
   async function listCollections({ clubId }) {
-    const rows = await find(T.collections, `${C.collections.clubId}=${encodeURIComponent(clubId)}&limit=${schema.rowLimit}`);
-    return (Array.isArray(rows) ? rows : []).map(shapeCollection);
+    const found = await rowsOrRefusal(T.collections, `${C.collections.clubId}=${encodeURIComponent(clubId)}&limit=${schema.rowLimit}`);
+    if (found.refusal) return { error: found.refusal, detail: found.detail };
+    return found.rows.map(shapeCollection);
   }
 
   // Scope is re-asserted on the row itself, not trusted to the query filter: this is the read that
   // decides whether a member may see a board, so a filter the backend ignored must not become a
   // cross-club read.
   async function listPublishedCollections({ clubId }) {
-    const rows = await find(T.collections,
+    const found = await rowsOrRefusal(T.collections,
       `${C.collections.clubId}=${encodeURIComponent(clubId)}&${C.collections.status}=published&limit=${schema.rowLimit}`);
-    return (Array.isArray(rows) ? rows : [])
+    if (found.refusal) return { error: found.refusal, detail: found.detail };
+    return found.rows
       .filter((row) => eq(row[C.collections.clubId]) === eq(clubId) && eq(row[C.collections.status]) === 'published')
       .map((row) => ({ id: eq(row[C.collections.id]), name: eq(row[C.collections.name]), status: 'published' }));
   }

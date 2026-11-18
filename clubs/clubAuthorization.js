@@ -396,7 +396,11 @@ const STORE_ERROR_STATUS = {
   import_incomplete: 422, import_unverified: 422, publish_refused_unverified: 422,
   invalid_board_record: 422,
   club_scope_mismatch: 403, not_a_club_admin: 403, super_admin_required: 403,
-  collection_not_found: 404, board_not_found: 404, not_found: 404, bad_request: 400, write_unverified: 502
+  collection_not_found: 404, board_not_found: 404, not_found: 404, bad_request: 400, write_unverified: 502,
+  // A club list read that came back as something other than a row set. 503, because "the storage
+  // could not be read" is the only honest answer: as a 200 with `data: []` it is indistinguishable
+  // from an empty table, which is how a successfully created club vanished from the admin screen.
+  club_read_unreadable: 503
 };
 
 function respondStoreResult(res, payload) {
