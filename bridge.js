@@ -60,13 +60,31 @@ const crypto = require("crypto");
 // account client and the storage adapter can be read and tested without wading through the relay.
 // bridge.js contributes one thing this file cannot: its own session resolver.
 const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs");
+const { buildNcbGateway, createCorsResolver } = require("./ncb/gateway");
+const { createNcbSessionAuthority, looksSealed } = require("./ncb/sessionAuthority.js");
+const { createNcbNativeClient } = require("./ncb/nativeClient.js");
+// One definition of "which transport, and is it configured enough to use", shared with the club
+// account client: two answers to that question is how a deployment ends up sending a browser's
+// credential to one backend and a service account's to another.
+const { readTransport } = require("./clubs/ncbNativeAccountClient.js");
 
 const app = express();
 // `x-quota-reservation` is exposed so a browser can read whether its call was charged or
 // deduplicated. allowedHeaders is deliberately NOT narrowed: cors() reflects whatever the
 // preflight asks about, which is what lets a caller send `x-ai-decision-key` at all, and
 // listing a fixed set here would break any client that sends a header this file doesn't know.
-app.use(cors({ exposedHeaders: ["X-Request-Id", "Server-Timing", "x-quota-reservation"] }));
+//
+// The origin argument is new, and it is a pass-through for every path except /ncb: `ncbCors`
+// returns the option object exactly as it was for anything that is not the player gateway, and
+// narrows only the /ncb namespace to the named NCB_GATEWAY_ALLOWED_ORIGINS list. It has to happen
+// here rather than inside the gateway router because cors() is mounted first, answers every
+// preflight itself, and writes Access-Control-Allow-Origin on the way out — a router further down
+// can refuse a request but cannot remove a header this call already set. See ncb/gateway.js
+// (`createCorsResolver`). The namespace is spelled without a trailing star here on purpose: a
+// forward-slash-star sequence inside a line comment reads as a block comment to any tool that
+// strips comments mechanically, and one of the release gates does exactly that to this file.
+const EXPOSED_CORS_HEADERS = ["X-Request-Id", "Server-Timing", "x-quota-reservation"];
+app.use(cors(createCorsResolver({ env: process.env, exposedHeaders: EXPOSED_CORS_HEADERS })));
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = Number(process.env.PORT || 3001);
@@ -112,6 +130,49 @@ const NCB_PROXY_BASE = String(process.env.NCB_PROXY_BASE ||
   "https://rmvzorxcl35mttidiexhtp5g2m0hpsqo.lambda-url.us-east-2.on.aws").trim();
 const NCB_INSTANCE = String(process.env.NCB_INSTANCE || "55954_bridgemind").trim();
 const NCB_TIMEOUT_MS = boundedInt(process.env.NODESEND_NCB_TIMEOUT_MS, 8000, 500, 30000);
+
+/* THE CALLER TRANSPORT, and it has two shapes because the vendor has two credential channels.
+
+   `proxy` (the default, and the one every route here was built against): the AWS gateway took the
+   browser's `Authorization: Bearer <token>` and held the NCB session behind it. That service is dead
+   — 403 on every path — but the code path stays until the replacement is proven in production, which
+   is why it is still the default and not a deletion.
+
+   `native`: the browser holds a NodeSend SEALED handle. `resolveSessionUser` opens it, asks NCB
+   `get-session` with the wrapped cookie, and puts the result on `req.ncbCaller`. From then on every
+   data call this process makes FOR THAT REQUEST carries that player's own cookie and NO Authorization
+   header — which is what keeps the vendor's per-user row scoping real, because the alternative is the
+   database secret, a credential that sees every row and therefore authorises nothing.
+
+   The two never mix on one request: a sealed caller is only ever served natively, and an unsealed one
+   only ever goes to the proxy. There is no code path in which a browser-supplied value is placed in
+   the secret slot. */
+const NCB_TRANSPORT = readTransport(process.env);
+const ncbNative = createNcbNativeClient({ env: process.env, timeoutMs: NCB_TIMEOUT_MS });
+const ncbAuthority = createNcbSessionAuthority({
+  env: process.env,
+  // Resolved at call time rather than captured: a harness that replaces the logger after loading
+  // this module must see its own, or the leak assertions test a function nothing calls.
+  log: (name, data) => safeEvent(name, data)
+});
+
+/**
+ * The transport state, for `/` and `/health`. Deliberately three facts and nothing else: which
+ * transport is live, whether the native bases are usable, and whether a browser credential can be
+ * verified at all. No URL (a published base is a map of the internal hop), no table, no secret, and
+ * no cookie — `/health` is unauthenticated, as every other route in this relay assumes.
+ */
+function ncbTransportHealth() {
+  return {
+    transport: NCB_TRANSPORT.transport,
+    nativeBasesUsable: NCB_TRANSPORT.transport === 'native' ? !NCB_TRANSPORT.reason : null,
+    reason: NCB_TRANSPORT.reason ?? null,
+    // Whether THIS process can mint and open the credential a browser holds. False is a deployment
+    // fault with a named cause, not a player being signed out.
+    sealedSessions: ncbAuthority.configured,
+    sealedSessionsReason: ncbAuthority.reason
+  };
+}
 
 const ALIBABA_ALLOWED_HOSTS = String(process.env.ALIBABA_ALLOWED_HOSTS || "")
   .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -167,6 +228,27 @@ function getBearerToken(req) {
 // the counting is only correct while this process is the only one doing it: every call is
 // authorised as the caller, so a request that never arrives cannot be counted.
 async function ncbRequest(req, path, options = {}) {
+  // A caller whose identity was proven through a sealed handle is served natively, as themselves.
+  // `req.ncbCaller` is set only by `resolveSessionUser`, from NCB's own `get-session` answer, so
+  // there is no path by which a request body or a header can install one.
+  //
+  // The path is passed through unchanged. Every call site already spells the verb into it
+  // (`/data/read/ai_quota_usage?...`), and `dataPath` parses that form — rebuilding the path from
+  // `options.method` here would produce `/data/read/read/...` and turn a working quota read into a
+  // 404 on a table named `read`.
+  if (req && req.ncbCaller && req.ncbCaller.cookie && String(path).startsWith("/data/")) {
+    return await ncbNative.dataPath(path, {
+      cookie: req.ncbCaller.cookie,
+      body: options.body === undefined ? undefined : safeJsonParse(options.body, options.body)
+    });
+  }
+  // No proven sealed caller on a `native` deployment: refuse rather than send somebody's bearer to
+  // the AWS proxy. Reaching this line means a route forgot `requireBridgeSession`, and the answer it
+  // must give is a transport fault it can report, not a request to a service that no longer exists.
+  if (NCB_TRANSPORT.transport === "native") {
+    safeEvent("ncb_native_caller_absent", { path: String(path).split("?")[0] });
+    return { ok: false, status: 0, json: async () => null, kind: "caller_unauthenticated" };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NCB_TIMEOUT_MS);
   timer.unref?.();
@@ -185,11 +267,47 @@ async function ncbRequest(req, path, options = {}) {
   }
 }
 
+// `JSON.stringify` at the call sites, `parse` here: the native transport takes an object and the
+// proxy transport takes the string it was given, and a re-serialization failure must not become a
+// silently empty body on either side.
+function safeJsonParse(value, fallback) {
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
 // Resolves the owner of the presented session. The token itself is never
 // logged, and a user_id in the request body is never consulted.
 async function resolveSessionUser(req) {
-  if (!getBearerToken(req)) {
+  const presented = getBearerToken(req);
+  if (!presented) {
     return { ok: false, status: 401, code: "auth_error", error: "Authentication required" };
+  }
+  // THE SEALED HANDLE, which is what this relay issues and what a browser holds after signing in
+  // through the gateway's auth routes. The identity is whatever NCB's own `get-session` answers for
+  // the cookie inside the handle — never the copy the handle carries, and never a `user_id` in a body.
+  if (looksSealed(presented)) {
+    const resolved = await ncbAuthority.resolve(presented);
+    if (!resolved.ok) {
+      return {
+        ok: false, status: resolved.status, code: resolved.code, reason: resolved.reason,
+        error: resolved.status === 503 ? "Session could not be verified" : "Authentication required"
+      };
+    }
+    // Carried on the request so the data calls for THIS request are made as this player. Nothing
+    // downstream re-derives the identity, and nothing here returns the cookie to a caller.
+    req.ncbCaller = { userId: resolved.userId, role: resolved.role, cookie: resolved.cookie };
+    return { ok: true, userId: resolved.userId, role: resolved.role, via: "sealed_handle" };
+  }
+  // A deployment that has declared itself `native` does not dial the AWS proxy at all — not even to
+  // fail. Anything that is not a sealed handle is therefore a credential this relay does not accept,
+  // which is an honest 401: it heals on the next sign-in, and it can never be mistaken for an outage.
+  // Under the default `proxy` transport the legacy path below is untouched, so a deployment that has
+  // not switched over behaves exactly as it does today.
+  if (NCB_TRANSPORT.transport === "native") {
+    safeEvent("session_credential_unsupported", { kind: "not_a_sealed_handle" });
+    return {
+      ok: false, status: 401, code: "auth_error", reason: "unsupported_credential",
+      error: "Authentication required"
+    };
   }
   let response;
   try {
@@ -203,8 +321,25 @@ async function resolveSessionUser(req) {
     };
   }
   const body = await response.json().catch(() => ({}));
-  const user = response.ok ? (body?.data?.user || body?.user || null) : null;
+  // THE STATUS IS THE ANSWER, NOT THE TOKEN. This function used to treat "the authority answered
+  // anything other than 2xx" as "this session is invalid", which is a 401 — and a 401 tells the client
+  // to throw away a working login. When the Lambda gateway went dark and answered 403 to every path,
+  // that converted an outage into a mass sign-out for players who were fine. A refused or failed
+  // authority is UNVERIFIABLE, which is 503; only a genuine 401 from the authority means "signed out".
+  if (response.status === 401) {
+    return { ok: false, status: 401, code: "auth_error", error: "Authentication required" };
+  }
+  if (!response.ok) {
+    safeEvent("session_authority_refused", { status: response.status });
+    return {
+      ok: false, status: 503, code: "session_service_unavailable",
+      error: "Session could not be verified"
+    };
+  }
+  const user = body?.data?.user || body?.user || null;
   if (!user?.id) {
+    // A 2xx that names no user is an invalid session, not an outage: the authority answered and said
+    // "nobody", which is exactly what a signed-out get-session does.
     return { ok: false, status: 401, code: "auth_error", error: "Authentication required" };
   }
   return { ok: true, userId: String(user.id), role: String(user.role || "") };
@@ -1752,7 +1887,8 @@ const invitationBuckets = new Map();
 /* A read with NO credential of any kind. Deliberately its own helper rather than a flag on
    `ncbRequest`: the bearer-carrying transport is pinned by the gates as the only path that
    can present the caller's session, and an anonymous public read must not look like, or be
-   able to become, a credentialed one. */
+   able to become, a credentialed one. Untouched, because it is the AWS-era contract and the gates
+   assert it; the native alternative is `invitationCodeRead`, chosen below. */
 async function ncbPublicRead(path) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NCB_TIMEOUT_MS);
@@ -1814,14 +1950,54 @@ function invitationRateHit(ip) {
   return Math.max(1, Math.ceil((INVITATION_RATE_WINDOW_MS - (now - entry.startedAt)) / 1000));
 }
 
+/* THE INVITATION READ, and the only place that decides which transport it travels on.
+
+   Under `proxy` this is the anonymous public read the AWS gateway served. Under `native` there is
+   nothing to be anonymous about — the vendor host serves no public family (four candidate paths, each
+   an HTML 404) — so the lookup is made on the relay's own club service account: a real NCB session,
+   with that account's own row scope, and never the database secret. `readClubAccountConfig` supplies
+   it; if the account is not configured the answer is a named 503 rather than a guess.
+
+   The shape it returns is the same vendor envelope `ncbPublicRead` produced, so the predicate in
+   `findUsableInvitationRow` — exact code match, unused flag, duplicates refused — is preserved
+   verbatim rather than rewritten around the new transport. */
+async function invitationRowRead({ code = "", id = "" } = {}) {
+  const filterName = code ? "code" : "id";
+  const filterValue = code ? String(code) : String(id);
+  if (!filterValue) return { ok: false, reason: "invitation_service_unavailable" };
+  const query = `${filterName}=${encodeURIComponent(filterValue)}`;
+  if (NCB_TRANSPORT.transport !== "native") {
+    return ncbPublicRead(`/public-data/read/${USER_CODES_TABLE}?${query}`);
+  }
+  const account = clubMount && clubMount.account;
+  if (!account || account.configured !== true) {
+    safeEvent("invitation_reader_unconfigured", {});
+    return { ok: false, reason: "invitation_service_unavailable" };
+  }
+  const read = await account.request({
+    group: "data", path: `read/${USER_CODES_TABLE}`, query, method: "GET"
+  });
+  if (!read || read.ok !== true) {
+    // The reason is this relay's own vocabulary, never the upstream body: an NCB error can echo what
+    // it was sent, and what it was sent is a live invitation code.
+    safeEvent("invitation_reader_refused", { reason: read?.reason || "read_failed" });
+    return { ok: false, reason: "invitation_service_unavailable" };
+  }
+  const rows = Array.isArray(read.body?.data) ? read.body.data : null;
+  if (rows === null) return { ok: false, reason: "invitation_service_unavailable" };
+  return { ok: true, payload: { data: rows } };
+}
+
+async function invitationCodeRead(code) {
+  return invitationRowRead({ code });
+}
+
 /* Rows are matched on the EXACT code the caller typed and an unused flag, which is the
    predicate `Login.jsx` used; `?code=` filtering at NCB is a substring-free equality
    filter, but the comparison is re-done here so a filter change upstream cannot quietly
    turn the check into "somebody else's code matched". */
 async function findUsableInvitationRow(req, code) {
-  const read = await ncbPublicRead(
-    `/public-data/read/${USER_CODES_TABLE}?code=${encodeURIComponent(code)}`
-  );
+  const read = await invitationCodeRead(code);
   if (!read.ok) return { ok: false, reason: read.reason };
   const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
   const matches = rows.filter((row) => String(row?.code ?? "") === code && !Number(row?.used ?? 0));
@@ -2412,6 +2588,11 @@ app.get("/", (req, res) => res.json({
     invitationValidate: "POST /auth/validate-invitation",
     invitationConsume: "POST /auth/consume-invitation",
     quota: "GET|POST /quota",
+    // The player gateway, named as a family rather than route by route: the browser's own transport
+    // (`src/api.js`) builds `/auth/…` and `/data/…` under this prefix, so an operator verifying the
+    // migration needs to see that the family is served here at all. `GET /health` carries its exact
+    // route and table counts.
+    playerGateway: "POST /ncb/auth/sign-in/email|sign-up/email|sign-out|change-password, GET /ncb/auth/get-session, GET|POST|PUT|DELETE /ncb/data/{read,create,update,delete}/:table[/:id], GET /ncb/public-data/read/user_codes, GET /ncb/whoami",
     // Named so an operator can see the surface exists. The club routes are unprefixed like every
     // other route here — the browser-side transport strips the `/api` prefix it uses against the
     // local Express server, so the two applications agree on `/clubs/...` and `/me/club/...`.
@@ -2436,6 +2617,10 @@ app.get("/", (req, res) => res.json({
   },
   trickster: { auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
   quota: quotaLedgerState(),
+  // WHICH NCB TRANSPORT IS LIVE, because it is the fact an operator needs before touching the
+  // frontend's base URL: under `proxy` a browser bearer still goes to the AWS gateway, under `native`
+  // only a sealed handle is accepted at all and nothing is sent there. No URL, no table, no secret.
+  ncb: ncbTransportHealth(),
   providers: ["alibaba", "openai"]
 }));
 
@@ -2466,6 +2651,18 @@ app.get("/health", (req, res) => res.json({
   // `configured:true, sessionActive:false` means a sign-in is not currently held (a live fact).
   // No credential, email, table name or row ever appears here.
   clubs: clubHealth(clubMount),
+  // The player gateway reports what an operator actually needs to page on: whether it can mint a
+  // session handle at all, and how wide it is allowed to be. Counts and booleans only — no origin,
+  // no table name, no key, and never the upstream cookie or a sealed handle.
+  // `configured:false` with reason `ncb_session_seal_key_unconfigured` is a deployment fact (every
+  // /ncb route then answers 503 rather than minting a forgeable handle), which is why it is reported
+  // apart from the live-failure fields above it.
+  ncbGateway: ncbMount.health(),
+  // Which NCB transport this process dials. `proxy` means browser bearers still go to the AWS gateway
+  // (dead) and the frontend must not yet hold sealed handles; `native` means only a sealed handle is
+  // accepted and nothing at all is sent to the proxy. The frontend's base URL should be switched to
+  // match this value, and this is the field that proves it.
+  ncb: ncbTransportHealth(),
   providers: { alibaba: true, openai: true }
 }));
 
@@ -2818,7 +3015,30 @@ const clubMount = buildClubMount({
 });
 app.use(clubMount.router);
 
+/* The player gateway that replaces the dead Quest/AWS Lambda. Built once, at boot, from the
+   environment, exactly like the club mount above it.
+   Ordering matters and is not stylistic: these routes are mounted last, after the relay's own
+   `cors()` and `express.json()` and after every existing surface, so nothing here can change what
+   any AI, quota, Trickster, multiplayer or Clubs route answers to a browser on any origin it accepts
+   today. The one exception is deliberate and lives at the top of this file: `createCorsResolver`
+   narrows the CORS answer for the /ncb namespace alone, because cors writes its headers before any
+   router runs. */
+const ncbMount = buildNcbGateway({
+  env: process.env,
+  log: safeEvent,
+  // The one anonymous read the app performs, and the only credential that can serve it natively is
+  // the club service account's own session. `user_codes` and nothing else; the projection is inside
+  // the gateway, so a column added to that table later cannot leak through here by accident.
+  guestRead: async ({ table, code, id }) => {
+    if (table !== USER_CODES_TABLE) return { ok: false, reason: "table_not_allowed" };
+    const read = await invitationRowRead({ code, id });
+    return read.ok ? { ok: true, rows: read.payload?.data ?? [] } : { ok: false, reason: read.reason };
+  }
+});
+app.use(ncbMount.router);
+
 app.use((req, res) => res.status(404).json({ success: false, error: "Endpoint not found" }));
+
 
 if (require.main === module) {
   app.listen(PORT, "0.0.0.0", () => {
@@ -2831,7 +3051,21 @@ if (require.main === module) {
       ...quotaLedgerFields(),
       // Printed at boot because "club storage is inert" must be visible to whoever starts the
       // container, not discovered by a player being told they have no club.
-      clubs: describeClubStoreState()
+      clubs: describeClubStoreState(),
+      // Which transport the container came up on, said out loud: a deployment that means to be
+      // native and forgot the variable looks identical to a working one from the outside, and the
+      // first symptom is players being told to sign in forever.
+      ncbTransport: NCB_TRANSPORT.transport === 'native'
+        ? (NCB_TRANSPORT.reason
+          ? `native INCOMPLETE — ${NCB_TRANSPORT.reason}: ${NCB_TRANSPORT.detail}`
+          : 'native (sealed player sessions; the AWS proxy is not dialled)')
+        : 'proxy (browser bearers go to NCB_PROXY_BASE)',
+      // Same reasoning for the player gateway, with one addition that matters more: a missing seal
+      // key is silent at runtime (every /ncb route answers 503, which looks like an upstream problem)
+      // and is a one-line fix at deploy, so it has to be said out loud when the container starts.
+      ncbGateway: ncbMount.configured
+        ? `player gateway ACTIVE (${ncbMount.health().routes} routes, stateless sealed sessions)`
+        : `player gateway INACTIVE — ${ncbMount.reason}`
     });
   });
   // No quota probe at boot, deliberately. Every quota decision is made as the caller, with
@@ -2889,7 +3123,7 @@ module.exports = {
   AI_CREDENTIALS_TABLE, AI_CREDENTIAL_USAGE_SCOPES, normalizeUsageScope,
   credentialMetadata, listOwnCredentialsDecision, saveOwnCredentialDecision,
   deleteOwnCredentialDecision, resolveStoredCredential, resolveRequestApiKey,
-  encryptProviderApiKeyLocal, storedValueIsCiphertext, buildNcbPublicUrl,
+  encryptProviderApiKeyLocal, storedValueIsCiphertext, buildNcbPublicUrl,
   // The Trickster gateway's own rules, exported so the harness can test the real
   // predicates instead of a copy of them. The routes themselves are exercised over
   // HTTP through `app`, which is what proves the session guard is attached.
@@ -2909,5 +3143,22 @@ module.exports = {
   clubAccountConfig: require("./clubs/ncbAccountClient.js").readClubAccountConfig,
   clubSchemaConfig: require("./clubs/clubSchema.js").readClubSchemaConfig,
   createClubNcbStore: require("./clubs/clubNcbStore.js").createClubNcbStore,
-  createNcbAccountClient: require("./clubs/ncbAccountClient.js").createNcbAccountClient
+  createNcbAccountClient: require("./clubs/ncbAccountClient.js").createNcbAccountClient,
+  // The player gateway: the live mount these routes serve, the builder the gate reboots with a
+  // different environment, and the two primitives whose rules the gate has to be tested against
+  // rather than re-implemented. Exported for the same reason every other predicate here is — the
+  // harness must exercise what actually ships, not a copy of it.
+  ncbMount, buildNcbGateway,
+  ncbSeal: require("./ncb/sessionSeal.js").createSessionSeal,
+  ncbNativeClient: require("./ncb/nativeClient.js").createNcbNativeClient,
+  // The upstream-refusal status table, exported so the gate asserts the mapping the relay actually
+  // uses rather than a copy of it that could drift.
+  ncbAuthUpstreamStatus: require("./ncb/gateway.js").authUpstreamStatus,
+  // The authority that turns a sealed handle into a proven NCB identity, and the transport decision
+  // that decides whether it is consulted at all. Exported because the gates must assert the SHIPPED
+  // behaviour — a harness that rebuilt either of these locally would be testing a copy.
+  ncbSessionAuthority: require("./ncb/sessionAuthority.js").createNcbSessionAuthority,
+  ncbTransportHealth, ncbNativeTransport: NCB_TRANSPORT,
+  ncbGatewayTables: require("./ncb/gateway.js").DEFAULT_TABLES,
+  ncbGatewayClubTables: require("./ncb/gateway.js").NEVER_THROUGH_THE_GATEWAY
 };

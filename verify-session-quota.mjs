@@ -2018,7 +2018,11 @@ check('there is one NCB transport, still three call sites, and user_settings is 
   `awaits=${sourceAwaits} (expected 3: session, read, write) sourceReadOnly=${/quotaRead\(req,\s*`\/data\/read\/\$\{USER_SETTINGS_TABLE\}/.test(codeOnly)}`);
 check('no NCB service credential exists or is invented',
   !/NCB_SERVICE_TOKEN|NCB_ADMIN_TOKEN|NCB_API_KEY|NCB_BEARER|QUOTA_DATABASE_URL|DATABASE_URL/.test(codeOnly)
-  && [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].sort().join(',') === 'NCB_INSTANCE,NCB_PROXY_BASE,NCB_TIMEOUT_MS',
+  // NCB_TRANSPORT is a selector between two transports ('proxy' | 'native') and carries no secret.
+  // It is listed rather than tolerated: the assertion that matters is that NOTHING named NCB_* in
+  // this relay is a credential, and a new variable that could be one would have to be added here and
+  // then survive the deny-list on the line above.
+  && [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].sort().join(',') === 'NCB_INSTANCE,NCB_PROXY_BASE,NCB_TIMEOUT_MS,NCB_TRANSPORT',
   [...new Set(codeOnly.match(/NCB_[A-Z_]+/g) || [])].join(','));
 // Exactly two bearer expressions in the whole file: the caller's own session token, and the
 // provider key the caller supplied. Anything else would be a credential this relay holds.

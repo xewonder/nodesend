@@ -35,6 +35,10 @@
  */
 
 const SIGN_IN_PATH = 'sign-in/email';
+// The native (cookie-carrying) implementation of the same account, selected by NCB_TRANSPORT below.
+// One direction only: ncbNativeAccountClient.js requires nothing from this file, so there is no
+// load-order cycle between the two transports of one feature.
+const { createNativeAccountClient, readTransport } = require('./ncbNativeAccountClient.js');
 const GET_SESSION_PATH = 'get-session';
 const SIGN_OUT_PATH = 'sign-out';
 const REQUEST_TIMEOUT_MS = 12000;
@@ -121,6 +125,49 @@ function readClubAccountConfig(env = {}) {
  * @param {Function} [options.now]
  */
 function createNcbAccountClient({ env = process.env, fetchImpl = null, now = Date.now } = {}) {
+  // The transport decision comes first, because it is a safety property rather than a preference:
+  // `native` means the club account authenticates against `NCB_AUTH_API_URL` and is carried by the
+  // vendor's own session cookie, which is the only shape the live host accepts. `proxy` (the default)
+  // keeps the AWS-era protocol byte-for-byte so a deployment that has not proven the native path
+  // changes nothing. A half-configured native deployment fails CLOSED and says which variable is
+  // missing — falling back to the dead proxy because a URL was left out is how an outage gets
+  // misdiagnosed as a code fault.
+  const transport = readTransport(env);
+  if (transport.transport === 'native') {
+    const account = readClubAccountConfig(env);
+    if (!account.ok) {
+      const unavailable = { ok: false, reason: account.reason, detail: account.detail };
+      return {
+        unavailable,
+        configured: false,
+        async request() { return { ok: false, reason: account.reason, detail: account.detail }; },
+        async getSession() { return { ok: false, reason: account.reason, detail: account.detail }; },
+        async signOut() { return { ok: true, reason: null, detail: 'not configured; nothing to sign out' }; },
+        status() { return { configured: false, reason: account.reason, sessionActive: false, identityVerified: false, cooldownUntil: 0, transport: 'native' }; }
+      };
+    }
+    if (transport.reason) {
+      return {
+        unavailable: { ok: false, reason: transport.reason, detail: transport.detail },
+        configured: false,
+        async request() { return { ok: false, reason: transport.reason, detail: transport.detail }; },
+        async getSession() { return { ok: false, reason: transport.reason, detail: transport.detail }; },
+        async signOut() { return { ok: false, reason: transport.reason, detail: transport.detail }; },
+        status() { return { configured: false, reason: transport.reason, sessionActive: false, identityVerified: false, cooldownUntil: 0, transport: 'native' }; }
+      };
+    }
+    return createNativeAccountClient({
+      account: {
+        email: account.email, password: account.password,
+        instance: account.instance, expectedUserId: account.expectedUserId,
+        // Passed through, not defaulted here: an empty value must stay empty (it means "send no
+        // Origin"), which a `||` fallback in this file would silently undo.
+        trustedOrigin: env.NCB_TRUSTED_ORIGIN
+      },
+      transport, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {})
+    });
+  }
+
   const config = readClubAccountConfig(env);
   if (!config.ok) {
     // Fail closed at construction: no client, no attempt, no half-open session.

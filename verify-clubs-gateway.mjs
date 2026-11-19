@@ -1288,28 +1288,39 @@ const CLIENT_EXPECTED = Object.freeze([
 // the list but not mounted — or mounted but not listed — reddens this arm. The walk RECURSES into
 // nested routers: the bootstrap is mounted inside the club router, and a walker that only looked one
 // level deep would report a clean parity check while an undeclared route sat unnoticed underneath.
-function mountedClubPaths() {
-  const direct = [];
-  const nested = [];
-  const walk = (stack, depth) => {
-    for (const layer of stack) {
-      const entry = layer?.route;
-      if (entry) {
-        for (const method of Object.keys(entry.methods ?? {})) {
-          (depth === 0 ? direct : nested).push(`${method.toUpperCase()} ${entry.path}`);
-        }
-        continue;
+//
+// The buckets are chosen by ROUTER IDENTITY, not by path prefix. The relay now mounts two routers —
+// the club mount and the player gateway — and an inventory that swept them together would let a club
+// parity arm pass by comparing against a list that never contained the gateway's routes, which is the
+// same blind spot as ignoring it. Anything mounted that is neither of those two is `unaccounted`, and
+// arm 10j fails on it: a new public surface is still as loud here as a missing club route is.
+function collectRoutes(stack, depth, out) {
+  for (const layer of stack) {
+    const entry = layer?.route;
+    if (entry) {
+      for (const method of Object.keys(entry.methods ?? {})) {
+        (depth === 0 ? out.direct : out.nested).push(`${method.toUpperCase()} ${entry.path}`);
       }
-      if (layer?.handle?.stack && Array.isArray(layer.handle.stack)) walk(layer.handle.stack, depth + 1);
+      continue;
     }
-  };
+    if (layer?.handle?.stack && Array.isArray(layer.handle.stack)) collectRoutes(layer.handle.stack, depth + 1, out);
+  }
+  return out;
+}
+const emptyBucket = () => ({ direct: [], nested: [] });
+function mountedClubPaths() {
+  const club = collectRoutes(bridge.clubMount.router.stack ?? [], 0, emptyBucket());
+  const gateway = collectRoutes(bridge.ncbMount.router.stack ?? [], 0, emptyBucket());
+  const unaccounted = [];
   for (const layer of app._router.stack) {
     if (layer.name !== 'router' || !layer.handle?.stack) continue;
-    walk(layer.handle.stack, 0);
+    if (layer.handle === bridge.clubMount.router || layer.handle === bridge.ncbMount.router) continue;
+    const extra = collectRoutes(layer.handle.stack, 0, emptyBucket());
+    unaccounted.push(...extra.direct, ...extra.nested);
   }
-  return { direct, nested };
+  return { direct: club.direct, nested: club.nested, gateway: gateway.direct, unaccounted };
 }
-const { direct: mounted, nested: mountedNested } = mountedClubPaths();
+const { direct: mounted, nested: mountedNested, gateway: mountedGateway, unaccounted: unaccountedRoutes } = mountedClubPaths();
 const declared = clubRoutes.map((route) => `${route.method} ${route.path}`);
 const notMounted = declared.filter((route) => !mounted.includes(route));
 const undeclared = mounted.filter((route) => !declared.includes(route));
@@ -1363,6 +1374,15 @@ check('10h. the bootstrap is not part of the permanent client contract',
 check('10i. /health.clubs.routes counts the contract routes plus the one server-only addition',
   (bridge.clubHealth(bridge.clubMount).routes === 22) && mounted.length === 22,
   `health=${bridge.clubHealth(bridge.clubMount).routes} mounted=${mounted.length}`);
+// The player gateway is a SECOND mounted router, and this gate is where a relay-wide mount inventory
+// lives. Excluding it silently would defeat the purpose of 10b; naming it means a third router — or a
+// gateway that grew a route outside its own gate — still reddens an arm here. The count is asserted
+// against the gateway's own health claim, which verify-ncb-gateway.mjs ties to the mounted stack.
+check('10j. the only mounted routers are the club mount and the player gateway, and the gateway is exactly its declared /ncb surface',
+  unaccountedRoutes.length === 0
+  && mountedGateway.length === bridge.ncbMount.health().routes
+  && mountedGateway.every((route) => route.includes(' /ncb')),
+  `unaccounted=[${unaccountedRoutes.join(', ')}] gateway=${mountedGateway.length}/${bridge.ncbMount.health().routes}`);
 
 // ── pure authority decision, without any I/O at all ─────────────────────────
 const pureDenials = [
@@ -2445,7 +2465,12 @@ const clubCode = clubSource.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\
 check('14b. no club module reaches for an MCP secret_key or a database credential in code',
   !/\.\s*secret_key\b|\[['"]secret_key['"]\]|DATABASE_URL/.test(clubCode),
   (clubCode.match(/\.\s*secret_key|DATABASE_URL/gi) ?? []).slice(0, 3).join(','));
-const EXPECTED_CLUB_FILES = ['clubAuthorization.js', 'clubBoardValidator.js', 'clubBootstrap.js', 'clubNcbStore.js', 'clubSchema.js', 'index.js', 'ncbAccountClient.js'];
+// `ncbNativeAccountClient.js` is the second transport of the same account, selected by
+// NCB_TRANSPORT. It belongs in this inventory rather than beside the gateway modules because it is
+// the club service account and nothing else: it holds the same credentials, the same identity
+// discipline and the same renewal rules, and a file list that omitted it would be a list of six
+// files where seven ship.
+const EXPECTED_CLUB_FILES = ['clubAuthorization.js', 'clubBoardValidator.js', 'clubBootstrap.js', 'clubNcbStore.js', 'clubSchema.js', 'index.js', 'ncbAccountClient.js', 'ncbNativeAccountClient.js'];
 check('14c. every club module is CommonJS, because the relay is loaded with require()',
   clubFiles.every((name) => !/^\s*(import|export)\s/m.test(fs.readFileSync(path.join(clubDir, name), 'utf8')))
   && clubFiles.length === EXPECTED_CLUB_FILES.length

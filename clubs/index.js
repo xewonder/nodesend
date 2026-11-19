@@ -48,16 +48,22 @@ function buildClubMount({ env = process.env, authenticate, fetchImpl, limits } =
 
   const account = readClubAccountConfig(env);
   const frontend = assertNotFrontendFacing(env);
+  // The account client is built from the ACCOUNT alone, and before the schema is consulted. That
+  // ordering matters for one thing only: a deployment whose schema is missing still cannot serve club
+  // routes (the store stays null and every route 503s, exactly as before), but it can answer the one
+  // question that is not about club data at all — the anonymous invitation-code read bridge.js wires
+  // to this client. Schema state and account state are separate facts and are not conflated here.
+  const client = (account.ok && frontend.ok)
+    ? createNcbAccountClient({ env, ...(fetchImpl ? { fetchImpl } : {}) })
+    : null;
   const schema = account.ok ? readClubSchemaConfig(env) : { ok: false, schema: null, problems: ['club account is not configured'] };
 
   if (!account.ok) return finish({ authenticate, store: null, client: null, reason: account.reason, detail: account.detail, limits });
   if (!frontend.ok) return finish({ authenticate, store: null, client: null, reason: frontend.reason, detail: frontend.detail, limits });
-  if (!schema.ok) return finish({ authenticate, store: null, client: null, reason: 'club_schema_unconfigured', detail: schema.problems.join('; '), limits });
-
-  const client = createNcbAccountClient({ env, ...(fetchImpl ? { fetchImpl } : {}) });
-  if (client.unavailable) {
+  if (client && client.unavailable) {
     return finish({ authenticate, store: null, client: null, reason: client.unavailable.reason, detail: client.unavailable.detail, limits });
   }
+  if (!schema.ok) return finish({ authenticate, store: null, client, reason: 'club_schema_unconfigured', detail: schema.problems.join('; '), limits });
 
   let store = null;
   let reason = null;
@@ -88,6 +94,12 @@ function buildClubMount({ env = process.env, authenticate, fetchImpl, limits } =
       routes: CLUB_ROUTES,
       bootstrapRoutes: BOOTSTRAP_ROUTES,
       bootstrapState: () => bootstrap.__bootstrapState(),
+      // The dedicated account itself, for the ONE read bridge.js needs that is not club data: the
+      // anonymous invitation-code lookup. Exposed as an object, not as a credential — `request()` is
+      // the only entry point, it holds the session cookie inside itself, and no function here
+      // returns it. `configured` is false whenever the account is unusable, so a caller can fail
+      // closed with a named reason instead of dialling an unauthenticated route.
+      account: builtClient || null,
       status() {
         return {
           configured: Boolean(builtStore),
