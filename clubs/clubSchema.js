@@ -56,6 +56,35 @@ const REQUIRED_COLUMNS = Object.freeze({
 });
 
 /**
+ * THE OPTIONAL ACCOUNT DIRECTORY — and why it is not the sixth table.
+ *
+ * The agreed five are still the entire club storage footprint: nothing here is ever WRITTEN. This
+ * role names an application table that already exists and already holds what a Super Admin types:
+ * the account's chosen nickname and display name. Without it, appointing someone means pasting a
+ * technical NCB user id, which is the thing this feature exists to remove.
+ *
+ * It is OPTIONAL, and "not declared" is a legitimate deployment state: every club route keeps
+ * working, account search answers the named 503 `club_directory_unconfigured`, and member rows
+ * carry `null` names. What it must never do is answer an empty result list, because "nobody matched"
+ * and "there is no directory to look in" are different claims about the world.
+ *
+ * No default name is supplied, for the reason the five tables have none: a guessed name is a real
+ * read against whatever table happens to answer.
+ *
+ * THE LIMIT THAT SHAPES EVERYTHING ELSE: the live NCB data route offers exact-match column equality,
+ * `limit`, `page`, `sort` and `order` — and nothing else. Measured 2026-11-18: `?search=`, `?q=` and
+ * `?like=` each answered HTTP 500 `Unknown column 'search' in 'where clause'`, and `?code=*bc*`
+ * matched zero rows, so no wildcard reaches the backend. A partial match therefore cannot be pushed
+ * down: it is a bounded scan of this table with the comparison made here. That is also why the
+ * directory holds no email column and no email search is offered.
+ */
+const DIRECTORY_TABLE_ROLE = 'users';
+const REQUIRED_DIRECTORY_COLUMNS = Object.freeze(['userId']);
+const OPTIONAL_DIRECTORY_COLUMNS = Object.freeze(['nickname', 'displayName', 'nicknameNormalized']);
+/** The columns a partial name match can actually be made against. */
+const SEARCHABLE_DIRECTORY_COLUMNS = Object.freeze(['nickname', 'displayName', 'nicknameNormalized']);
+
+/**
  * Optional board columns a deployment may offer. Deliberately EMPTY, and the reason belongs here:
  * the live `club_collection_boards` table has `tags_json` (free-form, unused by this relay) and NO
  * `source_pbn` at all. The earlier contract named `sourcePbn` and would have written a column that
@@ -209,12 +238,17 @@ function readClubSchemaConfig(env = {}, deps = {}) {
   }
   // A role outside the agreed five is refused, not ignored. `attempts` is the one that would
   // otherwise creep back: accepting it silently is how a sixth table becomes a live dependency
-  // again after the contract said there would not be one.
+  // again after the contract said there would not be one. The read-only account directory is the
+  // single accepted exception, and it is checked on its own terms below.
   for (const role of Object.keys(declaredTables)) {
-    if (!AGREED_TABLE_ROLES[role]) problems.push(`tables.${role} is not one of the agreed five club table roles`);
+    if (!AGREED_TABLE_ROLES[role] && role !== DIRECTORY_TABLE_ROLE) {
+      problems.push(`tables.${role} is not one of the agreed five club table roles`);
+    }
   }
   for (const role of Object.keys(declaredColumns)) {
-    if (!AGREED_TABLE_ROLES[role]) problems.push(`columns.${role} is not one of the agreed five club table roles`);
+    if (!AGREED_TABLE_ROLES[role] && role !== DIRECTORY_TABLE_ROLE) {
+      problems.push(`columns.${role} is not one of the agreed five club table roles`);
+    }
   }
 
   const columns = {};
@@ -256,6 +290,43 @@ function readClubSchemaConfig(env = {}, deps = {}) {
   const names = Object.values(tables).map(eq).filter(Boolean);
   if (new Set(names).size !== names.length) problems.push('two schema roles point at the same table');
 
+  // ── the optional read-only account directory ────────────────────────────
+  // Declared or absent, both valid; half-declared is not. A directory with no `user_id` column
+  // cannot resolve a match to an account, and a directory with no name column cannot be searched,
+  // so either would make `GET /clubs/users` a route that can only ever answer "nobody matched" —
+  // a false statement about people who exist, which is the failure this whole contract refuses.
+  let directory = null;
+  const directoryTable = eq(declaredTables[DIRECTORY_TABLE_ROLE]);
+  if (directoryTable) {
+    const declaredDirectoryColumns = declaredColumns[DIRECTORY_TABLE_ROLE]
+      && typeof declaredColumns[DIRECTORY_TABLE_ROLE] === 'object'
+      ? declaredColumns[DIRECTORY_TABLE_ROLE] : {};
+    const directoryColumns = {};
+    for (const field of [...REQUIRED_DIRECTORY_COLUMNS, ...OPTIONAL_DIRECTORY_COLUMNS]) {
+      const value = eq(declaredDirectoryColumns[field]);
+      if (!value) {
+        if (REQUIRED_DIRECTORY_COLUMNS.includes(field)) problems.push(`columns.${DIRECTORY_TABLE_ROLE}.${field} is missing`);
+        continue;
+      }
+      directoryColumns[field] = value;
+    }
+    for (const field of Object.keys(declaredDirectoryColumns)) {
+      if (!REQUIRED_DIRECTORY_COLUMNS.includes(field) && !OPTIONAL_DIRECTORY_COLUMNS.includes(field)) {
+        problems.push(`columns.${DIRECTORY_TABLE_ROLE}.${field} is not a column this contract reads (allowed: ${[...REQUIRED_DIRECTORY_COLUMNS, ...OPTIONAL_DIRECTORY_COLUMNS].join(', ')})`);
+      }
+    }
+    if (!problems.some((p) => p.startsWith(`columns.${DIRECTORY_TABLE_ROLE}`))
+      && !SEARCHABLE_DIRECTORY_COLUMNS.some((field) => directoryColumns[field])) {
+      problems.push(`columns.${DIRECTORY_TABLE_ROLE} needs at least one of ${SEARCHABLE_DIRECTORY_COLUMNS.join(', ')} — a directory with no name column cannot answer a name search`);
+    }
+    // The directory must not be one of the club tables wearing a second role: reading it as
+    // profiles would resolve a member's name from the membership row itself.
+    if (names.includes(directoryTable)) problems.push(`tables.${DIRECTORY_TABLE_ROLE} must name a different table from the five club tables`);
+    if (!problems.some((p) => p.includes(DIRECTORY_TABLE_ROLE))) {
+      directory = { table: directoryTable, columns: directoryColumns };
+    }
+  }
+
   // Optional value translation, currently only for the club activity flag. A HALF-SPECIFIED mapping
   // is refused: `{ "active": 1 }` alone would leave 'inactive' writing the literal text into a
   // numeric column, which is the exact mismatch this block exists to prevent, and it would fail on
@@ -280,6 +351,9 @@ function readClubSchemaConfig(env = {}, deps = {}) {
     schema: {
       tables,
       columns,
+      // null when the deployment declared no directory. Every caller must handle that as "cannot
+      // look", never as "looked and found nobody".
+      directory,
       // The one codec the storage layer uses for the club activity flag. Kept on the schema rather
       // than imported ad hoc so no call site can reach the store without it.
       clubStatus,
@@ -303,6 +377,10 @@ module.exports = {
   AGREED_TABLE_ROLES,
   REQUIRED_COLUMNS,
   OPTIONAL_BOARD_COLUMNS,
+  DIRECTORY_TABLE_ROLE,
+  REQUIRED_DIRECTORY_COLUMNS,
+  OPTIONAL_DIRECTORY_COLUMNS,
+  SEARCHABLE_DIRECTORY_COLUMNS,
   MEMBERSHIP_UNIQUE_KEY,
   MEMBERSHIP_STATUSES,
   APPROVED_MEMBERSHIP_STATUS,

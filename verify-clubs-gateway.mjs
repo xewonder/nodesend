@@ -74,14 +74,19 @@ process.env.CLUB_NCB_SCHEMA_JSON = JSON.stringify({
     clubs: 'clubs',
     memberships: 'club_memberships',
     collections: 'club_board_collections',
-    boards: 'club_collection_boards'
+    boards: 'club_collection_boards',
+    // The optional read-only account directory. Its LIVE column names come from the app that owns
+    // the table (BridgeMind src/services/userProfileService.js / publicProfileService.js), and it
+    // deliberately has NO email column, because the real one has none.
+    users: 'user_settings'
   },
   columns: {
     systemAdmins: { userId: 'user_id' },
     clubs: { id: 'id', name: 'name', status: 'active' },
     memberships: { id: 'id', userId: 'user_id', clubId: 'club_id', role: 'role', status: 'status' },
     collections: { id: 'id', clubId: 'club_id', name: 'title', status: 'publication_status', createdBy: 'created_by_user_id' },
-    boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json' }
+    boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json' },
+    users: { userId: 'user_id', nickname: 'nickname', displayName: 'display_name', nicknameNormalized: 'nickname_normalized' }
   },
   // The live flag is numeric, exactly as production declares it.
   values: { clubs: { status: { active: 1, inactive: 0 } } }
@@ -120,7 +125,29 @@ const tables = {
     { id: 'm9', user_id: '24', club_id: '12', role: 'member', status: 'approved' }
   ],
   club_board_collections: [],
-  club_collection_boards: []
+  club_collection_boards: [],
+  // THE ACCOUNT DIRECTORY, exactly as the live table is shaped: `nickname`, the lowercase
+  // `nickname_normalized` the app mints from it, `display_name`, `avatar_url`, `ai_source` — and no
+  // email column, because the real one has none. Two rows are deliberately half-filled (a display
+  // name with no nickname, and the reverse) and one has no user id at all, so a directory row that
+  // cannot be attributed is exercised rather than assumed.
+  user_settings: [
+    { id: 'us1', user_id: '1', nickname: 'RelayOwner', nickname_normalized: 'relayowner', display_name: 'Relay Owner', avatar_url: null, ai_source: 'system' },
+    { id: 'us2', user_id: '2', nickname: 'GlyfadaSkipper', nickname_normalized: 'glyfadaskipper', display_name: 'Glyfada Captain', avatar_url: null, ai_source: 'user' },
+    { id: 'us3', user_id: '3', nickname: 'GlyfadaMember', nickname_normalized: 'glyfadamember', display_name: null, avatar_url: null, ai_source: 'system' },
+    { id: 'us4', user_id: '4', nickname: 'ThessPlayer', nickname_normalized: 'thessplayer', display_name: 'Thessaloniki Player', avatar_url: null, ai_source: 'system' },
+    { id: 'us5', user_id: '5', nickname: 'NoClubAtAll', nickname_normalized: 'noclubatall', display_name: null, avatar_url: null, ai_source: 'system' },
+    { id: 'us6', user_id: '301', nickname: 'gly_teacher', nickname_normalized: 'gly_teacher', display_name: 'Glyfada Teacher', avatar_url: null, ai_source: 'system' },
+    { id: 'us7', user_id: '302', nickname: 'glymaster', nickname_normalized: 'glymaster', display_name: 'Coach of Glyfada BC', avatar_url: null, ai_source: 'system' },
+    { id: 'us8', user_id: '303', nickname: 'thess_tutor', nickname_normalized: 'thess_tutor', display_name: 'Thessaloniki Tutor', avatar_url: null, ai_source: 'system' },
+    { id: 'us9', user_id: '304', nickname: 'Unrelated Person', nickname_normalized: 'unrelated person', display_name: 'Nothing Matching', avatar_url: null, ai_source: 'system' },
+    { id: 'us10', user_id: '305', nickname: null, nickname_normalized: null, display_name: 'Display Name Only', avatar_url: null, ai_source: 'system' },
+    { id: 'us11', user_id: '306', nickname: 'NicknameOnly', nickname_normalized: 'nicknameonly', display_name: null, avatar_url: null, ai_source: 'system' },
+    { id: 'us12', user_id: null, nickname: 'OrphanRow', nickname_normalized: 'orphanrow', display_name: 'No Account Id', avatar_url: null, ai_source: 'system' },
+    // Built for the ranking arm: its normalized nickname IS the whole query, while several other
+    // rows merely CONTAIN it. Without a row like this, "exact first" is unobservable.
+    { id: 'us13', user_id: '310', nickname: 'Glyfada', nickname_normalized: 'glyfada', display_name: 'Glyfada Town', avatar_url: null, ai_source: 'system' }
+  ]
 };
 let rowSequence = 100;
 // Every /data/ call the club store made, with the bearer that authorised it. This is the witness
@@ -142,7 +169,8 @@ const TABLE_COLUMNS = {
   clubs: ['id', 'name', 'active'],
   club_memberships: ['id', 'user_id', 'club_id', 'role', 'status'],
   club_board_collections: ['id', 'club_id', 'title', 'publication_status', 'created_by_user_id'],
-  club_collection_boards: ['id', 'collection_id', 'board_number', 'dealer', 'vulnerability', 'hands_json']
+  club_collection_boards: ['id', 'collection_id', 'board_number', 'dealer', 'vulnerability', 'hands_json'],
+  user_settings: ['id', 'user_id', 'nickname', 'nickname_normalized', 'display_name', 'avatar_url', 'ai_source']
 };
 // Set to { table, fragment, status, body } to make the read of THAT table whose query matches THAT
 // fragment answer THAT response. Scoped by table AND query fragment on purpose: a knob that refused
@@ -1041,9 +1069,10 @@ const foreignBearers = dataCalls.filter((row) => row.bearer !== CLUB_SESSION_TOK
 check('8b. every club-data operation ran on the dedicated account, never a caller bearer',
   foreignBearers.length === 0,
   `${foreignBearers.length} call(s) carried a caller token`);
-check('8c. no club-data call went to a table outside the agreed five',
-  new Set(dataCalls.map((row) => row.pathname.split('/')[3])).size === 5
-  && new Set(dataCalls.map((row) => row.pathname.split('/')[3])).has('club_collection_boards'),
+check('8c. no club-data call went to a table outside the agreed five plus the one declared directory',
+  new Set(dataCalls.map((row) => row.pathname.split('/')[3])).size === 6
+  && new Set(dataCalls.map((row) => row.pathname.split('/')[3])).has('club_collection_boards')
+  && new Set(dataCalls.map((row) => row.pathname.split('/')[3])).has('user_settings'),
   [...new Set(dataCalls.map((row) => row.pathname.split('/')[3]))].join(','));
 
 // ── board-start: a read and a validation, never a write ─────────────────────
@@ -1094,6 +1123,20 @@ check('8j. board-start touched no table outside the agreed five, and the live sc
   && liveSchema.ok === true && Object.keys(liveSchema.schema.tables).length === 5
   && !Object.values(liveSchema.schema.tables).includes('club_board_attempts'),
   `${[...new Set(startWindow.map(tableOf).filter((name) => !AGREED.includes(name)))].join(',')} / ${JSON.stringify(liveSchema.schema?.tables ?? liveSchema.problems)}`);
+
+// The directory is the one table this feature reads that it must NEVER write. Asserted twice on
+// purpose: on what the process actually sent, and on the source that could send anything else.
+// 8h already proved the recorder sees writes, so "every directory call was a GET" has a detector
+// behind it rather than a constant.
+const directoryTable = liveSchema.schema.directory?.table ?? '';
+const directoryCalls = dataCalls.filter((row) => tableOf(row) === directoryTable);
+const storeSource = require('node:fs').readFileSync(path.join(ROOT, 'clubs', 'clubNcbStore.js'), 'utf8')
+  .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
+check('8x. the account directory is read-only in fact: every call touched it was a GET, it is not one of the five, and no write call names it',
+  directoryTable !== '' && !AGREED.includes(directoryTable)
+  && directoryCalls.length > 0 && directoryCalls.every((row) => row.method === 'GET')
+  && !/(CREATE|UPDATE|REMOVE)\(\s*(directoryTable\b|['"]user_settings['"])/.test(storeSource),
+  `${directoryCalls.length} call(s), non-GET=${directoryCalls.filter((row) => row.method !== 'GET').length} namedInWrites=${(storeSource.match(/(CREATE|UPDATE|REMOVE)\(\s*directoryTable/g) ?? []).length}`);
 
 // A deployment that declares the old sixth table is refused at boot, not quietly tolerated.
 const sixthTable = clubSchemaConfig({
@@ -1285,7 +1328,10 @@ check('10c. every operation the prepared club client can call has a matching Nod
 const SERVER_ONLY_ROUTES = Object.freeze([
   // Approving, rejecting or revoking a membership is an authority action. BridgeMind's client has no
   // such call yet, and the server must not wait for it to exist before it can enforce approval.
-  'POST /clubs/:clubId/members/:userId/status'
+  'POST /clubs/:clubId/members/:userId/status',
+  // Account search: the surface that replaces pasting a technical NCB user id into an appointment
+  // form. It returns three fields about accounts, is Super Admin only, and is measured by section 20.
+  'GET /clubs/users'
 ]);
 const beyondClient = mounted.filter((route) => !CLIENT_EXPECTED.includes(route));
 const unexplained = beyondClient.filter((route) => !SERVER_ONLY_ROUTES.includes(route));
@@ -1314,8 +1360,8 @@ check('10g. the nested surface is exactly the declared bootstrap route, and noth
 check('10h. the bootstrap is not part of the permanent client contract',
   !CLIENT_EXPECTED.some((route) => /bootstrap/.test(route)) && !declared.some((route) => /bootstrap/.test(route)),
   'bootstrap must not appear in CLUB_ROUTES or the client list');
-check('10i. /health.clubs.routes still counts only the 21 contract routes',
-  (bridge.clubHealth(bridge.clubMount).routes === 21) && mounted.length === 21,
+check('10i. /health.clubs.routes counts the contract routes plus the one server-only addition',
+  (bridge.clubHealth(bridge.clubMount).routes === 22) && mounted.length === 22,
   `health=${bridge.clubHealth(bridge.clubMount).routes} mounted=${mounted.length}`);
 
 // ── pure authority decision, without any I/O at all ─────────────────────────
@@ -1812,6 +1858,210 @@ check('18r. a collections mapping without created_by_user_id is refused at boot 
     `${membersRefused.status} ${membersRefused.text.slice(0, 140)}`);
 
   tables.clubs.splice(0, tables.clubs.length, ...clubsHeld);
+}
+
+// ── 20. the account directory: name search, member names, and the honest email NO ──────────────
+// The objective is that a Super Admin appoints a teacher by typing a NAME. What the backend can
+// actually do decides the shape: the live read route offers exact-match equality plus
+// limit/page/sort/order and NOTHING else, so a partial match is a bounded scan with the comparison
+// made in NodeSend, and the table holding nicknames and display names holds no email column at all.
+// Every arm below is measured on the real exported app over HTTP, on the club account's bearer.
+{
+  const directoryReads = (from) => dataCalls.slice(from).filter((row) => row.pathname.endsWith('/read/user_settings'));
+  // `respondStoreResult` wraps a non-array payload, so a search answer lives under `data`.
+  const payloadOf = (res) => res.body?.data ?? {};
+  const usersOf = (res) => payloadOf(res).users ?? [];
+  const idsOf = (res) => usersOf(res).map((row) => row.user_id);
+
+  // 20a — the feature itself: a partial, case-insensitive name match.
+  const glySearch = await ask('GET', '/clubs/users?q=gly&limit=50', { token: CALLER_TOKEN });
+  const glyIds = idsOf(glySearch);
+  check('20a. a Super Admin finds accounts by a partial case-insensitive name match, and the search says it looked at everything',
+    glySearch.status === 200
+    && ['2', '3', '301', '302', '310'].every((id) => glyIds.includes(id))
+    && !glyIds.includes('303') && !glyIds.includes('304') && !glyIds.includes('306')
+    && payloadOf(glySearch).truncated === false && payloadOf(glySearch).matched_count === glyIds.length,
+    `${glySearch.status} ${glySearch.text.slice(0, 220)}`);
+
+  // 20b — a whole-nickname hit must lead the list, or an admin appoints the wrong person.
+  const exactFirst = await ask('GET', '/clubs/users?q=glyfada&limit=50', { token: CALLER_TOKEN });
+  check('20b. an exact nickname match is returned first among the substring matches',
+    exactFirst.status === 200 && idsOf(exactFirst)[0] === '310'
+    && usersOf(exactFirst).length > 1 && glyIds.length > 1 && idsOf(exactFirst).includes('301'),
+    `${exactFirst.status} first=${idsOf(exactFirst)[0]} ids=${JSON.stringify(idsOf(exactFirst))}`);
+
+  const upper = await ask('GET', '/clubs/users?q=GLYFADA&limit=50', { token: CALLER_TOKEN });
+  check('20c. the match is case-insensitive from the query side too, not only from the stored column',
+    upper.status === 200 && JSON.stringify(idsOf(upper)) === JSON.stringify(idsOf(exactFirst)),
+    `${upper.status} ids=${JSON.stringify(idsOf(upper))}`);
+
+  // 20d — the field list is the security property of the whole route.
+  const rowKeys = new Set();
+  for (const row of usersOf(glySearch)) Object.keys(row).forEach((key) => rowKeys.add(key));
+  check('20d. a search returns user_id, nickname and display_name and nothing else — no email, no avatar, no ai_source, no credential',
+    [...rowKeys].sort().join(',') === 'display_name,nickname,user_id'
+    && !/ai_source|avatar_url|nickname_normalized|password|token|secret|session/i.test(glySearch.text),
+    `keys=${[...rowKeys].sort().join(',')}`);
+  check('20e. a directory row with no account id is skipped rather than returned as a user with an empty id',
+    usersOf(glySearch).length > 0 && glyIds.every((id) => id !== '' && id !== 'null' && id !== 'undefined'),
+    JSON.stringify(glyIds));
+
+  const clubAdminSearch = await ask('GET', '/clubs/users?q=gly', { token: 'tok-admin10' });
+  const memberSearch = await ask('GET', '/clubs/users?q=gly', { token: 'tok-member10' });
+  check('20f. a Club Admin and an ordinary member are both refused: the directory answers about people outside their club',
+    clubAdminSearch.status === 403 && clubAdminSearch.body.error === 'super_admin_required'
+    && memberSearch.status === 403 && memberSearch.body.error === 'super_admin_required',
+    `${clubAdminSearch.status}/${memberSearch.status}`);
+  const anonSearch = await ask('GET', '/clubs/users?q=gly');
+  check('20g. an unauthenticated search is refused before any directory read is attempted',
+    anonSearch.status === 401 && (anonSearch.body.error ?? anonSearch.body.status) === 'auth_error',
+    `${anonSearch.status} ${anonSearch.text.slice(0, 120)}`);
+
+  // 20h–20j: refusals that must cost NO read at all, measured on what the process actually sent.
+  const beforeEmail = dataCalls.length;
+  const emailSearch = await ask('GET', '/clubs/users?q=someone%40example.test', { token: CALLER_TOKEN });
+  check('20h. an email query is refused BY NAME, never answered with an empty list about a real person',
+    emailSearch.status === 400 && emailSearch.body.error === 'email_lookup_unavailable'
+    && directoryReads(beforeEmail).length === 0,
+    `${emailSearch.status} ${emailSearch.text.slice(0, 140)} reads=${directoryReads(beforeEmail).length}`);
+
+  const beforeTiny = dataCalls.length;
+  const tinySearch = await ask('GET', '/clubs/users?q=g', { token: CALLER_TOKEN });
+  check('20i. a one-character query is refused before the scan, because one character is a directory dump wearing a search',
+    tinySearch.status === 400 && tinySearch.body.error === 'bad_request'
+    && directoryReads(beforeTiny).length === 0,
+    `${tinySearch.status} ${tinySearch.text.slice(0, 120)}`);
+
+  const beforeExtra = dataCalls.length;
+  const extraField = await ask('GET', '/clubs/users?q=gly&offset=1', { token: CALLER_TOKEN });
+  check('20j. an undeclared query field is refused by the positive field list, with no read made (item 7)',
+    extraField.status === 400 && extraField.body.error === 'client_identity_refused'
+    && directoryReads(beforeExtra).length === 0,
+    `${extraField.status} ${extraField.text.slice(0, 140)}`);
+
+  // 20k/20l: a refused directory read must never be served as "nobody matched".
+  const beforeRefusal = dataCalls.length;
+  clubReadRefusal = { table: 'user_settings', fragment: /(^|&)sort=/, status: 500, body: { status: 'failed', error: 'read refused' } };
+  const directoryRefused = await ask('GET', '/clubs/users?q=gly', { token: CALLER_TOKEN });
+  clubReadRefusal = null;
+  check('20k. a refused directory read answers 503, never a 200 carrying an empty result set',
+    directoryRefused.status === 503 && directoryRefused.body.error === 'club_account_request_failed'
+    && directoryReads(beforeRefusal).length === 1,
+    `${directoryRefused.status} ${directoryRefused.text.slice(0, 140)}`);
+  const afterRefusal = await ask('GET', '/clubs/users?q=gly', { token: CALLER_TOKEN });
+  check('20l. positive control: with the refusal removed the same query matches again, so 20k measured the knob',
+    afterRefusal.status === 200 && idsOf(afterRefusal).length === glyIds.length && glyIds.length > 1,
+    `${afterRefusal.status} users=${idsOf(afterRefusal).length}`);
+
+  // 20m–20o: member-list enrichment, its cost, and its honest gaps.
+  const beforeMembers = dataCalls.length;
+  const memberList = await ask('GET', '/clubs/10/members', { token: CALLER_TOKEN });
+  const memberRows = memberList.body?.data ?? [];
+  const byUser = new Map(memberRows.map((row) => [String(row.user_id), row]));
+  check('20m. an authorized member list now carries the display name and nickname where the directory holds them (item 4)',
+    memberList.status === 200 && byUser.get('2')?.display_name === 'Glyfada Captain'
+    && byUser.get('2')?.nickname === 'GlyfadaSkipper'
+    && byUser.get('3')?.nickname === 'GlyfadaMember' && byUser.get('3')?.display_name === null,
+    `${memberList.status} ${JSON.stringify(memberRows).slice(0, 220)}`);
+  check('20n. enrichment costs ONE directory read for the whole roster, not one per member',
+    memberRows.length >= 4 && directoryReads(beforeMembers).length === 1,
+    `members=${memberRows.length} reads=${directoryReads(beforeMembers).length}`);
+  check('20o. a member with no directory row keeps their membership row and gets null names, not a dropped row',
+    byUser.has('20') && byUser.get('20').display_name === null && byUser.get('20').nickname === null
+    && byUser.get('20').membership_status === 'pending',
+    JSON.stringify(byUser.get('20')));
+
+  // 20p/20q: requirement 5 — several Club Admins in ONE club, each its own membership row.
+  const appointA = await ask('POST', '/clubs/11/admins', { token: CALLER_TOKEN, body: { user_id: '301' } });
+  const afterA = new Map(((await ask('GET', '/clubs/11/members', { token: CALLER_TOKEN })).body?.data ?? [])
+    .map((row) => [String(row.user_id), row]));
+  const appointB = await ask('POST', '/clubs/11/admins', { token: CALLER_TOKEN, body: { user_id: '302' } });
+  const club11Rows = (await ask('GET', '/clubs/11/members', { token: CALLER_TOKEN })).body?.data ?? [];
+  const admins11 = club11Rows.filter((row) => row.club_role === 'club_admin');
+  const resolved11 = new Map(club11Rows.map((row) => [String(row.user_id), row]));
+  check('20p. multiple Club Admins per club are preserved, each resolved to its own account and named (item 5)',
+    appointA.status === 200 && appointB.status === 200
+    && admins11.length === 2 && ['301', '302'].every((id) => admins11.some((row) => String(row.user_id) === id))
+    && admins11.every((row) => row.membership_status === 'approved')
+    && admins11.every((row) => typeof row.display_name === 'string' && row.display_name !== ''),
+    `${appointA.status}/${appointB.status} admins=${JSON.stringify(admins11.map((row) => [row.user_id, row.display_name]))}`);
+  check('20q. appointing the second admin left the first one untouched: same row id, still club_admin',
+    afterA.get('301')?.club_role === 'club_admin'
+    && resolved11.get('301')?.membership_id === afterA.get('301')?.membership_id
+    && resolved11.get('301')?.club_role === 'club_admin'
+    && new Set(admins11.map((row) => row.membership_id)).size === 2,
+    `before=${JSON.stringify(afterA.get('301'))} after=${JSON.stringify(resolved11.get('301'))}`);
+
+  // 20r/20s: which columns actually participate, and what the server-side result cap claims.
+  const displayOnly = await ask('GET', '/clubs/users?q=town', { token: CALLER_TOKEN });
+  const nicknameOnly = await ask('GET', '/clubs/users?q=master', { token: CALLER_TOKEN });
+  check('20r. both name columns participate: a phrase found only in a display_name matches, and so does one found only in a nickname',
+    displayOnly.status === 200 && JSON.stringify(idsOf(displayOnly)) === '["310"]'
+    && JSON.stringify(idsOf(nicknameOnly)) === '["302"]',
+    `town=${JSON.stringify(idsOf(displayOnly))} master=${JSON.stringify(idsOf(nicknameOnly))}`);
+
+  const capped = await ask('GET', '/clubs/users?q=gly&limit=2', { token: CALLER_TOKEN });
+  check('20s. the result cap is applied server-side and the answer says matches were withheld rather than implying there were none',
+    capped.status === 200 && idsOf(capped).length === 2
+    && payloadOf(capped).matched_count === glyIds.length && payloadOf(capped).truncated === true,
+    `${capped.status} ${capped.text.slice(0, 200)}`);
+  const overCap = await ask('GET', '/clubs/users?q=gly&limit=10000', { token: CALLER_TOKEN });
+  check('20t. a client-supplied limit cannot raise the ceiling the relay holds for one list',
+    overCap.status === 200 && idsOf(overCap).length <= 100 && payloadOf(overCap).truncated === false,
+    `returned=${idsOf(overCap).length} truncated=${payloadOf(overCap).truncated}`);
+
+  // The typed text is compared HERE and never sent to the backend, so no operator, quote or wildcard
+  // in a Super Admin's search box can reshape the storage query. Measured on what was actually sent,
+  // as parameter NAMES — the exact string is not pinned, because this deployment's bound is config.
+  const hostile = "gly' or 1=1 --%_";
+  const beforeHostile = dataCalls.length;
+  const hostileSearch = await ask('GET', `/clubs/users?q=${encodeURIComponent(hostile)}`, { token: CALLER_TOKEN });
+  const hostileReads = directoryReads(beforeHostile);
+  const hostileKeys = [...new Set(new URLSearchParams(hostileReads[0]?.search ?? '').keys())];
+  const hostileText = hostileReads[0]?.search ?? '';
+  check('20x. the typed query never reaches the backend: the directory read carries only honoured parameter names and no fragment of the search text',
+    hostileSearch.status === 200 && hostileReads.length === 1
+    && hostileKeys.every((key) => ['Instance', 'limit', 'sort', 'order', 'page'].includes(key))
+    && ['limit', 'sort', 'order'].every((key) => hostileKeys.includes(key))
+    && !['gly', "' or", '1=1', '--'].some((fragment) => hostileText.includes(fragment))
+    && (hostileSearch.body?.data?.users ?? []).length === 0 && payloadOf(hostileSearch).truncated === false,
+    `${hostileSearch.status} keys=${hostileKeys.join(',')} sent=${hostileText.slice(0, 120)}`);
+}
+
+// The same two features against a deployment that declared the five club tables and NO directory —
+// the legitimate steady state for anyone who has not opted in. This is where "no directory" must be
+// visible as a refusal, never as an empty result set or a silent name loss.
+{
+  const fiveTableOnly = JSON.parse(JSON.stringify(SCHEMA_OBJECT));
+  delete fiveTableOnly.tables.users;
+  delete fiveTableOnly.columns.users;
+  const noDir = await serveIsolated({
+    env: { ...READY_ENV, CLUB_NCB_SCHEMA_JSON: JSON.stringify(fiveTableOnly) },
+    fetchImpl: (url, init) => globalThis.fetch(url, init)
+  });
+  const unconfiguredSearch = await call('GET', '/clubs/users?q=gly', { token: CALLER_TOKEN, base: noDir.base });
+  check('20u. with no directory declared, account search answers the named 503 rather than "nobody matched"',
+    unconfiguredSearch.status === 503 && unconfiguredSearch.body.error === 'club_directory_unconfigured',
+    `${unconfiguredSearch.status} ${unconfiguredSearch.text.slice(0, 160)}`);
+  const unconfiguredMembers = await call('GET', '/clubs/10/members', { token: CALLER_TOKEN, base: noDir.base });
+  const unconfiguredRows = unconfiguredMembers.body?.data ?? [];
+  check('20v. and the member list still works with null names, so opting out of the directory costs no club feature',
+    unconfiguredMembers.status === 200 && unconfiguredRows.length >= 4
+    && unconfiguredRows.every((row) => row.display_name === undefined || row.display_name === null),
+    `${unconfiguredMembers.status} ${JSON.stringify(unconfiguredRows[0]).slice(0, 160)}`);
+  await noDir.close();
+
+  // The scan bound has to be reported, or a truncating search is a silent "no such person". A
+  // three-row window over a fourteen-row directory is how that is measured without seeding 500 rows.
+  const narrowScan = await serveIsolated({
+    env: { ...READY_ENV, CLUB_NCB_ROW_LIMIT: '3' },
+    fetchImpl: (url, init) => globalThis.fetch(url, init)
+  });
+  const narrowSearch = await call('GET', '/clubs/users?q=only', { token: CALLER_TOKEN, base: narrowScan.base });
+  check('20w. a search that could not look at the whole directory says so instead of reporting nobody matched',
+    narrowSearch.status === 200 && narrowSearch.body?.data?.truncated === true,
+    `${narrowSearch.status} ${narrowSearch.text.slice(0, 160)}`);
+  await narrowScan.close();
 }
 
 // ── 16. the one-time super-admin bootstrap ───────────────────────────────────

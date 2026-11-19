@@ -218,6 +218,102 @@ function createClubNcbStore({ client, schema }) {
     return { user_id: eq(confirmed[C.systemAdmins.userId]) };
   }
 
+  // ── THE ACCOUNT DIRECTORY ────────────────────────────────────────────────
+  // Read-only, optional, and never written: this is the application table that already holds the
+  // name a person chose for themselves. It exists so a Super Admin can appoint a teacher by typing
+  // that name instead of pasting an NCB user id.
+  const D = schema.directory ? schema.directory.columns : null;
+  const directoryTable = schema.directory ? schema.directory.table : '';
+
+  /**
+   * One bounded scan of the directory table, shared by search and by member-name enrichment.
+   *
+   * WHY A SCAN AT ALL: the live backend offers no partial-match operator — `?search=`, `?q=` and
+   * `?like=` each answer HTTP 500 `Unknown column 'search' in 'where clause'` and a wildcard value
+   * matches nothing (clubSchema.js records the measurement). So "find me anyone called *gly*" can
+   * only be a bounded read with the comparison made here. The bound is `CLUB_NCB_ROW_LIMIT`, and the
+   * scan is sorted by the identity column so the window is DETERMINISTIC: with an unspecified MySQL
+   * row order the same query could match a person today and miss them tomorrow, and a missed person
+   * is reported as "no such account".
+   *
+   * A REFUSAL STAYS A REFUSAL. An unreadable directory that answers `[]` tells a Super Admin that
+   * nobody in BridgeMind holds that name — the same class of lie the club list was fixed for, aimed
+   * at real people instead of at rows.
+   */
+  async function scanDirectory() {
+    if (!schema.directory) return { unconfigured: true };
+    const found = await rowsOrRefusal(directoryTable, `limit=${schema.rowLimit}&sort=${D.userId}&order=asc`);
+    if (found.refusal) return { refusal: found.refusal, detail: found.detail };
+    return { rows: found.rows, truncated: found.rows.length >= schema.rowLimit };
+  }
+
+  function directoryLabel(row) {
+    return {
+      user_id: eq(row[D.userId]),
+      nickname: D.nickname ? eq(row[D.nickname]) : '',
+      display_name: D.displayName ? eq(row[D.displayName]) : '',
+      normalized: D.nicknameNormalized ? eq(row[D.nicknameNormalized]).toLowerCase() : ''
+    };
+  }
+
+  /**
+   * The only user fields this feature ever returns: the id, and the two names. Not email (the
+   * directory has no email column and the account table is not readable through the data route), not
+   * `avatar_url`, not `ai_source`, and never anything that could be a credential — a search that
+   * returns an AI-provider waiver or a session field turns a name lookup into an identity dump.
+   */
+  async function searchAccounts({ q = '', limit = 20 } = {}) {
+    const needle = String(q).trim().toLowerCase();
+    if (needle === '') return { error: 'bad_request', detail: 'a search term is required' };
+    const scan = await scanDirectory();
+    if (scan.unconfigured) {
+      return { error: 'club_directory_unconfigured', detail: 'this deployment declares no account directory (CLUB_NCB_SCHEMA_JSON tables.users), so accounts cannot be searched by name' };
+    }
+    if (scan.refusal) return { error: scan.refusal, detail: scan.detail };
+
+    const matches = [];
+    for (const row of scan.rows) {
+      const label = directoryLabel(row);
+      if (label.user_id === '') continue;
+      // Every field is folded to lowercase before the comparison, not just the stored normalized
+      // column. `nickname` and `display_name` hold what the player typed — "Glyfada Teacher" — and
+      // comparing them against a lowercased query without folding them is how a search answers
+      // "nobody called that" about a row it is looking straight at. Case-insensitivity here is
+      // NodeSend's own, so it does not depend on the column collation being CI or on NCB offering a
+      // case-insensitive operator, which it does not.
+      const fields = [label.nickname, label.display_name, label.normalized]
+        .map((value) => String(value ?? '').toLowerCase())
+        .filter((value) => value !== '');
+      if (!fields.some((value) => value.includes(needle))) continue;
+      // A whole-nickname hit ranks first. The exact `nickname_normalized` read is what the rest of
+      // the product treats as authoritative, and burying it under substring matches is how an admin
+      // appoints the wrong person from a list they believed was ordered by relevance.
+      matches.push({ ...label, exact: label.normalized !== '' && label.normalized === needle });
+    }
+    matches.sort((a, b) => (a.exact === b.exact ? 0 : a.exact ? -1 : 1));
+
+    const size = Math.min(Number(limit) || 20, 100, schema.rowLimit);
+    return {
+      users: matches.slice(0, size).map(({ exact, nickname, display_name, user_id, normalized }) => ({ user_id, nickname, display_name })),
+      matched_count: matches.length,
+      // Not "did the page fill up" — "the account set was not fully looked at, or the matches were
+      // not all shown". A search that says nothing more has to be trusted to be complete.
+      truncated: scan.truncated || matches.length > size
+    };
+  }
+
+  async function directoryLabels() {
+    if (!schema.directory) return { labels: null };
+    const scan = await scanDirectory();
+    if (scan.refusal) return { error: scan.refusal, detail: scan.detail };
+    const labels = new Map();
+    for (const row of scan.rows) {
+      const label = directoryLabel(row);
+      if (label.user_id !== '' && !labels.has(label.user_id)) labels.set(label.user_id, label);
+    }
+    return { labels };
+  }
+
   // ── SUPER ADMIN ───────────────────────────────────────────────────────────
 
   /**
@@ -296,12 +392,24 @@ function createClubNcbStore({ client, schema }) {
     // `status` rides along so a club admin sees the pending requests they are being asked to act on
     // through the SAME read that lists members. A separate requests endpoint would be a second
     // surface deciding the same thing.
-    return found.rows.map((row) => ({
+    const rows = found.rows.map((row) => ({
       user_id: eq(row[C.memberships.userId]),
       club_role: eq(row[C.memberships.role]),
       membership_status: eq(row[C.memberships.status]),
       membership_id: eq(row[C.memberships.id])
     }));
+    if (rows.length === 0 || !schema.directory) return rows;
+    // Names are decoration on a row whose authority is the membership itself, so an unresolved name
+    // is `null` and not a missing member. The directory read is one scan, not one per member: a
+    // roster is the list an admin acts on, and a 500-member club must not cost 500 REST calls.
+    const directory = await directoryLabels();
+    if (directory.error) return { error: directory.error, detail: directory.detail };
+    for (const row of rows) {
+      const label = directory.labels?.get(row.user_id);
+      row.display_name = label?.display_name || null;
+      row.nickname = label?.nickname || null;
+    }
+    return rows;
   }
 
   /**
@@ -687,6 +795,7 @@ function createClubNcbStore({ client, schema }) {
     createSystemAdmin,
     listClubs,
     listActiveClubs,
+    searchAccounts,
     createClub,
     updateClub,
     setClubStatus,

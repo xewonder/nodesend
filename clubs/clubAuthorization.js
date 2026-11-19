@@ -70,6 +70,7 @@ const isId = (value) => ID.test(String(value ?? '').trim());
 // one name nobody thought of; a positive list refuses the new name on sight.
 const BODY_FIELDS = Object.freeze({
   listClubs: { query: ['search', 'page', 'limit'], body: [] },
+  searchClubUsers: { query: ['q', 'limit'], body: [] },
   listClubMembers: { query: [], body: [] },
   setMembershipStatus: { query: [], body: ['status'] },
   createClub: { query: [], body: ['name'] },
@@ -97,6 +98,9 @@ const BODY_FIELDS = Object.freeze({
 const CLUB_ROUTES = Object.freeze([
   { op: 'listClubs', method: 'GET', path: '/clubs' },
   { op: 'createClub', method: 'POST', path: '/clubs' },
+  // Server-side addition, not part of the prepared browser contract yet: it is what removes the
+  // need to paste a technical NCB user id into an appointment form.
+  { op: 'searchClubUsers', method: 'GET', path: '/clubs/users' },
   { op: 'clubOptions', method: 'GET', path: '/clubs/options' },
   { op: 'updateClub', method: 'PATCH', path: '/clubs/:clubId' },
   { op: 'setClubStatus', method: 'POST', path: '/clubs/:clubId/status' },
@@ -122,6 +126,7 @@ const CLUB_ROUTES = Object.freeze([
 // specific missing method instead of throwing mid-request.
 const STORE_METHOD_FOR = Object.freeze({
   listClubs: 'listClubs', createClub: 'createClub', updateClub: 'updateClub', setClubStatus: 'setClubStatus',
+  searchClubUsers: 'searchAccounts',
   listClubMembers: 'listMembers', setMembershipStatus: 'setMembershipStatus',
   assignClubAdmin: 'assignClubAdmin', removeClubAdmin: 'removeClubAdmin',
   clubOptions: 'listActiveClubs', myClub: 'getMembership', setMyClub: 'setClubMembership', clearMyClub: 'setClubMembership',
@@ -209,7 +214,12 @@ function authorizeClubOperation({
 
   switch (op) {
     // ── R1: only a Super Admin manages clubs and Club Admins ──────────────
+    // The account search is R1 too, and for a sharper reason than the club list: it answers about
+    // people who are in NO club at all. A Club Admin holding it could enumerate the whole instance's
+    // accounts from within their own club's permission, which is a directory grant wearing a
+    // club-scoped one.
     case 'listClubs':
+    case 'searchClubUsers':
     case 'createClub':
     case 'updateClub':
     case 'setClubStatus':
@@ -319,11 +329,34 @@ function hasControlChars(value) {
 }
 
 /**
- * Field-level validation of the values an ALLOWED body may carry. Shape (which fields exist) is
- * already settled by validateRequestShape; this settles whether their values make sense.
+ * Field-level validation of the values an ALLOWED request may carry — body fields for the writes,
+ * query fields for the searches. Shape (which fields exist at all) is already settled by
+ * `validateRequestShape`; this settles whether their values make sense.
  */
-function validateClubInput(op, body = {}, { maxBoards = MAX_BOARDS_PER_COLLECTION } = {}) {
+function validateClubInput(op, body = {}, { maxBoards = MAX_BOARDS_PER_COLLECTION, maxRowLimit = 100, query = {} } = {}) {
   switch (op) {
+    // A QUERY search, so it is validated here rather than in `validateRequestShape`: shape has
+    // already refused any field this operation does not declare, and this settles the VALUE.
+    // The email refusal is the honest half of the feature: `user_settings` has no email column, and
+    // the account table that does hold emails cannot be read through the data route at all — NCB
+    // injects a user_id filter on it. Answering an email query with an empty result list would tell
+    // the admin that person does not exist. It does; this backend just cannot see that column.
+    case 'searchClubUsers': {
+      const raw = String(query.q ?? '').trim().replace(/\s+/g, ' ');
+      if (!raw) return badRequest('q is required: a name or nickname to search for.');
+      if (raw.length < 2) return badRequest('q must be at least 2 characters; one character matches too much of the account directory to be a useful search.');
+      if (raw.length > 200) return badRequest('q must be 200 characters or fewer.');
+      if (hasControlChars(raw)) return badRequest('q contains invalid characters.');
+      if (raw.includes('@')) return {
+        ok: false,
+        status: 400,
+        body: {
+          error: 'email_lookup_unavailable',
+          detail: 'Accounts cannot be searched by email address: the directory this relay can read holds no email column, and the account table that holds it is not readable through the data route. Search by the nickname or display name the player chose.'
+        }
+      };
+      return { ok: true, value: { q: raw, limit: boundedLimit(query.limit, maxRowLimit) } };
+    }
     case 'createClub':
     case 'updateClub':
     case 'renameCollection': {
@@ -400,7 +433,11 @@ const STORE_ERROR_STATUS = {
   // A club list read that came back as something other than a row set. 503, because "the storage
   // could not be read" is the only honest answer: as a 200 with `data: []` it is indistinguishable
   // from an empty table, which is how a successfully created club vanished from the admin screen.
-  club_read_unreadable: 503
+  club_read_unreadable: 503,
+  // The deployment declared no account directory. 503 and not an empty result set: "no search is
+  // possible here" and "nobody in BridgeMind matches that name" are different claims, and only the
+  // second one is a fact about a person.
+  club_directory_unconfigured: 503
 };
 
 function respondStoreResult(res, payload) {
@@ -593,7 +630,7 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
     try {
       const context = await resolveContext(op, req, res, options);
       if (!context) return;
-      const input = validateClubInput(op, req.body ?? {}, boardLimits);
+      const input = validateClubInput(op, req.body ?? {}, { ...boardLimits, query: req.query ?? {} });
       if (input.ok === false) {
         return void res.status(input.status).json(input.body);
       }
@@ -611,6 +648,11 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
   // is a legal club id under ID, so `PATCH /clubs/options` must never be reachable as a club edit.
   router.get('/clubs/options', (req, res) => guarded('clubOptions', req, res, {},
     () => store.listActiveClubs()));
+
+  // Registered with the other literal paths, before anything parameterised: `users` is a legal club
+  // id under ID, so a route shape that could read it as one must not exist.
+  router.get('/clubs/users', (req, res) => guarded('searchClubUsers', req, res, {},
+    (context, value) => store.searchAccounts({ q: value.q, limit: value.limit })));
 
   router.get('/clubs', (req, res) => guarded('listClubs', req, res, {},
     (context, value, request) => store.listClubs({
