@@ -68,10 +68,15 @@ function hashOf(email, secret) {
  * @param {object|null} options.reservations  createInvitationReservations() instance, or null.
  * @param {(args:{recordId:string|number})=>Promise<{ok:boolean,row?:any,reason?:string}>} [options.readRecord]
  *   reads ONE record by id, used only by recovery to learn which code a held record belongs to.
+ * @param {(args:{userId:string})=>Promise<{ok:boolean,rows?:any[],reason?:string}>} [options.assignedTo]
+ *   reads the `user_codes` records that name one account as `registered_user_id`. Recovery needs it
+ *   because completion no longer lives in the reservation table: with no writable status column, the
+ *   only way to tell "this account already registered" from "nothing was ever reserved" after a
+ *   bookkeeping row has been deleted is to ask the records themselves.
  * @param {string} options.emailSecret  key for the candidate digest (never the authenticator).
  * @param {Function} [options.event]
  */
-function createInvitationClaim({ readRows, writeRow, reservations = null, readRecord = null, emailSecret = '', event = () => {} } = {}) {
+function createInvitationClaim({ readRows, writeRow, reservations = null, readRecord = null, assignedTo = null, emailSecret = '', event = () => {} } = {}) {
   /** Records that could still be spent: right value, unused, and not already somebody's invitee. */
   async function eligible(code, forAccount = '') {
     const read = await readRows({ code });
@@ -140,15 +145,16 @@ function createInvitationClaim({ readRows, writeRow, reservations = null, readRe
       return { ok: false, outcome: OUTCOME.NO_CODE };
     }
     if (!reservations) return { ok: false, outcome: OUTCOME.UNAVAILABLE };
-    const hash = String(emailHash || '');
 
     const before = await eligible(code, account);
     const row = (before.pool || []).find((r) => String(r?.id) === String(recordId)) || null;
     if (row && isUsed(row) && allocatedTo(row) === account) {
-      // Our own claim, already landed — a retry after a lost response. Complete the reservation, do
-      // not write again.
-      const done = await reservations.complete({ reservationId, recordId, inviteeUserId: account });
-      return { ok: true, outcome: OUTCOME.ALREADY_CLAIMED, recordId, reservationConfirmed: done.ok === true };
+      /* OUR OWN CLAIM, ALREADY LANDED — a retry after a lost response, or the recovery route doing
+         its job. The evidence is `user_codes` itself, which is the only place on this instance where
+         a registration outcome has been observed to persist, so nothing is written a second time and
+         nothing has to be. The reservation row is confirmed by read alone. */
+      const held = await reservations.confirmHeld({ reservationId, recordId, emailHash });
+      return { ok: true, outcome: OUTCOME.ALREADY_CLAIMED, recordId, reservationHeld: held.ok === true };
     }
     if (row && (isUsed(row) || (allocatedTo(row) && allocatedTo(row) !== account))) {
       event('invitation_claim_conflict', { recordId, claimedBy: allocatedTo(row), attemptedBy: account });
@@ -163,23 +169,37 @@ function createInvitationClaim({ readRows, writeRow, reservations = null, readRe
       return { ok: false, outcome: OUTCOME.WRITE_FAILED, recordId, reason: written?.reason || 'write_failed' };
     }
 
-    // Verification, after the fact and never instead of the reservation.
+    /* THE VERIFICATION IS NOT RELAXED, AND IT MUST NOT BE. The write's own response is worth nothing
+       here: this vendor has been measured answering a PUT on `invitation_reservations` with
+       `200 application/json` and persisting nothing, so an acknowledged write is exactly what a
+       failed one looks like. Success therefore requires what the row says AFTER the write — `used = 1`
+       AND `registered_user_id` naming this account — and a write that answers well and leaves the row
+       untouched is reported `claim_unconfirmed`, never claimed. This is the one place the whole
+       feature could have quietly become a lie, so the rule is stated at the line that enforces it. */
     const after = await readRows({ code });
     const spent = (after?.rows || []).find((r) => String(r?.id) === String(recordId)) || null;
     if (!spent || Number(spent.used ?? 0) !== 1 || allocatedTo(spent) !== account) {
       event('invitation_claim_unconfirmed', { recordId, spent: Boolean(spent?.used), owner: allocatedTo(spent) || null });
       return { ok: false, outcome: OUTCOME.UNCONFIRMED, recordId };
     }
-    const done = await reservations.complete({ reservationId, recordId, inviteeUserId: account });
-    event('invitation_claimed', { recordId });
-    return { ok: true, outcome: OUTCOME.CLAIMED, recordId, reservationConfirmed: done.ok === true, hash };
+    const held = await reservations.confirmHeld({ reservationId, recordId, emailHash });
+    event('invitation_claimed', { recordId, reservationHeld: held.ok === true });
+    return { ok: true, outcome: OUTCOME.CLAIMED, recordId, reservationHeld: held.ok === true };
   }
 
   /**
-   * Authenticated recovery: a session NCB has already vouched for, and a pending reservation that
-   * digests to the same address the session reports. The session is the authorization; the digest is
-   * how the candidate is found. Nothing here reads a body-supplied identity, and nothing here
-   * releases, reassigns or ages out a reservation.
+   * Authenticated recovery: a session NCB has already vouched for, and the records that session
+   * reserved. The session is the authorization; the digest is how the candidates are FOUND. Nothing
+   * here reads a body-supplied identity, and nothing here releases, reassigns or ages out a row.
+   *
+   * Completion is derived, never recalled. The reservation table cannot record it — the vendor's
+   * UPDATE on that table is a measured no-op — so every question this function asks about outcome is
+   * answered by reading `user_codes`: does the reserved record name THIS account (finished), name a
+   * DIFFERENT account (conflict), or name nobody (unfinished, so drive the claim write now)? And when
+   * the address holds no reservation rows at all, `assignedTo` asks the records directly whether this
+   * account already owns one, because a registration whose bookkeeping row was deleted by hand is
+   * still a registration that happened, and telling that player their valid code failed is the same
+   * class of lie the `used` flag alone used to tell.
    */
   async function recover({ email, userId } = {}) {
     const account = String(userId ?? '').trim();
@@ -188,23 +208,23 @@ function createInvitationClaim({ readRows, writeRow, reservations = null, readRe
     if (!reservations) return { ok: false, outcome: OUTCOME.UNAVAILABLE };
     const emailHash = hashOf(sessionEmail, emailSecret);
     if (!emailHash) return { ok: false, outcome: OUTCOME.UNAVAILABLE, reason: 'reservation_key_unconfigured' };
-    const held = await reservations.pendingForEmailHash(emailHash);
+    const held = await reservations.forEmailHash(emailHash);
     if (!held.ok) return { ok: false, outcome: OUTCOME.STORE_UNAVAILABLE, reason: held.reason };
     const rows = (held.rows || []).slice().sort((a, b) => compareRecordIds(
       { id: a?.code_row_id }, { id: b?.code_row_id }
     ));
     if (!rows.length) {
-      // Nothing pending for this address. Before calling that a failure, ask the other question: is
-      // there a COMPLETED reservation naming THIS account? If so the registration finished and only
-      // the response was lost, and the honest answer is success with nothing left to do. Saying
-      // `code_not_found` here would tell a player who is already registered that their valid code
-      // failed — the same class of lie the `used` flag alone used to tell.
-      const finished = await reservations.forEmailHash(emailHash, reservations.COMPLETED);
-      const mine = (finished?.rows || []).filter((r) => String(r?.invitee_user_id ?? '') === account);
-      if (mine.length) {
-        event('invitation_recovery_already_completed', { recordId: mine[0]?.code_row_id ?? null });
-        return { ok: true, outcome: OUTCOME.ALREADY_CLAIMED, recovered: true, alreadyFinished: true,
-          recordId: mine[0]?.code_row_id ?? null };
+      /* Nothing reserved under this address. That is not the same as nothing having happened, so the
+         record side is asked before the caller is declined — and if a record already names THIS
+         account, the answer is success with nothing left to do. */
+      if (typeof assignedTo === 'function') {
+        const owned = await assignedTo({ userId: account });
+        const record = (owned?.rows || [])[0] || null;
+        if (record && allocatedTo(record) === account) {
+          event('invitation_recovery_already_assigned_from_record', { recordId: record?.id ?? null });
+          return { ok: true, outcome: OUTCOME.ALREADY_CLAIMED, recovered: true, alreadyFinished: true,
+            recordId: record?.id ?? null };
+        }
       }
       return { ok: false, outcome: OUTCOME.NOT_FOUND, candidates: 0 };
     }

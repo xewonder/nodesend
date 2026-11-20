@@ -424,7 +424,10 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     // record back in play for a second registrant while the first one's account may already exist at
     // NCB — the exact double-assignment the reservation exists to prevent. The stranded record is the
     // lesser fault and it is recoverable: the account that authenticates with this address finishes it
-    // through the authorized recovery route, and an operator marks it `abandoned` if that never comes.
+    // through the authorized recovery route. If that account never shows up, the row is an operator's
+    // decision taken in the dashboard — and retiring it as `abandoned` still holds the record, because
+    // the UNIQUE is on the row's existence, not on its status. Only deleting the row frees the
+    // invitation again, and that should follow a look at the `user_codes` record it names.
     res.on('finish', () => {
       const held = req.invitationReservation;
       if (!held || held.settled || req.invitationAccountCreated) return;

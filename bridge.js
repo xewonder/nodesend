@@ -2063,9 +2063,18 @@ function invitationRateHit(ip) {
    The shape it returns is the same vendor envelope `ncbPublicRead` produced, so the predicate in
    `findUsableInvitationRow` — exact code match, unused flag, duplicates refused — is preserved
    verbatim rather than rewritten around the new transport. */
-async function invitationRowRead({ code = "", id = "" } = {}) {
-  const filterName = code ? "code" : "id";
-  const filterValue = code ? String(code) : String(id);
+async function invitationRowRead({ code = "", id = "", registeredUserId = "" } = {}) {
+  /* ONE FILTER NAME, CHOSEN FROM THREE. The value is always URL-encoded and the name is never taken
+     from the caller, so a route cannot smuggle a fourth column name into a privileged read: NCB's
+     read grammar treats every unrecognized query name as a column and answers 500 for it, which makes
+     an open name a reliability hazard as well as an information one. `registered_user_id` is here for
+     exactly one caller — the claim's recovery path, asking whether the authenticated account already
+     owns a record — and it is answered server-side; the projection that follows keeps the caller from
+     seeing anything beyond the four fields the flow reads. */
+  let filterName = "code";
+  let filterValue = code ? String(code) : "";
+  if (!filterValue && id !== "" && id !== null && id !== undefined) { filterName = "id"; filterValue = String(id); }
+  if (!filterValue && registeredUserId) { filterName = "registered_user_id"; filterValue = String(registeredUserId); }
   if (!filterValue) return { ok: false, reason: "invitation_service_unavailable" };
   /* THE PAGE IS DECLARED, NOT INHERITED. `user_codes` has no filter on this read beyond the code
      value, and a code may carry an arbitrary number of records — so leaving the page size to the
@@ -3532,6 +3541,20 @@ const invitationClaim = INVITATION_CLAIM_MODE === "reservation" ? createInvitati
     const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
     const row = rows.find((r) => String(r?.id) === String(recordId)) || rows[0] || null;
     return { ok: true, row };
+  },
+  /* WHICH RECORDS THIS ACCOUNT ALREADY OWNS — the recovery path's substitute for a completion flag.
+     It is asked only about the account the vendor's own session reported, never about an id supplied
+     by a request body, so it cannot be pointed at another player's invitations; and the caller gets
+     back a boolean, not these rows. Recovery needs it because `invitation_reservations` has no
+     writable status column, so a registration whose bookkeeping row was deleted by hand would
+     otherwise be reported to its owner as a failed code. */
+  assignedTo: async ({ userId }) => {
+    const account = String(userId ?? '').trim();
+    if (!account) return { ok: false, reason: 'no_account_id' };
+    const read = await invitationRowRead({ registeredUserId: account });
+    if (!read.ok) return { ok: false, reason: read.reason };
+    const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
+    return { ok: true, rows: rows.filter((r) => String(r?.registered_user_id ?? '').trim() === account) };
   },
   reservations: invitationReservations,
   emailSecret: String(process.env.INVITATION_RESERVATION_HMAC_KEY || "").trim(),

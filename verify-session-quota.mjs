@@ -171,6 +171,16 @@ const ncbServer = http.createServer((req, res) => {
         ncb.hideReservationReads -= 1;
         return ok([]);
       }
+      /* A read addressed by primary key in the path is a DIFFERENT call from a filtered list read, and
+         NCB answers it differently: `data` is ONE OBJECT, not an array (measured live, and pinned by
+         the integration gate's arm 2c). Falling through to the list filter here made every by-key read
+         return the whole table, so a caller that verified "the row I just wrote" was really verifying
+         whichever row the store happened to return first — a bug in the fake that would have hidden a
+         wrong field on a real row, and it did. */
+      if (rowId) {
+        const one = ncb.rows[table].find((r) => String(r.id) === String(rowId));
+        return one ? send(200, { status: 'success', data: one }) : fail(404, 'Record not found or access denied');
+      }
       // The vendor's read grammar: limit/page/sort/order are PARAMETERS, and every other name in the
       // query is a column equality filter. Modelling them as columns here would silently turn any
       // paginated lookup into "no rows", which is exactly how the reservation adapter's
@@ -1700,7 +1710,18 @@ const createInvitationClaim = mod.createInvitationClaim || mod.default?.createIn
   check('I-12d a claim with no reservation store refuses outright, which is what the atomic-only default is',
     refusedBegin.ok === false && refusedBegin.outcome === 'claim_unavailable', JSON.stringify(refusedBegin));
 
-  const poolStub = { reserve: async () => ({ ok: true, reservationId: 1 }), complete: async () => ({ ok: true }), readByRecordId: async () => ({ ok: true, rows: [] }), pendingForEmailHash: async () => ({ ok: true, rows: [] }) };
+  // The stub mirrors the store's REAL surface: `reserve` (INSERT) and `abandon` (DELETE) are the only
+  // two writes it has, and `confirmHeld` is a read. There is no `complete` any more — the vendor's
+  // UPDATE on that table was measured answering 200 and persisting nothing, so a stub offering one
+  // would be testing an API the relay no longer has.
+  const poolStub = {
+    reserve: async () => ({ ok: true, reservationId: 1 }),
+    confirmHeld: async () => ({ ok: true, held: true, state: 'pending' }),
+    abandon: async () => ({ ok: true }),
+    readByRecordId: async () => ({ ok: true, rows: [] }),
+    findIdForRecord: async () => null,
+    forEmailHash: async () => ({ ok: true, rows: [] })
+  };
   const allocated = createInvitationClaim({
     readRows: async () => ({ ok: true, rows: [
       { id: 6, code: 'INV-ALLOC', used: 0, registered_user_id: 'someone-else' },

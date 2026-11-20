@@ -204,12 +204,20 @@ function answer(req, res, which) {
         if (table === 'user_codes' && claimFault) {
           return send(claimFault.status, claimFault.body ?? { status: 'error', message: 'write refused' });
         }
-        // `user_id` is the vendor's session-assigned ownership column and an update does not move it
-        // (measured with code 891: the PUT persisted `used` while NCB silently dropped `user_id`).
-        // Modelling that drop is what makes arm 11's "the claim never writes user_id" assertion mean
-        // something: without it, a regression to the old column would still look like it worked here.
+        /* MEASURED VENDOR BEHAVIOUR, per table. On `invitation_reservations` the PUT is answered with
+           `200 application/json` and NOTHING is persisted — diagnosed live on 2026-11-20 with the
+           NCB-stamped `user_id` echoed back and with it omitted, while an over-long `status` earns a
+           400 from the database. The fake reproduces that, because a fake that writes would let this
+           gate certify a completion UPDATE that the real vendor silently discards. On `user_codes` the
+           write does land, and `user_id` is dropped (measured, code 891) — modelling that drop is what
+           makes arm 14n's "the claim never writes user_id" assertion mean something. */
         const fields = { ...body };
         delete fields.user_id;
+        if (table === 'invitation_reservations') {
+          // The attempt itself is already in nativeLog, recorded centrally per request — so no second
+          // ledger is kept here, and an arm that wants to prove the relay never asks can read that.
+          return send(200, { status: 'success', message: 'Record updated successfully' });
+        }
         Object.assign(row, fields);
         return send(200, { status: 'success', data: row });
       }
@@ -1108,22 +1116,44 @@ check('12. a rebuilt relay with the same key opens the live handle; a different 
   // The reservation table itself, read from the fake: this is the durable artefact the design claims
   // to produce, so it is asserted rather than inferred from a 200.
   const reservationRows = rows.filter((r) => r.table === 'invitation_reservations');
-  // Two legitimate states, and no others. `completed` names the account that spent the record;
-  // `pending` is the residue of an attempt whose account-creation answer never arrived — held on
-  // purpose (arm 14w), never aged out, and releasable only by a human who has looked at the record.
-  // What must NEVER appear is a completed row with no invitee, a row in a state this code does not
-  // write, or a row that carries a credential.
-  check('14u. every reservation is completed-and-named or deliberately-pending, and none carries a credential',
+  /* APPEND-ONLY, AND PROVED SO. The reservation table has no writable completion flag on this vendor
+     (§4.4b: PUT answers 200 and persists nothing), so every row this run created must still say
+     `pending` — and that is only honest if the OUTCOME is recorded where it can be, which is
+     `user_codes`. So this arm asserts the pair together: a row that is `pending` and a spent record
+     naming the account, per successful registration. A future edit that "fixes" the row status would
+     fail here, because it would mean writing to an endpoint that does not write.
+     What must NEVER appear: a row naming nothing, a row in a state this code cannot write, a row that
+     carries a credential, or a spent record with no row holding it. */
+  const spentRecords = rows.filter((r) => r.table === 'user_codes' && Number(r.used) === 1
+    && String(r.registered_user_id ?? '').length > 0 && String(r.registered_user_id) !== 'user-somebody-else');
+  const heldRecordIds = new Set(reservationRows.map((r) => String(r.code_row_id)));
+  const orphanSpends = spentRecords.filter((r) => !heldRecordIds.has(String(r.id))).map((r) => r.id);
+  check('14u. append-only proven: every reservation row is still pending, every successful registration is proved by a spent record naming its account, and no row carries a credential',
     reservationRows.length >= 15
     && reservationRows.every((r) => String(r.code_row_id ?? '').length > 0)
-    && reservationRows.every((r) => (r.status === 'completed' && String(r.invitee_user_id ?? '').length > 0) || r.status === 'pending')
-    && reservationRows.filter((r) => r.status === 'completed').length >= 14
-    // Exactly one pending row may exist at this point, and it must be the record arm 14w proved was
-    // held on purpose. A second one means something released nothing when it should have.
-    && reservationRows.filter((r) => r.status === 'pending').every((r) => String(r.code_row_id) === '936')
+    && reservationRows.every((r) => String(r.status ?? '') === 'pending')
+    && reservationRows.every((r) => String(r.invitee_user_id ?? '') === '')
+    && spentRecords.length >= 14 && orphanSpends.length === 0
     && !JSON.stringify(reservationRows).includes('fixture-cookie') && !JSON.stringify(reservationRows).includes(COOKIE)
     && !JSON.stringify(reservationRows).includes(SEAL_KEY) && !JSON.stringify(reservationRows).includes('pw-flow-fixture'),
-    JSON.stringify(reservationRows.map((r) => ({ record: r.code_row_id, status: r.status, invitee: r.invitee_user_id }))).slice(0, 320));
+    JSON.stringify({ rows: reservationRows.length, statuses: [...new Set(reservationRows.map((r) => r.status))], spent: spentRecords.length, orphans: orphanSpends }).slice(0, 320));
+  /* THE INVARIANT, END TO END. Not "the completion failed gracefully" — the relay must never ASK.
+     Every registration, retry, recovery and release in this run went through the real mount and the
+     real claim module, so if any of them issued a PUT at the reservation table, somebody has wired a
+     dependency onto the one endpoint this vendor has been measured ignoring. `user_codes` PUTs are
+     expected and asserted elsewhere; these must be zero. */
+  const reservationPuts = nativeLog.filter((e) => e.method === 'PUT' && /\/api\/data\/update\/invitation_reservations\//.test(String(e.path)));
+  check('14x2. the relay never issues an UPDATE against invitation_reservations, at any point in the run — completion is derived, not written',
+    reservationPuts.length === 0,
+    JSON.stringify(reservationPuts.map((e) => `${e.method} ${e.path} ${JSON.stringify(e.body || '')}`).slice(0, 4)));
+  // And the positive half: the writes that DO carry the meaning went to `user_codes`, with the two
+  // fields that make a claim real. If those ever stop persisting, arm 14a/14c already reddens — this
+  // is here so the pair "no reservation PUT, yes record PUT" is on the record together.
+  const claimPuts = nativeLog.filter((e) => e.method === 'PUT' && /\/api\/data\/update\/user_codes\//.test(String(e.path)));
+  check('14x3. while the registration outcome is written where it persists: every claim is a user_codes PUT carrying used=1 and registered_user_id, and never user_id',
+    claimPuts.length >= 14 && claimPuts.every((e) => Number(e.body?.used) === 1
+      && String(e.body?.registered_user_id ?? '').length > 0 && !('user_id' in (e.body || {}))),
+    JSON.stringify({ puts: claimPuts.length, sample: claimPuts.slice(0, 2).map((e) => e.body) }).slice(0, 260));
   // Two concurrent registrations against a TWO-record code: the store must let both through, on
   // DIFFERENT records — the property a mutex-in-one-process could never deliver across replicas.
   const race2 = await Promise.all([

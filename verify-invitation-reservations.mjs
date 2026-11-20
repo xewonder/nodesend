@@ -60,7 +60,9 @@ function makeStore({ enforceUnique = true, readFails = false, writeFails = false
   const s = {
     codes: freshPool(), reservations: [], nextReservationId: 1, writes: [], refused: 0, storeFaults: 0,
     // Counters the retry arms read: how many times each operation was actually driven.
-    deletes: 0, reservationUpdates: 0, reservationCreates: 0
+    deletes: 0, reservationUpdates: 0, reservationCreates: 0,
+    // The literal UPDATE payloads, so an arm can prove which columns were sent and which were not.
+    reservationWrites: []
   };
   // A fault that fires for the first N ATTEMPTS and then stops firing, judged on how many attempts
   // PRECEDED this one. Which is the shape the probe showed (the cleanup pass failed, the retry by
@@ -78,12 +80,22 @@ function makeStore({ enforceUnique = true, readFails = false, writeFails = false
     const [verb, table, idPart] = String(p).split('/');
     if (readFails && verb === 'read') return { ok: false, httpStatus: 500, reason: 'read_failed' };
     if (verb === 'read' && table === 'user_codes') {
-      const code = new URLSearchParams(query || '').get('code');
-      const rowId = new URLSearchParams(query || '').get('id');
+      const q = new URLSearchParams(query || '');
+      const code = q.get('code');
+      const rowId = q.get('id');
+      // `registered_user_id` is the filter the recovery path uses now that the reservation table
+      // cannot record a completion. `limit` is a PARAMETER, never a column (the vendor's grammar), so
+      // it is read for truncation and never applied as a filter — the same distinction the
+      // session/quota fake had to learn the hard way.
+      const owner = q.get('registered_user_id');
+      const page = Number(q.get('limit') || 0) || 0;
       let rows = s.codes;
       if (code !== null) rows = rows.filter((r) => r.code === code);
       if (rowId !== null) rows = rows.filter((r) => String(r.id) === rowId);
-      return { ok: true, httpStatus: 200, body: { status: 'success', data: rows.map((r) => ({ ...r })) } };
+      if (owner !== null) rows = rows.filter((r) => String(r.registered_user_id ?? '') === owner);
+      const truncated = page > 0 && rows.length >= page;
+      if (page > 0) rows = rows.slice(0, page);
+      return { ok: true, httpStatus: 200, body: { status: 'success', data: rows.map((r) => ({ ...r })) }, truncated };
     }
     if (verb === 'update' && table === 'user_codes') {
       if (writeFails) return { ok: false, httpStatus: 500, reason: 'write_refused' };
@@ -97,12 +109,39 @@ function makeStore({ enforceUnique = true, readFails = false, writeFails = false
       // row rather than against the response, and this is the only way to prove it does: the fault
       // looks exactly like success from the caller's side.
       if (faults.writeLies) sent.registered_user_id = faults.writeLies;
+      // A claim write that answers 200 and persists NOTHING — the same fault the reservation table
+      // shows in production. If `user_codes` ever behaves this way, registration must be reported as
+      // unconfirmed, never as a success, and this mode is what proves that.
+      if (faults.codesNoop) {
+        return { ok: true, httpStatus: 200, body: { status: 'success', message: 'Record updated successfully' } };
+      }
+      // The flag lands and the account link does not. Reporting that as claimed would spend the
+      // invitation on nobody.
+      if (faults.codesDropsInvitee) {
+        row.used = Number(body?.used ?? row.used);
+        return { ok: true, httpStatus: 200, body: { status: 'success', data: { ...row } } };
+      }
       Object.assign(row, sent);
       return { ok: true, httpStatus: 200, body: { status: 'success', data: { ...row } } };
     }
     if (verb === 'read' && table === 'invitation_reservations') {
       const q = new URLSearchParams(query || '');
       const rowId = q.get('code_row_id'); const hash = q.get('invitee_email_hash');
+      // A read addressed by primary key in the PATH is a different call from a filtered list read, and
+      // the vendor answers it differently: `data` is ONE OBJECT, not an array (measured live, and
+      // pinned by the integration gate's arm 2c). Ignoring `idPart` here made every by-key read return
+      // the whole table and let `complete()` verify whatever row happened to be first — a bug in the
+      // fake, not in the design, and the kind that makes a green gate mean nothing.
+      if (idPart) {
+        // The fault models NCB private-mode invisibility: the row EXISTS and is not deleted, but this
+        // session can no longer read it. Answering 404 only for genuinely-absent rows would model a
+        // plain miss, which is a different fault and would leave the real one untested.
+        if (faults.readByIdInvisible) return { ok: false, httpStatus: 404, body: { status: 'error', message: 'Record not found or access denied' } };
+        const one = s.reservations.find((r) => String(r.id) === idPart);
+        return one
+          ? { ok: true, httpStatus: 200, body: { status: 'success', data: { ...one } } }
+          : { ok: false, httpStatus: 404, body: { status: 'error', message: 'Record not found or access denied' } };
+      }
       let rows = s.reservations;
       if (rowId !== null) rows = rows.filter((r) => String(r.code_row_id) === rowId);
       if (hash !== null) rows = rows.filter((r) => String(r.invitee_email_hash) === hash);
@@ -118,7 +157,14 @@ function makeStore({ enforceUnique = true, readFails = false, writeFails = false
       }
       if (body?.validationBad) return { ok: false, httpStatus: 422, body: { status: 'error', message: 'validation failed' } };
       if (failCreate) return { ok: false, httpStatus: 500, reason: 'reservation_insert_failed' };
-      const row = { id: s.nextReservationId++, code_row_id: rid, invitee_email_hash: body?.invitee_email_hash ?? '', status: 'pending' };
+      // The live run proved NCB stamps `user_id` on INSERT with the Clubs service-account id, so the
+      // fake carries it too. Without it, "the update must never send user_id" and "replacement
+      // semantics must not erase the owner" would both be untestable — the column simply has to exist
+      // for a wrong write to destroy it.
+      const row = {
+        id: s.nextReservationId++, code_row_id: rid, invitee_email_hash: body?.invitee_email_hash ?? '',
+        status: 'pending', invitee_user_id: '', user_id: 'club-svc-1', created_at: '2026-11-20 00:00:00'
+      };
       s.reservations.push(row);
       // THE WRITE LANDS AND THE ANSWER DOES NOT. This is the fault a blind retry would double-spend:
       // the row is in the table, the caller heard nothing, and a second INSERT would either be
@@ -128,20 +174,19 @@ function makeStore({ enforceUnique = true, readFails = false, writeFails = false
       }
       return { ok: true, httpStatus: 201, body: { status: 'success', id: row.id } };
     }
+    /* THE VENDOR'S UPDATE ON THIS TABLE, REPRODUCED EXACTLY. Measured live on 2026-11-20 against the
+       permanent table: `PUT /update/invitation_reservations/<id>` answers `200 application/json` and
+       writes NOTHING — identically with and without the NCB-stamped `user_id` in the body, while a
+       60-character `status` earns a 400 database validation error. So the request arrives, is
+       validated, and is not applied. This fake models that and NOTHING ELSE: it does not write, and it
+       counts the attempt, so an arm can prove the relay never asks. If a future edit reintroduces a
+       completion UPDATE, every registration in this file still passes on the record side — but the
+       "no UPDATE is ever issued" arm goes red, which is the point. */
     if (verb === 'update' && table === 'invitation_reservations') {
-      const updatesBefore = s.reservationUpdates; s.reservationUpdates++;
-      const row = s.reservations.find((r) => String(r.id) === idPart);
-      if (!row) return { ok: false, httpStatus: 404, reason: 'reservation_not_found' };
-      if (fires(updatesBefore, faults.updateRefusals)) {
-        return { ok: false, httpStatus: 500, reason: 'reservation_update_failed' };
-      }
-      Object.assign(row, body);
-      // The completion wrote, and the response was lost. Only a read-back can tell this from a
-      // failure, which is why `complete()` reads the row instead of believing the call.
-      if (fires(updatesBefore, faults.updateLostResponses)) {
-        return { ok: false, httpStatus: 0, reason: 'socket hang up' };
-      }
-      return { ok: true, httpStatus: 200, body: { status: 'success', data: { ...row } } };
+      s.reservationUpdates++;
+      s.reservationWrites.push({ id: idPart, body: JSON.parse(JSON.stringify(body ?? {})) });
+      if (faults.updateRefusals) return { ok: false, httpStatus: 500, reason: 'reservation_update_failed' };
+      return { ok: true, httpStatus: 200, body: { status: 'success', message: 'Record updated successfully' } };
     }
     if (verb === 'delete' && table === 'invitation_reservations') {
       const deletesBefore = s.deletes; s.deletes++;
@@ -175,10 +220,18 @@ function build(storeOpts = {}) {
   });
   const claim = createInvitationClaim({
     readRows: async ({ code }) => {
-      const r = await request({ path: 'read/user_codes', method: 'GET', query: `code=${encodeURIComponent(code)}` });
+      const r = await request({ path: 'read/user_codes', method: 'GET', query: `code=${encodeURIComponent(code)}&limit=200` });
       return r.ok
-        ? { ok: true, rows: r.body?.data ?? [], truncated: storeOpts.truncated === true }
+        ? { ok: true, rows: r.body?.data ?? [], truncated: storeOpts.truncated === true || r.truncated === true }
         : { ok: false, reason: r.reason };
+    },
+    // The same adapter bridge.js installs: recovery asks which records THIS account owns, because the
+    // reservation table can no longer answer that.
+    assignedTo: async ({ userId }) => {
+      const r = await request({ path: 'read/user_codes', method: 'GET', query: `registered_user_id=${encodeURIComponent(String(userId))}&limit=200` });
+      if (!r.ok) return { ok: false, reason: r.reason };
+      const rows = (r.body?.data ?? []).filter((x) => String(x.registered_user_id ?? '') === String(userId));
+      return { ok: true, rows };
     },
     readRecord: async ({ recordId }) => {
       const r = await request({ path: 'read/user_codes', method: 'GET', query: `id=${encodeURIComponent(String(recordId))}` });
@@ -336,8 +389,14 @@ await check('R15. recovery completes the interrupted registration for the accoun
   const begun = await claim.begin({ code: '123', email: emailA });
   const recovered = await claim.recover({ email: emailA, userId: 'acct-new-1' });
   const row = store.codes.find((r) => r.id === begun.recordId);
+  // Completion is proved by the RECORD, and the reservation row is left exactly as it was inserted —
+  // `pending` forever is the normal state of a finished registration on this vendor, not a stuck one.
+  // What matters is that the record now names the account the session reported, and that the relay
+  // never asked the dead endpoint to say so.
   return recovered.ok === true && recovered.recovered === true && Number(row.used) === 1
-    && row.registered_user_id === 'acct-new-1' && store.reservations[0].status === 'completed'
+    && row.registered_user_id === 'acct-new-1'
+    && String(store.reservations[0].status) === 'pending' && store.reservationUpdates === 0
+    && recovered.reservationHeld === true
     || { ok: false, why: JSON.stringify(recovered) };
 });
 await check('R16. recovery is authorized by the session, not by knowing an address: a different verified account completes nothing', async () => {
@@ -371,8 +430,11 @@ await check('R18b. a retry after completion reports already_claimed with NO seco
   await claim.finish({ code: '123', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
   const writesBefore = store.writes.length;
   const recovered = await claim.recover({ email: emailA, userId: 'acct-a' });
-  return recovered.ok === true && recovered.outcome === 'already_claimed' && recovered.alreadyFinished === true
-    && store.writes.length === writesBefore
+  // `alreadyFinished` belongs to the case where the bookkeeping row is GONE (R41); here the row is
+  // still there, so the answer comes from reading the record. Both say already_claimed, and neither
+  // writes anything — which is the half that makes the answer safe rather than merely friendly.
+  return recovered.ok === true && recovered.outcome === 'already_claimed' && recovered.recovered === true
+    && store.writes.length === writesBefore && store.reservationUpdates === 0
     || { ok: false, why: JSON.stringify(recovered) };
 });
 await check('R18c. and that completed reservation is invisible to a different account, which is still declined', async () => {
@@ -506,31 +568,28 @@ await check('R31. a store that never accepts the DELETE is reported as a failure
     && rival.ok === true && rival.recordId === 201
     || { ok: false, why: `${JSON.stringify(released)} deletes=${store.deletes} held=${stillHeld} rival=${rival.recordId}` };
 });
-// ── RESERVATION COMPLETION, AND THE ANSWERS THAT NEVER ARRIVED ──────────────
-await check('R32. completion cannot be confirmed: the registration is still claimed (the record proves it), the reservation stays pending, and recovery neither re-writes nor re-claims it', async () => {
+// ── APPEND-ONLY: COMPLETION IS DERIVED, NEVER WRITTEN ─────────────────────
+await check('R32. a store that refuses UPDATE changes nothing, because nothing writes there: the claim completes and the row stays as inserted', async () => {
   const { claim, store } = build({ faults: { updateRefusals: Infinity } });
   const begun = await claim.begin({ code: 'TEN', email: emailA });
   const done = await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
   const row = store.codes.find((r) => r.id === 200);
-  const writesAfterClaim = store.writes.length;
-  // The bookkeeping fault is still in force here, which is the point: recovery must read the RECORD
-  // and conclude "this account already owns it", not take a second record or write the row twice
-  // because the reservation never said `completed`.
-  const recovered = await claim.recover({ email: emailA, userId: 'acct-a' });
-  return done.ok === true && done.outcome === 'claimed' && done.reservationConfirmed === false
+  return done.ok === true && done.outcome === 'claimed' && done.reservationHeld === true
     && Number(row.used) === 1 && String(row.registered_user_id) === 'acct-a'
-    && String(store.reservations[0].status) === 'pending'
-    && recovered.ok === true && recovered.outcome === 'already_claimed'
-    && writesAfterClaim === store.writes.length && store.reservations.length === 1
-    || { ok: false, why: `${JSON.stringify(done)} status=${store.reservations[0]?.status} recovered=${JSON.stringify(recovered)} writes=${store.writes.length}/${writesAfterClaim}` };
+    && String(store.reservations[0].status) === 'pending' && store.reservationUpdates === 0
+    || { ok: false, why: `${JSON.stringify(done)} status=${store.reservations[0]?.status} puts=${store.reservationUpdates}` };
 });
-await check('R33. completion wrote but its answer was lost: the read-back is the authority, and the reservation is reported completed', async () => {
-  const { claim, store } = build({ faults: { updateLostResponses: Infinity } });
+await check('R33. THE INVARIANT: across a registration, a duplicate retry, a recovery and a release, the relay issues NO UPDATE against invitation_reservations', async () => {
+  const { claim, store } = build();
   const begun = await claim.begin({ code: 'TEN', email: emailA });
-  const done = await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
-  return done.ok === true && done.reservationConfirmed === true
-    && String(store.reservations[0].status) === 'completed' && String(store.reservations[0].invitee_user_id) === 'acct-a'
-    || { ok: false, why: `${JSON.stringify(done)} row=${JSON.stringify(store.reservations[0])}` };
+  await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  await claim.recover({ email: emailA, userId: 'acct-a' });
+  const other = await claim.begin({ code: 'TEN', email: emailB });
+  await claim.release(other);
+  // Any PUT to that table is a regression toward the endpoint the live vendor proved does not work.
+  const puts = store.reservationWrites.length + store.reservationUpdates;
+  return puts === 0 || { ok: false, why: `${puts} UPDATE(s) issued against the reservation table` };
 });
 await check('R34. the reservation INSERT landed but its answer did not: the store is asked who holds the record, and NO second record is consumed', async () => {
   const { claim, store } = build({ faults: { createLostResponses: Infinity } });
@@ -568,6 +627,123 @@ await check('R37. and the same truncated page that DOES hold a free record still
   return r.ok === true && r.recordId === 8 || { ok: false, why: JSON.stringify(r) };
 });
 
+// ── THE CLAIM WRITE IS VERIFIED, AND NOTHING ELSE ────────────────────────
+// `user_codes` is the one place a registration outcome has been OBSERVED to persist, and the whole
+// design now rests on that write having happened. These arms make the relay prove it every time: a
+// write that answers well and changes nothing must be reported as a failure, never as a success.
+await check('R38. if user_codes UPDATE ever no-ops the way the reservation table does, the claim is reported unconfirmed — success is never inferred from a response', async () => {
+  const { claim, store } = build({ faults: { codesNoop: true } });
+  const begun = await claim.begin({ code: 'TEN', email: emailA });
+  const done = await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  const row = store.codes.find((r) => r.id === 200);
+  // The reservation is deliberately NOT released: an account was created, so the record must stay held.
+  return done.ok === false && done.outcome === 'claim_unconfirmed'
+    && Number(row.used) === 0 && String(row.registered_user_id ?? '') === ''
+    && String(store.reservations[0].status) === 'pending' && store.reservations.length === 1
+    || { ok: false, why: `${JSON.stringify(done)} row=${JSON.stringify(row)}` };
+});
+await check('R39. a claim write that lands used=1 but drops registered_user_id is unconfirmed — an invitation spent on nobody is never a success', async () => {
+  const { claim, store } = build({ faults: { codesDropsInvitee: true } });
+  const begun = await claim.begin({ code: 'TEN', email: emailA });
+  const done = await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  const row = store.codes.find((r) => r.id === 200);
+  return done.ok === false && done.outcome === 'claim_unconfirmed'
+    && Number(row.used) === 1 && String(row.registered_user_id ?? '') === ''
+    || { ok: false, why: `${JSON.stringify(done)} row=${JSON.stringify(row)}` };
+});
+await check('R40. requirement 6: a completed invitation is never assignable again while its reservation row still says pending — the UNIQUE and the record both refuse it', async () => {
+  const { claim, store } = build();
+  const first = await claim.begin({ code: 'TEN', email: emailA });
+  const done = await claim.finish({ code: 'TEN', recordId: first.recordId, reservationId: first.reservationId, userId: 'acct-a', emailHash: first.emailHash });
+  const statusOf200 = String(store.reservations.find((r) => String(r.code_row_id) === '200').status);
+  // A second registration on the same code value must land on a DIFFERENT record…
+  const second = await claim.begin({ code: 'TEN', email: emailB });
+  await claim.finish({ code: 'TEN', recordId: second.recordId, reservationId: second.reservationId, userId: 'acct-b', emailHash: second.emailHash });
+  // …and once every record is held or spent, the answer is exhaustion, not a re-spend of record 200.
+  const others = [];
+  for (let i = 0; i < 9; i++) {
+    const b = await claim.begin({ code: 'TEN', email: `extra${i}@example.com` });
+    if (b.ok) { others.push(b.recordId); await claim.finish({ code: 'TEN', recordId: b.recordId, reservationId: b.reservationId, userId: `acct-x${i}`, emailHash: b.emailHash }); }
+    else others.push(b.outcome);
+  }
+  const spentByA = store.codes.filter((r) => r.code === 'TEN' && r.registered_user_id === 'acct-a');
+  return done.ok === true && statusOf200 === 'pending' && second.recordId === 201
+    && !others.includes(200) && spentByA.length === 1 && Number(spentByA[0].used) === 1
+    || { ok: false, why: `status=${statusOf200} second=${second.recordId} others=${others.join(',')} byA=${spentByA.length}` };
+});
+// ── RECOVERY, DERIVED FROM THE RECORD ─────────────────────────────────────
+await check('R41. recovery after the bookkeeping row is deleted by hand still tells the truth: the account that owns the record already registered', async () => {
+  const { claim, store } = build();
+  const begun = await claim.begin({ code: 'TEN', email: emailA });
+  await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  // An operator removed the reservation. The registration still happened, and only user_codes says so.
+  store.reservations.length = 0;
+  const recovered = await claim.recover({ email: emailA, userId: 'acct-a' });
+  return recovered.ok === true && recovered.outcome === 'already_claimed' && recovered.alreadyFinished === true
+    && String(recovered.recordId) === '200' && store.writes.length === 1
+    || { ok: false, why: `${JSON.stringify(recovered)} writes=${store.writes.length}` };
+});
+await check('R42. and the same empty state for an account that owns nothing is a DECLINE, not a success — recovery cannot be talked into crediting a stranger', async () => {
+  const { claim, store } = build();
+  const begun = await claim.begin({ code: 'TEN', email: emailA });
+  await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  store.reservations.length = 0;
+  const nobody = await claim.recover({ email: 'someone.else@example.com', userId: 'acct-someone-else' });
+  const row = store.codes.find((r) => r.id === 200);
+  return nobody.ok === false && nobody.outcome === 'code_not_found'
+    && String(row.registered_user_id) === 'acct-a' && Number(row.used) === 1
+    || { ok: false, why: `${JSON.stringify(nobody)} row=${JSON.stringify(row)}` };
+});
+await check('R43. a retry whose response was lost reports already_claimed with NO second write and no second record', async () => {
+  const { claim, store } = build();
+  const begun = await claim.begin({ code: 'TEN', email: emailA });
+  await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  const writes = store.writes.length;
+  const again = await claim.finish({ code: 'TEN', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-a', emailHash: begun.emailHash });
+  const recovered = await claim.recover({ email: emailA, userId: 'acct-a' });
+  return again.ok === true && again.outcome === 'already_claimed'
+    && recovered.ok === true && recovered.outcome === 'already_claimed'
+    && store.writes.length === writes && store.reservations.length === 1
+    || { ok: false, why: `${again.outcome}/${recovered.outcome} writes=${store.writes.length}/${writes}` };
+});
+await check('R44. confirmHeld refuses a row an operator retired — an abandoned reservation is never presented as this registration’s', async () => {
+  const { reservations, store } = build();
+  const made = await reservations.reserve({ recordId: 'ZZ-905', emailHash: 'hash-905' });
+  store.reservations.find((r) => String(r.id) === String(made.reservationId)).status = 'abandoned';
+  const held = await reservations.confirmHeld({ reservationId: made.reservationId, recordId: 'ZZ-905' });
+  return held.ok === false && held.reason === 'reservation_abandoned_by_operator'
+    || { ok: false, why: JSON.stringify(held) };
+});
+await check('R45. confirmHeld refuses a row naming a DIFFERENT record, and a row whose digest is not ours — read-back is the authority here too', async () => {
+  const { reservations, store } = build();
+  const made = await reservations.reserve({ recordId: 'ZZ-906', emailHash: 'hash-906' });
+  const wrongRecord = await reservations.confirmHeld({ reservationId: made.reservationId, recordId: 'ZZ-999' });
+  const wrongDigest = await reservations.confirmHeld({ reservationId: made.reservationId, recordId: 'ZZ-906', emailHash: 'hash-SOMEONE-ELSE' });
+  // A row addressed by an id that is not in the table is ABSENT, which the operator must be able to
+  // tell apart from a store that did not answer: the first means the record is unreserved again.
+  const absent = await reservations.confirmHeld({ reservationId: 99999, recordId: 'ZZ-906' });
+  return wrongRecord.ok === false && wrongRecord.reason === 'reservation_record_mismatch'
+    && wrongDigest.ok === false && wrongDigest.reason === 'reservation_digest_mismatch'
+    && absent.ok === false && absent.reason === 'reservation_row_absent'
+    || { ok: false, why: `${JSON.stringify([wrongRecord, wrongDigest, absent])}` };
+});
+await check('R46. a release is never banked on a row this session could not see: DELETE on an invisible reservation is reported as not attributable, not as released', async () => {
+  const { reservations } = build({ faults: { readByIdInvisible: true } });
+  const made = await reservations.reserve({ recordId: 'ZZ-908', emailHash: 'hash-908' });
+  const released = await reservations.abandon({ reservationId: made.reservationId, recordId: 'ZZ-908' });
+  return released.ok === false && released.reason === 'reservation_never_visible_to_release'
+    || { ok: false, why: JSON.stringify(released) };
+});
+await check('R47. requirement 6 again at the store: a spent record stays unreservable forever, pending status and all — that is the single-use guarantee', async () => {
+  const { claim, store } = build();
+  const begun = await claim.begin({ code: '777', email: emailA });
+  await claim.finish({ code: '777', recordId: begun.recordId, reservationId: begun.reservationId, userId: 'acct-777', emailHash: begun.emailHash });
+  const rival = await claim.begin({ code: '777', email: emailB });
+  const row = store.codes.find((r) => r.id === 500);
+  return rival.ok === false && rival.outcome === 'invitation_exhausted'
+    && Number(row.used) === 1 && String(row.registered_user_id) === 'acct-777' && row.user_id === 'issuer'
+    || { ok: false, why: `${JSON.stringify(rival)} row=${JSON.stringify(row)}` };
+});
 const failed = results.filter((r) => !r.pass);
 for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? `   [${r.detail}]` : ''}`);
 console.log(`\nRESULTS: ${results.length - failed.length}/${results.length} passed, ${failed.length} failed  (invitation reservations)`);

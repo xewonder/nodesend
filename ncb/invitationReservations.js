@@ -15,19 +15,35 @@ What the key is, and what it is not. The unique column holds the RECORD ID, neve
 issued — so a UNIQUE on the code string would have destroyed the feature while looking like it was
 being protected. Reserving a record does not reserve a code.
 
-States: `pending` (reserved, account not yet created or not yet claimed), `completed` (spent and
-linked to an account), `abandoned` (an operator's judgement, never this code's). There is no `expired`
-state and no age-based release, deliberately: a reservation that could be stolen because it sat still
-is a reservation that can be stolen. Recovery reads state and identity, it never overwrites them.
+THIS TABLE IS APPEND-ONLY, AND THAT IS A MEASURED CONSTRAINT, NOT A PREFERENCE. Live diagnosis on
+2026-11-20 (report §4.4b): against `invitation_reservations`, INSERT, the UNIQUE refusal, the filtered
+read, the primary-key read and DELETE all behave correctly, while `PUT /update/invitation_reservations/<id>`
+answers `200 application/json` and persists NOTHING — with the NCB-stamped `user_id` echoed back, and
+with it omitted, identically. The same request carrying a 60-character `status` into `VARCHAR(16)`
+answers `400` with a database validation error, so the request is reaching the database layer: this is
+not a routing failure, not a payload shape, and not a row we cannot see. It is the vendor's UPDATE path
+declining to write to a `private` table. `ncba_rls_config` carries no row for this table (private) and
+`public_read,shared_readwrite` for `user_codes` — which is the one behavioural difference between the
+endpoint that works and the endpoint that does not.
 
-What is stored, and what never is: the record id, a keyed digest of the normalized invitee email, the
-status, and after completion the invitee's user id. Never a password, never an upstream cookie, never a
-bearer, never a vendor session identifier. The email digest is a LOOKUP CANDIDATE, not an
-authenticator — see ncb/invitationClaim.js for why holding an email proves nothing and how recovery is
-actually authorized.
+So no code in this file issues an UPDATE, and none ever will. Consequences, stated where they matter:
+the reservation row is written once and never revised; `status` keeps the value it was inserted with;
+completion is NOT recorded here — it is derived from `user_codes.registered_user_id`, which the claim
+verifies by read-back. A row that remains `pending` forever is therefore the normal state of a
+successful registration, not a stuck one, and it is exactly what makes the record unclaimable twice:
+the UNIQUE still holds. There is no `expired` state and no age-based release, deliberately: a
+reservation that could be stolen because it sat still is a reservation that can be stolen.
+
+What is stored, and what never is: the record id, a keyed digest of the normalized invitee email, and
+the status at insertion. Never a password, never an upstream cookie, never a bearer, never a vendor
+session identifier. The email digest is a LOOKUP CANDIDATE, not an authenticator — see
+ncb/invitationClaim.js for why holding an email proves nothing and how recovery is authorized.
 */
 
 const RESERVED = 'pending';
+// Read-only constants. `completed` is NOT a state this relay can write — it is kept so that a row an
+// operator or the vendor has advanced is recognised rather than treated as corrupt, and so that the
+// vocabulary in the table matches the vocabulary in the dashboard.
 const COMPLETED = 'completed';
 const ABANDONED = 'abandoned';
 
@@ -142,33 +158,53 @@ function createInvitationReservations({
     return { ok: false, reason: attempt?.reason || 'reservation_store_unavailable', httpStatus: attempt?.httpStatus ?? 0 };
   }
 
-  async function complete({ reservationId, recordId, inviteeUserId }) {
+  /* NO UPDATE IS ISSUED AGAINST THIS TABLE. There is no payload builder here on purpose: the only
+     writes are the reservation INSERT and the release DELETE, both of which the live diagnosis proved
+     to work. A previous revision of this file built a full read-modify-write body for a completion
+     PUT; that PUT was measured answering 200 and persisting nothing, with and without the vendor's
+     `user_id`, so the shape of the body was never the question and the code that built it is gone. */
+
+  /* CONFIRM HELD — read-only, and it replaces the completion UPDATE entirely.
+
+     The reservation row is the whole record of the claim. What this checks is the one thing still
+     worth checking after the account exists and `user_codes` has been written and read back: that OUR
+     row is still the row holding this record. It writes nothing, so the vendor's silent no-op cannot
+     mislead it, and it is not a state transition. Completion itself is derived from
+     `user_codes.registered_user_id` by ncb/invitationClaim.js — that column answers "who got this
+     invitation", and it is the only place on this instance where a registration outcome has been
+     observed to persist (its policy is `public_read,shared_readwrite`, and it is verified by
+     read-back, never by the response). */
+  async function confirmHeld({ reservationId, recordId, emailHash = '' }) {
     const target = reservationId ?? (await findIdForRecord(recordId));
     if (!target) return { ok: false, reason: 'reservation_not_found' };
-    const body = { status: COMPLETED, invitee_user_id: String(inviteeUserId ?? '') };
-    let lastReason = 'reservation_update_failed';
-    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      const res = await request({ path: path('update', target), method: 'PUT', body });
-      if (res && res.ok === true) lastReason = null;
-      else lastReason = res?.reason || 'reservation_update_failed';
-      // THE READ-BACK IS THE AUTHORITY, not the response. Completion is an idempotent write of two
-      // fixed fields to one primary key, so re-driving it after a lost answer is safe, and an update
-      // that reported failure but landed is still a completion — reported from what the row says.
-      const back = await request({ path: path('read', target), method: 'GET' });
-      const row = rowsOf(back?.body)[0] || {};
-      if (String(row?.status ?? '') === COMPLETED) {
-        log('invitation_reservation_completed', { reservationId: target, attempts: attempt });
-        return { ok: true, reservationId: target, attempts: attempt };
-      }
-      if (attempt < ATTEMPTS) await settle(DELAY_MS * attempt);
+    const found = await request({ path: path('read', target), method: 'GET' });
+    if (!found || found.ok !== true) {
+      /* A 404 and a 500 mean different things and the operator has to be able to tell them apart:
+         the first is "this row is not here any more" (someone deleted it, and the record it protected
+         is now reservable again by anyone), the second is "the store did not answer" and says nothing
+         at all about the row. Both refuse the confirmation — neither is ever read as held. */
+      if (found?.httpStatus === 404) return { ok: false, reason: 'reservation_row_absent', reservationId: target };
+      return { ok: false, reason: found?.reason || 'reservation_read_failed', reservationId: target };
     }
-    /* Unconfirmed, not denied. The record it describes is already spent and already names this
-       account — that half was verified by the claim read-back before this function was called. A
-       reservation left `pending` is therefore bookkeeping the recovery route can still finish for
-       the SAME account, so this returns rather than throwing, and the caller reports the
-       registration as what it is. */
-    log('invitation_reservation_completion_unconfirmed', { reservationId: target, reason: lastReason });
-    return { ok: false, unconfirmed: true, reason: lastReason, reservationId: target, attempts: ATTEMPTS };
+    const row = rowsOf(found.body)[0] || null;
+    if (!row) return { ok: false, reason: 'reservation_row_absent', reservationId: target };
+    // The row must name the record it was taken for. Anything else is somebody else's reservation and
+    // a reply this call has no business presenting as its own.
+    if (String(row.code_row_id ?? '') !== String(recordId)) {
+      log('invitation_reservation_record_mismatch', {
+        reservationId: target, expected: String(recordId), found: String(row.code_row_id ?? '')
+      });
+      return { ok: false, reason: 'reservation_record_mismatch', reservationId: target };
+    }
+    if (emailHash && String(row.invitee_email_hash ?? '') !== String(emailHash)) {
+      return { ok: false, reason: 'reservation_digest_mismatch', reservationId: target };
+    }
+    const state = String(row.status ?? '');
+    // `abandoned` is an operator's decision, made in the dashboard because nothing here can write it.
+    // A row a human retired is not a claim this registration may present as its own, whatever
+    // `user_codes` now says, so it is refused rather than reinterpreted.
+    if (state === ABANDONED) return { ok: false, reason: 'reservation_abandoned_by_operator', reservationId: target };
+    return { ok: true, reservationId: target, state, held: true };
   }
 
   async function findIdForRecord(recordId) {
@@ -176,27 +212,22 @@ function createInvitationReservations({
     return found.ok && found.rows.length ? found.rows[0].id : null;
   }
 
-  /** Recovery candidates in one state. `pending` by default; `completed` is asked for separately. */
-  async function forEmailHash(emailHash, status = RESERVED) {
+  /* Recovery candidates for one digest — ALL of them, with no status filter.
+
+     Filtering on `pending` was harmless when this code wrote `completed`, and is now silently
+     load-bearing in the wrong direction: every row this relay creates stays as inserted, so a status
+     filter would only ever exclude rows an operator changed by hand. What recovery actually needs is
+     every record this address ever reserved, and the ANSWER to "did it finish" comes from the record
+     itself. A row an operator retired is still returned here, and `confirmHeld` is what refuses it. */
+  async function forEmailHash(emailHash) {
     if (!emailHash) return { ok: true, rows: [] };
     const res = await request({
       path: path('read'), method: 'GET',
       query: `invitee_email_hash=${encodeURIComponent(String(emailHash))}&limit=25`
     });
     if (!res || res.ok !== true) return { ok: false, reason: res?.reason || 'reservation_read_failed' };
-    const rows = rowsOf(res.body).filter((r) => String(r?.invitee_email_hash ?? '') === String(emailHash)
-      && String(r?.status ?? '') === String(status));
+    const rows = rowsOf(res.body).filter((r) => String(r?.invitee_email_hash ?? '') === String(emailHash));
     return { ok: true, rows };
-  }
-
-  /**
-   * `completed` is queried by the recovery path for one reason: to tell "this registration already
-   * finished" apart from "nothing was ever reserved for you". Without that second reading, a client
-   * whose sign-up response was lost in transit is told its valid code failed, when the truth is that
-   * it succeeded a minute ago — and the retry writes nothing either way.
-   */
-  async function pendingForEmailHash(emailHash) {
-    return forEmailHash(emailHash, RESERVED);
   }
 
   /**
@@ -225,6 +256,15 @@ function createInvitationReservations({
        as a stuck reservation would strand a record out of a small pool forever, because nothing in
        this design ages a reservation out. */
     let lastReason = 'reservation_release_failed';
+    /* Was it visible to us before we tried to remove it? Under a private policy a 404 afterwards means
+       either "deleted" or "still there, but no longer readable by this session", and the REST API
+       cannot distinguish them. Only the first may be reported as a release, so the pre-delete read is
+       what makes the claim mean something rather than merely sound clean. */
+    let wasVisible = true;
+    {
+      const pre = await request({ path: path('read', reservationId), method: 'GET' });
+      wasVisible = Boolean(rowsOf(pre?.body)[0]);
+    }
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const res = await request({ path: path('delete', reservationId), method: 'DELETE' });
       if (res && res.ok === true) lastReason = null;
@@ -235,6 +275,11 @@ function createInvitationReservations({
       if (back && back.ok === true) {
         const stillThere = (back.rows || []).some((r) => String(r?.id) === String(reservationId));
         if (!stillThere) {
+          if (!wasVisible) {
+            // Never visible, so never provably released by this call. Report it rather than banking it.
+            log('invitation_reservation_release_not_attributable', { reservationId, recordId });
+            return { ok: false, reason: 'reservation_never_visible_to_release', reservationId, attempts: attempt };
+          }
           log('invitation_reservation_released', { reservationId, recordId, attempts: attempt });
           return { ok: true, reservationId, attempts: attempt };
         }
@@ -251,8 +296,11 @@ function createInvitationReservations({
 
   return {
     RESERVED, COMPLETED, ABANDONED, table,
-    reserve, complete, abandon, readByRecordId, findIdForRecord,
-    forEmailHash, pendingForEmailHash,
+    // `reserve` (INSERT) and `abandon` (DELETE) are the only two writes this store performs, and
+    // `confirmHeld` is a read. There is no `complete` any more: the vendor's UPDATE on this table was
+    // measured answering 200 and persisting nothing, so completion is derived from
+    // `user_codes.registered_user_id` by the claim module.
+    reserve, confirmHeld, abandon, readByRecordId, findIdForRecord, forEmailHash,
     looksLikeDuplicate
   };
 }
