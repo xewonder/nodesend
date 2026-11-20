@@ -61,6 +61,9 @@ const crypto = require("crypto");
 // bridge.js contributes one thing this file cannot: its own session resolver.
 const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs");
 const { buildNcbGateway, createCorsResolver } = require("./ncb/gateway");
+const { createInvitationClaim } = require("./ncb/invitationClaim");
+const { createInvitationReservations } = require("./ncb/invitationReservations");
+const { normalizeInvitationCode: sharedInvitationCode } = require("./ncb/invitationCode.js");
 const { createNcbSessionAuthority, looksSealed } = require("./ncb/sessionAuthority.js");
 const { createNcbNativeClient } = require("./ncb/nativeClient.js");
 // One definition of "which transport, and is it configured enough to use", shared with the club
@@ -170,7 +173,19 @@ function ncbTransportHealth() {
     // Whether THIS process can mint and open the credential a browser holds. False is a deployment
     // fault with a named cause, not a player being signed out.
     sealedSessions: ncbAuthority.configured,
-    sealedSessionsReason: ncbAuthority.reason
+    sealedSessionsReason: ncbAuthority.reason,
+    // Which claim contract this process is honouring, read at call time so it cannot drift from the
+    // wiring below. `atomic-only` is the default and means registration is refused rather than
+    // attempted on a non-atomic write — see the INVITATION_CLAIM_MODE block near the club mount.
+    invitationClaim: typeof INVITATION_CLAIM_MODE === 'string' ? INVITATION_CLAIM_MODE : 'atomic-only',
+    // The reservation store separately, because `reservation` mode WITHOUT a store is a deployment
+    // that will refuse every claim for a reason that is invisible from the mode alone. Table NAME is
+    // reported, never contents: it is configuration, and it is what an operator needs to see to know
+    // the arbitration is happening in the database and not in this process's memory.
+    reservationStoreWired: typeof invitationReservations !== 'undefined' ? Boolean(invitationReservations) : false,
+    reservationTable: invitationReservations?.table ?? null,
+    reservationKeyConfigured: typeof process.env.INVITATION_RESERVATION_HMAC_KEY === 'string'
+      && String(process.env.INVITATION_RESERVATION_HMAC_KEY).trim().length >= 32
   };
 }
 
@@ -295,7 +310,11 @@ async function resolveSessionUser(req) {
     // Carried on the request so the data calls for THIS request are made as this player. Nothing
     // downstream re-derives the identity, and nothing here returns the cookie to a caller.
     req.ncbCaller = { userId: resolved.userId, role: resolved.role, cookie: resolved.cookie };
-    return { ok: true, userId: resolved.userId, role: resolved.role, via: "sealed_handle" };
+    // The email is carried for one purpose: an interrupted registration is recovered by the account
+    // the VENDOR says this session belongs to. It is never taken from a body field, and it is never
+    // the sole credential — knowing an address is not owning an account, which is why the reservation
+    // digest is only how a candidate is found and the authenticated session is what authorizes it.
+    return { ok: true, userId: resolved.userId, role: resolved.role, email: resolved.email || "", via: "sealed_handle" };
   }
   // A deployment that has declared itself `native` does not dial the AWS proxy at all — not even to
   // fail. Anything that is not a sealed handle is therefore a credential this relay does not accept,
@@ -342,7 +361,7 @@ async function resolveSessionUser(req) {
     // "nobody", which is exactly what a signed-out get-session does.
     return { ok: false, status: 401, code: "auth_error", error: "Authentication required" };
   }
-  return { ok: true, userId: String(user.id), role: String(user.role || "") };
+  return { ok: true, userId: String(user.id), role: String(user.role || ""), email: String(user.email || "") };
 }
 
 // Only the validated identity is attached; nothing else from the session is.
@@ -356,7 +375,9 @@ async function requireBridgeSession(req, res, next) {
       success: false, status: resolved.code, error: resolved.error, requestId
     });
   }
-  req.bridgeUser = { id: resolved.userId, role: resolved.role };
+  // `email` is here for the same reason it is on `ncbCaller`: recovery of an interrupted registration
+  // must be authorized by what the vendor's session says, and a body-supplied address is not that.
+  req.bridgeUser = { id: resolved.userId, role: resolved.role, email: resolved.email || "" };
   return next();
 }
 
@@ -1417,8 +1438,35 @@ async function releaseReservation(req, userId, period, key, claim) {
 // identity, so a user_id planted in it cannot impersonate anybody, and a malformed key is
 // validated to nothing rather than trusted. Outcomes (`reservation`, `claim`) live on the
 // result object only, never in a response body.
-async function reserveQuotaDecision(req, user) {
+//
+// The increment lives in exactly one place. Both the ordinary charge and the multiplayer commit call this,
+// so a second copy of the create-or-update arithmetic cannot drift its unit and silently start writing
+// half-decisions into the counter.
+async function applyQuotaIncrement(req, userId, period, limit) {
+  const usage = await resolveQuotaUsage(req, userId, period);
+  if (!usage.ok) return { ok: false, reason: usage.reason };
+  if (usage.row === null) {
+    const created = await quotaStore.createUsage(req, {
+      user_id: userId, period_key: period, calls_used: 1, applied_limit: limit
+    });
+    return created?.ok
+      ? { ok: true, used: 1 }
+      : { ok: false, reason: created?.reason || "create_failed" };
+  }
+  const next = usage.used + 1;
+  const updated = await quotaStore.updateUsage(req, usage.rowId, {
+    calls_used: next, applied_limit: limit,
+    updated_at: quotaSqlDate(new Date().toISOString())
+  });
+  return updated?.ok ? { ok: true, used: next } : { ok: false, reason: updated?.reason || "update_failed" };
+}
+
+async function reserveQuotaDecision(req, user, policy = null) {
   const key = decisionKeyValue(req);
+  // `claim` takes the reservation without touching the counter, `commit` charges a claim already held, and
+  // `release` withdraws one whose decision never landed. Only the multiplayer path can ask for those; every
+  // other caller keeps the single historical behaviour, which is what `phase === "charge"` means here.
+  const phase = policy?.multiplayer === true ? String(policy.phase || "claim") : "charge";
   // Own-key accounts stop here, BEFORE any storage read: no config read, no override
   // read, no reservation, no increment. A request that is not spending the System's
   // money must not touch the System's ledger even to discover it is exempt.
@@ -1438,7 +1486,17 @@ async function reserveQuotaDecision(req, user) {
   if (claimed !== authoritative) {
     quotaAudit("ai_source_claim_mismatch", { userId: user?.id ?? null, claimed, authoritative });
   }
-  if (!applicability.quotaApplies) {
+  // MULTIPLAYER BILLING POLICY: a hosted Trickster decision is never waived, because the
+  // account's own provider key is not what answers it — the operator's Trickster service does.
+  // The exemption stays exactly as it was for every other caller: `policy` defaults to null, so
+  // /ai/chat and the ordinary routes run the identical branch they always did, and only a server
+  // path that has already verified the multiplayer scope can pass the flag. It is not readable
+  // from a header, body field or role; nothing on the request can set it.
+  const quotaApplies = policy?.multiplayer === true ? true : applicability.quotaApplies;
+  if (policy?.multiplayer === true && applicability.quotaApplies !== true) {
+    quotaAudit("mp_waiver_declined", { userId: user?.id ?? null, authoritative });
+  }
+  if (!quotaApplies) {
     quotaAudit("reserve_not_applicable", { userId: user?.id ?? null, key: key ?? null });
     return { status: 200, body: quotaNotApplicableView(), reservation: "unbilled" };
   }
@@ -1460,8 +1518,36 @@ async function reserveQuotaDecision(req, user) {
   // claim precedes the charge. Charge-then-claim left a crash window in which a billed
   // decision had no record, so a restart charged the same decision twice.
   const answer = await withUserLock(user.id, async () => {
+    // The multiplayer halves that run AFTER a dispatch decision are made on a hold this function issued,
+    // never on anything the request carries: a caller cannot commit a claim it does not own.
+    if (phase === "commit" || phase === "release") {
+      const hold = policy.hold;
+      if (!hold || hold.userId !== user.id || hold.key !== key) {
+        return { status: 503, body: quotaUnavailable(), cause: "mp_hold_unusable" };
+      }
+      if (phase === "release") {
+        const back = await releaseReservation(req, user.id, hold.period, hold.key, hold.claim);
+        return back?.ok
+          ? { status: 200, body: { allowed: true, released: true }, claim: "released" }
+          : { status: 503, body: quotaUnavailable(), cause: back?.reason || "release_failed", claim: "release_refused" };
+      }
+      const charged = await applyQuotaIncrement(req, user.id, hold.period, hold.limitValue);
+      return charged.ok
+        ? {
+          status: 200, body: { allowed: true, ...quotaBoundedView(charged.used, hold.limitValue) },
+          reservation: "created", claim: "held"
+        }
+        : { status: 503, body: quotaUnavailable(), cause: charged.reason, claim: "held" };
+    }
+
     const prior = await findReservation(req, user.id, period, key);
     if (!prior.ok) return { status: 503, body: quotaUnavailable(), cause: prior.reason };
+    // A multiplayer CLAIM differs from the human path on purpose. Already claimed there means already billed,
+    // so the answer is served; here it means another request owns this exact decision, and serving a second
+    // one would spend a second upstream call. So the claim is refused, not reused.
+    if (prior.found && phase === "claim") {
+      return { status: 409, body: { allowed: false, reason: "mp_decision_already_claimed" }, claim: "none" };
+    }
     if (prior.found) return reusedQuotaAnswer(req, user.id, period, limit.limit);
 
     const claim = await claimReservation(req, user.id, period, key);
@@ -1469,7 +1555,16 @@ async function reserveQuotaDecision(req, user) {
       quotaAudit("claim_refused", claim);
       return { status: 503, body: quotaUnavailable(), cause: claim.reason, claim: "none" };
     }
-    if (claim.reason === "already_claimed") return reusedQuotaAnswer(req, user.id, period, limit.limit);
+    if (claim.reason === "already_claimed") {
+      // Two requests raced for one decision and durable storage settled it: exactly one create won. The
+      // ordinary path reuses the winner's stored answer. A multiplayer CLAIM must not: the winner has only
+      // reserved, its answer is still upstream, so reusing here would hand out an unrelated older reply and
+      // — because reuse carries no hold — would then dispatch a SECOND free decision. Refuse the loser.
+      if (phase === "claim") {
+        return { status: 409, body: { allowed: false, reason: "mp_decision_already_claimed" }, claim: "none" };
+      }
+      return reusedQuotaAnswer(req, user.id, period, limit.limit);
+    }
 
     const release = async () => {
       const back = await releaseReservation(req, user.id, period, key, claim);
@@ -1494,37 +1589,31 @@ async function reserveQuotaDecision(req, user) {
       };
     }
 
-    let used = null;
-    if (usage.row === null) {
-      const created = await quotaStore.createUsage(req, {
-        user_id: user.id, period_key: period, calls_used: 1, applied_limit: limit.limit
-      });
-      if (!created?.ok) {
-        const claimState = await release();
-        return {
-          status: 503, body: quotaUnavailable(),
-          cause: created?.reason || "create_failed", claim: claimState
-        };
-      }
-      used = 1;
-    } else {
-      const next = usage.used + 1;
-      const updated = await quotaStore.updateUsage(req, usage.rowId, {
-        calls_used: next, applied_limit: limit.limit,
-        updated_at: quotaSqlDate(new Date().toISOString())
-      });
-      if (!updated?.ok) {
-        const claimState = await release();
-        return {
-          status: 503, body: quotaUnavailable(),
-          cause: updated?.reason || "update_failed", claim: claimState
-        };
-      }
-      used = next;
+    // A multiplayer claim stops HERE: the reservation is taken, the cap is checked, and the counter is not
+    // touched. The charge happens only in the commit phase, once an answer has actually landed, so a failed
+    // Trickster call cannot consume quota. The ordinary path falls straight through to the same increment.
+    if (phase === "claim") {
+      return {
+        status: 200,
+        body: { allowed: true, ...quotaBoundedView(usage.used, limit.limit) },
+        reservation: "claimed", claim: "held",
+        hold: { userId: user.id, period, key, claim, limitValue: limit.limit }
+      };
+    }
+
+    // One increment, one owner. `charge` (every pre-existing caller) and `commit` (a landed multiplayer
+    // answer) both reach the counter through this single call, so there is no second writer to drift.
+    const charged = await applyQuotaIncrement(req, user.id, period, limit.limit);
+    if (!charged.ok) {
+      const claimState = await release();
+      return {
+        status: 503, body: quotaUnavailable(),
+        cause: charged.reason, claim: claimState
+      };
     }
 
     return {
-      status: 200, body: { allowed: true, ...quotaBoundedView(used, limit.limit) },
+      status: 200, body: { allowed: true, ...quotaBoundedView(charged.used, limit.limit) },
       reservation: key ? "created" : "charged", claim: key ? "held" : "none"
     };
   });
@@ -1870,7 +1959,10 @@ function requireBridgeAdmin(req, res, next) {
 // route and the same table policy `Login.jsx` was already using. No service credential is
 // invented, and none exists: see `ncbRequest`, which carries only the caller's bearer.
 const USER_CODES_TABLE = String(process.env.USER_CODES_TABLE || "user_codes").trim();
-const INVITATION_CODE_MAX_LENGTH = 128;
+// Read FROM the shared validator rather than restated here, so the bound this relay exports and the
+// bound that rejects a request can never disagree — which is precisely the failure this line used to
+// be part of (128 here, 64 in the gateway, 4 as a floor in the lookup route).
+const { INVITATION_CODE_MAX_LENGTH } = require("./ncb/invitationCode.js");
 // Abuse control for a pre-registration endpoint. There is no existing limiter in this
 // relay, so this is the same shape the quota code already uses for process-local state:
 // one bounded Map, oldest-key eviction, and an explicit statement of what it cannot do.
@@ -1882,6 +1974,10 @@ const INVITATION_RATE_WINDOW_MS = boundedInt(
 );
 const INVITATION_RATE_MAX = boundedInt(process.env.INVITATION_RATE_MAX, 20, 1, 10000);
 const INVITATION_RATE_BUCKETS_LIMIT = 5000;
+// How many records for ONE code value one claim is allowed to look at. A bulk issue of ten rows is the
+// documented shape; this is the ceiling at which a pool stops being fully visible to a single read,
+// and past it `invitation_pool_unpaged` is reported rather than a false exhaustion.
+const INVITATION_POOL_PAGE = boundedInt(process.env.INVITATION_POOL_PAGE, 200, 10, 1000);
 const invitationBuckets = new Map();
 
 /* A read with NO credential of any kind. Deliberately its own helper rather than a flag on
@@ -1922,11 +2018,17 @@ function invitationBucketCount() {
   return invitationBuckets.size;
 }
 
+// ONE RULE, IMPORTED (ncb/invitationCode.js). This function used to be its own opinion — 1..128
+// characters — while the gateway's public lookup allowed 4..64 of [A-Za-z0-9-] and the claim module
+// allowed 1..64 with a wider punctuation set. The deployed effect was measurable: code `777` returned
+// `valid:true` from this route and `400 bad_code` from the lookup the browser actually calls.
+//
+// The 128 ceiling is deliberately narrowed to 64. No code longer than 64 could ever have been spent
+// through the public route, so the wider bound was not a compatibility the deployment had — it was a
+// second answer to the same question. Codes at or under 64 characters, of any case and any of the
+// punctuation NCB itself accepts in a string column, keep working exactly as before.
 function normalizeInvitationCode(value) {
-  const code = typeof value === "string" ? value.trim() : "";
-  if (!code || code.length > INVITATION_CODE_MAX_LENGTH) return null;
-  if (DECISION_KEY_UNSET_WORDS.test(code)) return null;
-  return code;
+  return sharedInvitationCode(value);
 }
 
 /* Best-effort, in-process, per-address window. Returns the seconds the caller must wait,
@@ -1965,7 +2067,14 @@ async function invitationRowRead({ code = "", id = "" } = {}) {
   const filterName = code ? "code" : "id";
   const filterValue = code ? String(code) : String(id);
   if (!filterValue) return { ok: false, reason: "invitation_service_unavailable" };
-  const query = `${filterName}=${encodeURIComponent(filterValue)}`;
+  /* THE PAGE IS DECLARED, NOT INHERITED. `user_codes` has no filter on this read beyond the code
+     value, and a code may carry an arbitrary number of records — so leaving the page size to the
+     vendor's default would decide silently how large a bulk pool can be before the claim stops
+     seeing all of it. `truncated` is reported with the rows so the claim can tell "every record for
+     this value is spent" apart from "the records I was allowed to see are spent"; the second is a
+     deployment fault, never an exhaustion, and treating it as exhaustion is how a valid code gets
+     locked out of registration permanently. */
+  const query = `${filterName}=${encodeURIComponent(filterValue)}&limit=${INVITATION_POOL_PAGE}`;
   if (NCB_TRANSPORT.transport !== "native") {
     return ncbPublicRead(`/public-data/read/${USER_CODES_TABLE}?${query}`);
   }
@@ -1985,27 +2094,43 @@ async function invitationRowRead({ code = "", id = "" } = {}) {
   }
   const rows = Array.isArray(read.body?.data) ? read.body.data : null;
   if (rows === null) return { ok: false, reason: "invitation_service_unavailable" };
-  return { ok: true, payload: { data: rows } };
+  return { ok: true, payload: { data: rows }, truncated: rows.length >= INVITATION_POOL_PAGE };
 }
 
 async function invitationCodeRead(code) {
   return invitationRowRead({ code });
 }
 
-/* Rows are matched on the EXACT code the caller typed and an unused flag, which is the
-   predicate `Login.jsx` used; `?code=` filtering at NCB is a substring-free equality
-   filter, but the comparison is re-done here so a filter change upstream cannot quietly
-   turn the check into "somebody else's code matched". */
+/* THE POOL RULE. A code value may legitimately appear in many rows — ten rows carrying `123` is how a
+   bulk invitation is issued, on the owner's explicit 2026-11-20 decision — so "usable" means AT LEAST
+   ONE row that is unused and unallocated to somebody else, and the row spent is the FIRST such row by
+   ascending numeric id.
+
+   What used to live here was the opposite: more than one match was reported as `invitation_duplicate`
+   and the route answered 503. That made every multi-row code in the table unusable, which is why this
+   function no longer counts matches as a fault. A UNIQUE constraint anywhere in this feature belongs on
+   the record id (ncb/invitationReservations.js), never on the shared code string. */
 async function findUsableInvitationRow(req, code) {
   const read = await invitationCodeRead(code);
   if (!read.ok) return { ok: false, reason: read.reason };
   const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
-  const matches = rows.filter((row) => String(row?.code ?? "") === code && !Number(row?.used ?? 0));
-  if (matches.length > 1) {
-    // Two live rows for one code is a data fault, not a choice to make silently.
-    return { ok: false, reason: "invitation_duplicate" };
-  }
-  return { ok: true, row: matches[0] ?? null, duplicate: false };
+  const matches = rows
+    .filter((row) => String(row?.code ?? "") === code && !Number(row?.used ?? 0))
+    // An row already allocated to a DIFFERENT account is not available; one allocated to nobody is.
+    .filter((row) => !String(row?.registered_user_id ?? "").trim())
+    .sort(invitationRecordOrder);
+  return { ok: true, row: matches[0] ?? null, available: matches.length, records: matches.length };
+}
+
+// Ascending numeric id where the vendor gives one, stable and last where it does not: "the first
+// available record" has to mean the same thing in every route and on every restart.
+function invitationRecordOrder(a, b) {
+  const an = Number(a?.id); const bn = Number(b?.id);
+  const aNum = Number.isFinite(an); const bNum = Number.isFinite(bn);
+  if (aNum && bNum) return an - bn;
+  if (aNum) return -1;
+  if (bNum) return 1;
+  return String(a?.id ?? "").localeCompare(String(b?.id ?? ""));
 }
 
 async function validateInvitationDecision(req, body) {
@@ -2013,34 +2138,59 @@ async function validateInvitationDecision(req, body) {
   if (!code) return { status: 400, body: { error: "code is required" } };
   const found = await findUsableInvitationRow(req, code);
   if (!found.ok) return { status: 503, body: { error: found.reason } };
-  // The answer is a boolean and nothing else: no row id, no secret_key, no user_id, no
-  // stored code object, no count of matches.
-  return { status: 200, body: { valid: Boolean(found.row) } };
+  // The answer is a boolean and nothing else: no row id, no secret_key, no user_id, no stored code
+  // object, and no count of how many records are left — that count would make this route an oracle for
+  // how many invitations remain valid for a value someone already holds.
+  return { status: 200, body: { valid: found.available > 0 } };
 }
 
-/* Mark the code spent for the account that just registered. The identity written is the
-   SESSION's user id, never a body field: a caller cannot attach a code to somebody else's
-   account, and cannot spend one on an account it does not hold. */
-async function consumeInvitationDecision(req, body) {
+/* FINISH THE REGISTRATION THIS ACCOUNT STARTED, and nothing else.
+
+   The route is recovery, not a general "spend a code" endpoint. What makes it safe is where every
+   input comes from: the account is the id NCB reported for this session, the address it is matched on
+   is the address in that same session answer, and the record is whichever one a PENDING RESERVATION
+   already holds for that address. The request body contributes nothing — a `code` field is accepted so
+   a deployed frontend does not break, and is then ignored, because a caller choosing a record id or a
+   code string would be an invitation to spend something that was never theirs.
+
+   Knowing an email address is not proof of owning an account, so the reservation digest is used only
+   to FIND candidates; the authorization is the vendor-authenticated session behind them. A reservation
+   belonging to a different address, or one already completed, is invisible to this route. */
+async function consumeInvitationDecision(req) {
   const userId = req.bridgeUser?.id;
+  const email = String(req.bridgeUser?.email || "").trim();
   if (!userId) return { status: 401, body: { error: "Authentication required" } };
-  const code = normalizeInvitationCode(body?.code);
-  if (!code) return { status: 400, body: { error: "code is required" } };
-  const found = await findUsableInvitationRow(req, code);
-  if (!found.ok) return { status: 503, body: { error: found.reason } };
-  if (!found.row?.id) return { status: 200, body: { success: false, reason: "invitation_not_found" } };
-
-  const written = await quotaWrite(req, QUOTA_WRITE_METHODS.update,
-    `/data/update/${USER_CODES_TABLE}/${encodeURIComponent(found.row.id)}`,
-    { used: 1, user_id: userId }, "invitation_update_failed");
-  if (!written.ok) return { status: 503, body: { error: written.reason } };
-
-  // Read back, exactly as every other write in this relay does: a code that still says
-  // "unused" after a reported success is an outage-shaped answer, not a consumed one.
-  const after = await findUsableInvitationRow(req, code);
-  if (!after.ok) return { status: 503, body: { error: after.reason } };
-  if (after.row) return { status: 503, body: { error: "invitation_write_unconfirmed" } };
-  return { status: 200, body: { success: true } };
+  // The owner's contract for this endpoint, kept exactly: no atomic store configured is a VISIBLE
+  // failure, never a silent downgrade to a read-then-write the caller cannot trust.
+  if (!invitationClaim) {
+    safeEvent("invitation_claim_mode_refused", { mode: INVITATION_CLAIM_MODE });
+    return { status: 503, body: { error: "invitation_claim_unavailable" } };
+  }
+  if (!email) {
+    // No verified address to match on. Refusing is the only honest answer: falling back to the body
+    // would be the impersonation this route exists to prevent.
+    safeEvent("invitation_recovery_identity_unavailable", { requestId: req.nodeSendRequestId ?? null });
+    return { status: 409, body: { error: "invitation_recovery_identity_unverified" } };
+  }
+  const outcome = await invitationClaim.recover({ email, userId: String(userId) });
+  if (outcome.ok) {
+    return { status: 200, body: { success: true, recovered: outcome.recovered === true, alreadyClaimed: outcome.outcome === "already_claimed" } };
+  }
+  switch (outcome.outcome) {
+    case "code_not_found":
+      // Nothing pending for this account. The plain registration path already covers a fresh code, so
+      // this is a decline, not an outage — and it must not be reported as one.
+      return { status: 200, body: { success: false, reason: "invitation_not_found" } };
+    case "claim_unavailable":
+      return { status: 503, body: { error: "invitation_claim_unavailable" } };
+    case "reservation_store_unavailable":
+    case "invitation_read_failed":
+      return { status: 503, body: { error: outcome.outcome } };
+    case "claim_conflict":
+      return { status: 409, body: { error: "invitation_claim_conflict" } };
+    default:
+      return { status: 503, body: { error: outcome.outcome === "claim_unconfirmed" ? "invitation_write_unconfirmed" : outcome.outcome } };
+  }
 }
 
 async function validateInvitationHandler(req, res) {
@@ -2080,8 +2230,16 @@ async function consumeInvitationHandler(req, res) {
   }
   safeEvent("invitation_consumed", { requestId, userId: req.bridgeUser?.id ?? null,
     success: decision.body.success === true, reason: decision.body.reason ?? null });
-  return res.status(200).json({ success: decision.body.success === true, ...
-    (decision.body.reason ? { reason: decision.body.reason } : {}), requestId });
+  // `alreadyClaimed` is carried through because it is a different fact from `success`: the client
+  // needs to know the code was already ITS own, not that this call did the work. Dropping it would
+  // make a recovered registration look like a fresh one and invite a pointless second write.
+  return res.status(200).json({ success: decision.body.success === true,
+    ...(decision.body.reason ? { reason: decision.body.reason } : {}),
+    ...(decision.body.alreadyClaimed === true ? { alreadyClaimed: true } : {}),
+    // `recovered` is the difference between "this call spent a code" and "this call finished a
+    // registration a previous call had already reserved". A client that cannot tell them apart
+    // cannot report the truth to the person waiting on the screen.
+    ...(decision.body.recovered === true ? { recovered: true } : {}), requestId });
 }
 
 // ── PER-USER AI CREDENTIALS — the one Stage 1 surface that can really tighten ─
@@ -2616,6 +2774,9 @@ app.get("/", (req, res) => res.json({
     clubs: "BridgeMind Bearer session + server-side club membership (system_admins / club_memberships)"
   },
   trickster: { auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
+  // Listed apart from `trickster` because the two surfaces differ in the two ways an operator needs to see:
+  // this one charges quota, and it demands a second proof beyond the session.
+  multiplayer: mpGatewayHealth(),
   quota: quotaLedgerState(),
   // WHICH NCB TRANSPORT IS LIVE, because it is the fact an operator needs before touching the
   // frontend's base URL: under `proxy` a browser bearer still goes to the AWS gateway, under `native`
@@ -2635,6 +2796,11 @@ app.get("/health", (req, res) => res.json({
   // never a key. The two upstream hosts are public by nature; the API key is
   // reported as configured/not configured and is never read out.
   trickster: { routes: 4, auth: "BridgeMind Bearer session", upstreams: tricksterConfiguredState(), timeoutMs: tricksterTimeoutMs(), apiKeyConfigured: Boolean(process.env.TRICKSTER_API_KEY) },
+  // The multiplayer surface is reported separately from the human one precisely because the two differ in
+  // the ways that matter to an operator: this one is metered, and it needs a second, server-held proof.
+  // `ticketSecretConfigured:false` means the routes exist but refuse everything, which is the intended
+  // fail-closed state until a deploy wires the shared secret.
+  multiplayer: mpGatewayHealth(),
   // Per-user quota is decided here, on NCB, with the caller's own session bearer. There is
   // no second quota service to report the state of, so this is the real configuration of
   // the authority — including whether the idempotency ledger is durable. `quotaConfigured`
@@ -2987,6 +3153,261 @@ app.post("/trickster/play/suggest-card", requireBridgeSession, (req, res) => pro
 app.get("/trickster/bid/suggest-bid", requireBridgeSession, tricksterMethodNotAllowed);
 app.get("/trickster/play/suggest-card", requireBridgeSession, tricksterMethodNotAllowed);
 
+// ── MULTIPLAYER AI DECISION GATEWAY (metered, dedicated) ───────────────────
+// BridgeMind-Live's AI seats need the same two services, but they are NOT the same kind of
+// request. On the human routes the session user is asking for advice about their own play, and
+// the claim is the charge: `reserveQuotaDecision` increments the counter when it grants, so a
+// released claim is a released *unbilled* claim only. Reusing that here would bill a player for a
+// Trickster call that timed out, which is exactly what "release reservations on failed upstream
+// decisions" forbids. So this gateway keeps the same authority, the same mutex and the same
+// ledger primitives, but orders them for a decision the player never asked for: deny, claim,
+// dispatch, and charge only once an answer has actually landed.
+//
+// Nothing here is reachable with a caller-supplied claim of who is entitled. The two proofs are:
+//   1. the session bearer, exactly as the human routes require, and
+//   2. a seat ticket signed by BridgeMind-Live with a shared server secret, which the browser can
+//      never see: Live mints it per decision, in-process, and sends it only server-to-server.
+// A forged or replayed ticket buys nothing without a live session for the SAME user id, and a
+// stolen session buys nothing without a ticket binding it to a seat at a real table.
+const MP_TICKET_HEADER = "x-bm-seat-ticket";
+const MP_TICKET_SECRET_ENV = "BRIDGEMIND_MP_TICKET_SECRET";
+// A ticket is minted immediately before one upstream call, so a generous ceiling is still short:
+// the point is to bound replay, not to accommodate clock drift.
+const MP_TICKET_MAX_TTL_MS = 30000;
+const MP_VERSION = "v1";
+const MP_SEATS = ["North", "East", "South", "West"];
+const MP_TABLE_PATTERN = /^[A-Za-z0-9_-]{4,64}$/u;
+
+// Read per request like the Trickster base URLs, so a secret rotation needs no restart. Unset
+// means the gateway is not enabled at all: fail closed rather than accept unsigned tickets.
+function mpTicketSecret() {
+  return String(process.env[MP_TICKET_SECRET_ENV] || "").trim();
+}
+
+function mpGatewayState() {
+  return {
+    routes: 2,
+    auth: "BridgeMind Bearer session + Live-signed seat ticket",
+    ticketSecretConfigured: Boolean(mpTicketSecret()),
+    ticketMaxTtlMs: MP_TICKET_MAX_TTL_MS
+  };
+}
+
+function mpSafeEqualHex(a, b) {
+  const left = Buffer.from(String(a), "utf8");
+  const right = Buffer.from(String(b), "utf8");
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+// Returns { ok, claims } or { ok:false, reason } where every reason is a stable code: no reason
+// echoes any part of the ticket, because the ticket is a capability.
+function verifyMpTicket(raw, sessionUserId, kind) {
+  const secret = mpTicketSecret();
+  if (!secret) return { ok: false, reason: "mp_gateway_unconfigured" };
+  const text = String(raw || "");
+  const parts = text.split(".");
+  if (parts.length !== 3 || parts[0] !== MP_VERSION) return { ok: false, reason: "mp_ticket_malformed" };
+  const payload = parts[1];
+  const signature = parts[2];
+  if (!payload || !signature || payload.length > 1024 || !/^[0-9a-f]{64}$/.test(signature)) {
+    return { ok: false, reason: "mp_ticket_malformed" };
+  }
+  const expect = crypto.createHmac("sha256", secret).update(`${MP_VERSION}\n${payload}`, "utf8").digest("hex");
+  if (!mpSafeEqualHex(signature, expect)) return { ok: false, reason: "mp_ticket_signature" };
+  let claims;
+  try {
+    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return { ok: false, reason: "mp_ticket_malformed" };
+  }
+  if (!claims || typeof claims !== "object" || Array.isArray(claims)) {
+    return { ok: false, reason: "mp_ticket_malformed" };
+  }
+  // BILLING IDENTITY: the ticket names the table host, and the session must BE that host. Two proofs
+  // have to agree, so neither can be supplied by the caller: a ticket replayed under a guest's bearer
+  // is refused rather than quietly moved onto someone else's quota, and no body field or header names
+  // a payer. The host pays for every AI-controlled seat; a guest is never billed for sitting down or
+  // for being the next to act.
+  if (String(claims.host ?? "") !== String(sessionUserId)) return { ok: false, reason: "mp_ticket_host_mismatch" };
+  if (claims.v !== 1 || claims.kind !== kind) return { ok: false, reason: "mp_ticket_scope" };
+  if (!MP_SEATS.includes(claims.seat)) return { ok: false, reason: "mp_ticket_seat" };
+  if (typeof claims.table !== "string" || !MP_TABLE_PATTERN.test(claims.table)) {
+    return { ok: false, reason: "mp_ticket_table" };
+  }
+  if (!Number.isInteger(claims.boardNo) || claims.boardNo < 1 || claims.boardNo > 1000) {
+    return { ok: false, reason: "mp_ticket_board" };
+  }
+  if (!Number.isInteger(claims.seq) || claims.seq < 0) return { ok: false, reason: "mp_ticket_seq" };
+  if (!Number.isFinite(claims.exp)) return { ok: false, reason: "mp_ticket_exp" };
+  const remaining = claims.exp - Date.now();
+  if (remaining <= 0) return { ok: false, reason: "mp_ticket_expired" };
+  if (remaining > MP_TICKET_MAX_TTL_MS) return { ok: false, reason: "mp_ticket_too_long" };
+  return { ok: true, claims };
+}
+
+// Derived, never accepted: a client-chosen key could widen or narrow its own dedupe, so the
+// ledger identity comes only out of the verified ticket.
+function mpDecisionKey(claims) {
+  return sanitizeDecisionKey(
+    `mp:${claims.table}:${claims.boardNo}:${claims.seq}:${claims.seat}:${claims.kind}`
+  );
+}
+
+function requireMpSeatTicket(kind) {
+  return function mpSeatTicketGuard(req, res, next) {
+    const verified = verifyMpTicket(req.get(MP_TICKET_HEADER), req.bridgeUser?.id, kind);
+    if (!verified.ok) {
+      const status = verified.reason === "mp_gateway_unconfigured" ? 503 : 401;
+      safeEvent("mp_ticket_rejected", {
+        requestId: req.nodeSendRequestId, service: kind, userId: req.bridgeUser?.id ?? null,
+        reason: verified.reason, status
+      });
+      return res.status(status).json({ error: verified.reason });
+    }
+    const key = mpDecisionKey(verified.claims);
+    if (!key) {
+      safeEvent("mp_ticket_rejected", {
+        requestId: req.nodeSendRequestId, service: kind, userId: req.bridgeUser?.id ?? null,
+        reason: "mp_decision_key_unusable", status: 400
+      });
+      return res.status(400).json({ error: "mp_decision_key_unusable" });
+    }
+    // Install the derived key AS the header the one writer already reads, overwriting whatever the caller
+    // sent. Doing it here means `decisionKeyValue` inside `reserveQuotaDecision` sees the derived value with
+    // no second code path, and a caller-chosen key cannot pre-pay, widen or narrow its own dedupe.
+    req.mpDecision = { claims: verified.claims, key };
+    if (req.headers) req.headers[DECISION_KEY_HEADER] = key;
+    return next();
+  };
+}
+
+// The multiplayer ledger has NO arithmetic and NO mutex of its own. Every step delegates to
+// `reserveQuotaDecision`, the one entry point that already owns the per-user lock, the cap test, the claim
+// and the increment, so this gateway cannot grow a second writer that drifts the unit. The three phases ask
+// that one function for its three halves.
+function mpClaim(req, user) {
+  return reserveQuotaDecision(req, user, { multiplayer: true, phase: "claim" });
+}
+
+function mpCommit(req, user, hold) {
+  return reserveQuotaDecision(req, user, { multiplayer: true, phase: "commit", hold });
+}
+
+function mpRelease(req, user, hold) {
+  return reserveQuotaDecision(req, user, { multiplayer: true, phase: "release", hold });
+}
+
+// The metered decision path. The transport is NOT reimplemented here: `proxyTrickster` is called with a
+// recording `res` so the one copy of the upstream contract — body forwarded unchanged, status preserved,
+// HTML refused, shape validated before a 200 — also governs this route. `200` is only ever set by that
+// function after the response shape passed, which is what makes it safe to treat as "a decision landed".
+// Anything else, including a route that never answered at all, releases the claim and charges nothing:
+// a seat must never be billed for advice that never arrived.
+//
+// These routes are async and Express 4 does not catch a rejected handler, so nothing may propagate: an
+// escaping error would strand the claim AND leave the socket without an answer. Every exit releases first.
+async function mpMeteredTrickster(service, req, res, fetchImpl = globalThis.fetch) {
+  const user = req.bridgeUser;
+  let claim;
+  try {
+    claim = await mpClaim(req, user);
+  } catch (error) {
+    safeEvent("mp_claim_threw", { requestId: req.nodeSendRequestId, service, name: error?.name });
+    return res.status(503).json(quotaUnavailable());
+  }
+  // Status before body: only a 200 whose body says `allowed` is permission to spend an upstream call. A
+  // 429, a 409 or a 503 that happens to carry a permissive shape is a refusal either way.
+  if (claim.status !== 200 || claim.body?.allowed !== true) {
+    safeEvent("mp_denied_before_dispatch", {
+      requestId: req.nodeSendRequestId, service, userId: user?.id ?? null,
+      status: claim.status, cause: claim.cause ?? null
+    });
+    const { cause, ...body } = claim.body || {};
+    return res.status(claim.status || 503).json(Object.keys(body).length ? body : quotaUnavailable());
+  }
+  // The hold is issued by the claim phase and never read back from the request. No hold means quota is
+  // switched off for this deployment: the decision is still served, and nothing was claimed or billed.
+  const handle = claim.hold ?? null;
+  const dispatched = { status: 0, payload: undefined };
+  // The recorder CAPTURES instead of forwarding, because the answer must not reach the player before the
+  // charge settles. `requestIdentity` calls `setHeader` (bridge.js:357), so that is still delegated to the
+  // real response — a recorder that omitted it would throw before a single byte reached Trickster.
+  const recorder = {
+    status(code) { dispatched.status = code; return this; },
+    json(payload) { dispatched.payload = payload; return this; },
+    setHeader(...args) { return res.setHeader(...args); },
+    set(...args) { return res.set(...args); },
+    get(name) { return res.get(name); }
+  };
+  const settle = (status, payload) => res.status(status).json(payload ?? { error: "trickster_unreachable" });
+  try {
+    await proxyTrickster(service, "suggest", req, recorder, fetchImpl);
+  } catch (error) {
+    // Nothing landed, so nothing may be billed: the claim is withdrawn and the caller sees the failure.
+    let released = false;
+    if (handle) released = (await mpRelease(req, user, handle)).claim === "released";
+    safeEvent("mp_dispatch_threw", {
+      requestId: req.nodeSendRequestId, service, name: error?.name, released
+    });
+    return settle(502, { error: "trickster_unreachable" });
+  }
+  if (dispatched.status !== 200) {
+    let released = false;
+    if (handle) {
+      const back = await mpRelease(req, user, handle);
+      released = back?.claim === "released";
+      // A claim that outlives an unbilled decision must not be quiet: this key answers 409 from now on,
+      // so the seat stops visibly instead of being charged twice behind the scenes.
+      if (back?.claim === "release_refused") {
+        safeEvent("mp_claim_release_refused", {
+          requestId: req.nodeSendRequestId, service, cause: back.cause ?? null
+        });
+      }
+    }
+    safeEvent("mp_unserved_claim_released", {
+      requestId: req.nodeSendRequestId, service, status: dispatched.status, released
+    });
+    return settle(dispatched.status || 502, dispatched.payload);
+  }
+  if (!handle) {
+    safeEvent("mp_served_unmetered", { requestId: req.nodeSendRequestId, service });
+    return settle(200, dispatched.payload);
+  }
+  let charged;
+  try {
+    charged = await mpCommit(req, user, handle);
+  } catch (error) {
+    charged = { status: 503, cause: error?.name };
+  }
+  if (charged.status !== 200 || charged.body?.allowed !== true) {
+    // The answer exists but cannot be billed. Withholding is the fail-closed choice: handing it over would
+    // turn a storage outage into a free decision. The claim stays held, which is the limitation named in
+    // the report — without a durable reservation table this key cannot be safely retried.
+    safeEvent("mp_commit_refused_withheld", {
+      requestId: req.nodeSendRequestId, service, status: charged.status ?? 503, cause: charged.cause ?? null
+    });
+    return res.status(503).json(quotaUnavailable());
+  }
+  safeEvent("mp_decision_charged", {
+    requestId: req.nodeSendRequestId, service, userId: user?.id ?? null,
+    reservation: charged.reservation ?? null
+  });
+  return settle(200, dispatched.payload);
+}
+
+app.post("/mp/trickster/bid/suggest", requireBridgeSession, requireMpSeatTicket("bid"),
+  (req, res) => mpMeteredTrickster("bid", req, res));
+app.post("/mp/trickster/play/suggest", requireBridgeSession, requireMpSeatTicket("play"),
+  (req, res) => mpMeteredTrickster("play", req, res));
+
+// The human suggestion routes above are untouched and still unmetered on purpose: there the session user
+// is asking for advice about their own play, and the existing claim-is-the-charge ordering is the one
+// their quota display and retry behaviour were built against. These two are the multiplayer surface, and
+// an operator must be able to see which of the two is armed.
+function mpGatewayHealth() {
+  return { ...mpGatewayState(), metered: true, decisionKeySource: "verified seat ticket, server-derived" };
+}
+
 /* ── CLUBS ────────────────────────────────────────────────────────────────────
  * Mounted UNCONDITIONALLY, before the 404 catch-all, and deliberately so. Registering the routes
  * only once the club account and schema are configured would make an unconfigured deployment answer
@@ -3015,6 +3436,136 @@ const clubMount = buildClubMount({
 });
 app.use(clubMount.router);
 
+/* THE PRIVILEGED INVITATION CLAIM, the reservation store behind it, and the mode that gates them.
+
+   THE RULE THIS IMPLEMENTATION IS BUILT AROUND, stated because it changed twice under pressure and the
+   third version is the owner's: a code value may appear in many `user_codes` rows on purpose (ten rows
+   carrying `123` is how bulk codes are issued), so single-use is a property of a RECORD, never of the
+   shared string. The arbitration is therefore an INSERT into `invitation_reservations` whose
+   `code_row_id` column carries a database-enforced UNIQUE constraint. Uniqueness on `code` itself is
+   forbidden — it would have broken the feature while looking like it protected it.
+
+   THREE MODES, and only two of them exist:
+
+     reservation          the design above. The store decides who holds each record; the decision is
+                          durable, so it survives this container restarting, a second replica starting
+                          beside it, and Greta's own self-hosted server running the same claim. A
+                          reservation whose record is already spent is never released, and nothing here
+                          releases a reservation because it aged.
+
+     atomic-only          the DEFAULT, and the shipped state of production today. There is no claim
+                          writer wired at all, so `/ncb/auth/sign-up/email` answers 503
+                          `invitation_claim_unavailable` even with the registration lever on and a
+                          perfect code, and recovery declines too. Registration stays unavailable
+                          rather than being quietly downgraded.
+
+     privileged-rest      RETIRED, on the owner's instruction. It serialized in this process and
+                          verified by read-back — which is exactly the combination that must not be
+                          the sole protection, because an in-process lock dies with the container and a
+                          REST update has no compare-and-set. Setting it now means `atomic-only` and
+                          says so at boot; nothing is silently promoted.
+
+   The reservation is created BEFORE the account is created. That ordering was chosen deliberately and
+   its cost is stated: if the account creation fails, the record stays held until the same caller
+   returns or an operator releases it. The alternative order — which this file had before — never
+   strands a record but can spend a code on nobody, and it cannot be made safe without atomicity.
+
+   `INVITATION_RESERVATION_HMAC_KEY` keys the candidate digest of the normalized invitee address. That
+   digest is a LOOKUP KEY AND NOTHING MORE: it is never treated as proof that the caller owns the
+   account, which is why recovery is authorized by the vendor's own session answer
+   (`resolveSessionUser` → the `email` NCB reports) and refuses outright when no verified address is
+   present in it. Deliberately NOT `NCB_SESSION_SEAL_KEY`: rotating the seal key would otherwise strand
+   every pending reservation, and the two duties have no reason to fail together. */
+const RESERVATION_MODES = ["reservation", "atomic-only"];
+const INVITATION_CLAIM_MODE = (() => {
+  const wanted = String(process.env.INVITATION_CLAIM_MODE || "atomic-only").trim().toLowerCase();
+  if (wanted === "privileged-rest") {
+    // Reported rather than honoured: a deployment that still carries the retired value must learn that
+    // registration did NOT become safe, it became closed.
+    return "atomic-only";
+  }
+  return RESERVATION_MODES.includes(wanted) ? wanted : "atomic-only";
+})();
+
+const invitationReservations = INVITATION_CLAIM_MODE === "reservation" ? createInvitationReservations({
+  // The club service account's channel, the only privileged NCB identity this relay holds, and the one
+  // Clubs already depends on. No database secret is ever read or sent here.
+  request: async (spec) => {
+    const account = clubMount.account;
+    if (!account || account.configured !== true) {
+      return { ok: false, reason: account?.reason || "club_account_unconfigured" };
+    }
+    const sent = await account.request({
+      group: "data", path: `${spec.path}`, method: spec.method || "GET",
+      ...(spec.query ? { query: spec.query } : {}),
+      ...(spec.body === undefined ? {} : { body: spec.body })
+    });
+    return sent && sent.ok === true
+      ? { ok: true, httpStatus: sent.httpStatus ?? 200, body: sent.body ?? null }
+      : { ok: false, httpStatus: sent?.httpStatus ?? 0, reason: sent?.reason || "reservation_request_failed", detail: sent?.detail ?? null, body: sent?.body ?? null };
+  },
+  table: String(process.env.INVITATION_RESERVATION_TABLE || "invitation_reservations").trim() || "invitation_reservations",
+  // Bounded retries, because the probe measured a DELETE that failed and then succeeded on a second
+  // attempt by primary key. The back-off stays short and the attempt count stays small on purpose:
+  // completion sits on the sign-up response path, and a wedged store must produce a visible failure
+  // rather than a request that hangs until the browser gives up.
+  storeAttempts: boundedInt(process.env.INVITATION_RESERVATION_STORE_ATTEMPTS, 3, 1, 5),
+  retryDelayMs: boundedInt(process.env.INVITATION_RESERVATION_RETRY_MS, 200, 0, 2000),
+  log: safeEvent
+}) : null;
+
+const invitationClaim = INVITATION_CLAIM_MODE === "reservation" ? createInvitationClaim({
+  // The same reader the anonymous public route uses, so the claim and the lookup can never disagree
+  // about what a record says. Server-side this sees the full row; only the four projected fields ever
+  // reach a caller, and only inside the gateway's own public handler.
+  readRows: async ({ code }) => {
+    const read = await invitationRowRead({ code });
+    return read.ok
+      ? { ok: true, rows: read.payload?.data ?? [], truncated: read.truncated === true }
+      : { ok: false, reason: read.reason };
+  },
+  // One record, by id, for recovery: the code value is read FROM THE RECORD rather than trusted from
+  // a request body, so a retry cannot be steered at an arbitrary row.
+  readRecord: async ({ recordId }) => {
+    const read = await invitationRowRead({ id: String(recordId) });
+    if (!read.ok) return { ok: false, reason: read.reason };
+    const rows = Array.isArray(read.payload?.data) ? read.payload.data : [];
+    const row = rows.find((r) => String(r?.id) === String(recordId)) || rows[0] || null;
+    return { ok: true, row };
+  },
+  reservations: invitationReservations,
+  emailSecret: String(process.env.INVITATION_RESERVATION_HMAC_KEY || "").trim(),
+  event: (name, data) => safeEvent(name, data),
+  // THE PRIVILEGED WRITE, and the only place in this relay that writes an invitation row. It goes
+  // through the club service account — the credential the deployment already holds for Clubs — rather
+  // than the caller's session, because the caller is a brand-new account whose authority is exactly
+  // what the table must not trust. It writes `registered_user_id` and `used`, and never `user_id`:
+  // `user_id` is NCB's session-assigned ownership column, it is dropped on update (measured, code
+  // 891), and where it is honoured it MOVES THE ROW to the writer instead of recording the invitee.
+  writeRow: async ({ recordId, rowId, userId }) => {
+    // `recordId` is what the claim module passes since the pool model arrived (a code can name many
+    // records, so "row" is ambiguous); `rowId` is accepted only so an older caller cannot silently
+    // write to `undefined`. Both are validated, because writing to a missing id is exactly the silent
+    // failure this whole feature was rebuilt to remove.
+    const target = recordId ?? rowId;
+    if (target === null || target === undefined || target === "") {
+      return { ok: false, reason: "no_record_id" };
+    }
+    const account = clubMount.account;
+    if (!account || account.configured !== true) {
+      return { ok: false, reason: account?.reason || "claim_channel_unconfigured" };
+    }
+    const written = await account.request({
+      group: "data", path: `update/${USER_CODES_TABLE}/${encodeURIComponent(String(target))}`,
+      method: "PUT", body: { used: 1, registered_user_id: String(userId) }
+    });
+    return written && written.ok === true
+      ? { ok: true }
+      : { ok: false, reason: written?.reason || "claim_write_failed" };
+  },
+  event: (name, data) => safeEvent(name, data)
+}) : null;
+
 /* The player gateway that replaces the dead Quest/AWS Lambda. Built once, at boot, from the
    environment, exactly like the club mount above it.
    Ordering matters and is not stylistic: these routes are mounted last, after the relay's own
@@ -3033,7 +3584,10 @@ const ncbMount = buildNcbGateway({
     if (table !== USER_CODES_TABLE) return { ok: false, reason: "table_not_allowed" };
     const read = await invitationRowRead({ code, id });
     return read.ok ? { ok: true, rows: read.payload?.data ?? [] } : { ok: false, reason: read.reason };
-  }
+  },
+  // So `/ncb/auth/sign-up/email` can require and record an invitation server-side. Without this the
+  // gateway refuses to register anyone even when the operator turns the lever on — see the route.
+  invitationClaim
 });
 app.use(ncbMount.router);
 
@@ -3065,7 +3619,22 @@ if (require.main === module) {
       // and is a one-line fix at deploy, so it has to be said out loud when the container starts.
       ncbGateway: ncbMount.configured
         ? `player gateway ACTIVE (${ncbMount.health().routes} routes, stateless sealed sessions)`
-        : `player gateway INACTIVE — ${ncbMount.reason}`
+        : `player gateway INACTIVE — ${ncbMount.reason}`,
+      // Said at boot because it decides whether registration can work at all, and because the
+      // difference between "closed", "reserved against the database" and "misconfigured" must be
+      // visible to whoever starts the container rather than inferred from a 503.
+      invitationClaim: INVITATION_CLAIM_MODE === "reservation"
+        ? (invitationReservations
+          ? `reservation — atomic single-use on the record id via ${invitationReservations.table}`
+          : 'reservation MODE WITH NO STORE — claims will refuse')
+        : `atomic-only — no claim writer wired, so /ncb sign-up and recovery answer 503 by design${
+            String(process.env.INVITATION_CLAIM_MODE || "").trim().toLowerCase() === "privileged-rest"
+              ? " (the retired privileged-rest value was read and NOT honoured)" : ""}`,
+      // A reservation mode with no digest key is a deployment that will refuse every recovery, and
+      // the reason must not have to be discovered by a player mid-registration.
+      invitationReservationKey: INVITATION_CLAIM_MODE === "reservation"
+        ? (String(process.env.INVITATION_RESERVATION_HMAC_KEY || "").trim().length >= 32 ? "configured" : "MISSING_OR_TOO_SHORT")
+        : "not-applicable"
     });
   });
   // No quota probe at boot, deliberately. Every quota decision is made as the caller, with
@@ -3129,6 +3698,11 @@ module.exports = {
   // HTTP through `app`, which is what proves the session guard is attached.
   TRICKSTER_UPSTREAMS, TRICKSTER_RESPONSE_SHAPES, tricksterBaseUrl, tricksterTimeoutMs,
   tricksterUpstreamHeaders, tricksterSafeError, tricksterShapeOk, tricksterConfiguredState,
+  // The multiplayer gateway's own rules, exported for the same reason: the harness must reject a forged
+  // ticket with the REAL verifier rather than a copy that could drift from it.
+  MP_TICKET_HEADER, MP_TICKET_SECRET_ENV, MP_TICKET_MAX_TTL_MS, MP_VERSION, MP_SEATS,
+  mpTicketSecret, mpGatewayState, mpGatewayHealth, verifyMpTicket, mpDecisionKey, requireMpSeatTicket,
+  mpClaim, mpCommit, mpRelease, mpMeteredTrickster,
   isBridgeAdminRole,
   // Clubs: exported for the same reason every other predicate here is. The harness must exercise the
   // REAL authority decision, the REAL storage adapter and the REAL mounted router — not a copy that
@@ -3158,6 +3732,10 @@ module.exports = {
   // that decides whether it is consulted at all. Exported because the gates must assert the SHIPPED
   // behaviour — a harness that rebuilt either of these locally would be testing a copy.
   ncbSessionAuthority: require("./ncb/sessionAuthority.js").createNcbSessionAuthority,
+  // The privileged invitation claim, exported as the LIVE instance rather than a builder: the gate
+  // has to exercise the same object with the same reader and writer the routes use, because a
+  // harness that rebuilt it locally would be testing a copy of the wiring, not the wiring.
+  invitationClaim, createInvitationClaim, invitationReservations, createInvitationReservations,
   ncbTransportHealth, ncbNativeTransport: NCB_TRANSPORT,
   ncbGatewayTables: require("./ncb/gateway.js").DEFAULT_TABLES,
   ncbGatewayClubTables: require("./ncb/gateway.js").NEVER_THROUGH_THE_GATEWAY

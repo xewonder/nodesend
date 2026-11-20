@@ -42,10 +42,17 @@ const enc = (s) => crypto.publicEncrypt(
   Buffer.from(s)).toString('base64');
 
 const USERS = {
-  'tok-a': { id: 101, role: 'user' },
-  'tok-b': { id: 202, role: 'user' },
-  'tok-c': { id: 204, role: 'user' },
-  'tok-admin': { id: 900, role: 'administrator' }
+  // `email` is carried because invitation RECOVERY is authorized by the address the VENDOR'S SESSION
+  // reports, and a session that names no address must be refused rather than falling back to a body
+  // field. Arms I-11…I-12c depend on that being real, not assumed.
+  'tok-a': { id: 101, role: 'user', email: 'player.one@example.test' },
+  'tok-b': { id: 202, role: 'user', email: 'player.two@example.test' },
+  'tok-c': { id: 204, role: 'user', email: 'player.three@example.test' },
+  'tok-admin': { id: 900, role: 'administrator', email: 'admin@example.test' },
+  // The club service account's own session, minted by the sign-in branch below. It exists so an arm
+  // can prove WHICH bearer performed the invitation write: the claim must be the service account's,
+  // never the registering player's.
+  'tok-club': { id: 'club-svc-1', role: 'administrator' }
 };
 // Never hardcode a calendar month into a gate: it would pass today and expire silently.
 const PERIOD = new Date().toISOString().slice(0, 7);
@@ -67,10 +74,10 @@ const ncb = {
   // `user_settings` is the AUTHORITATIVE ai_source table the relay now reads. It is in
   // this registry so a read for it is served like any other and, crucially, so a
   // missing-table bug would surface as a 404 rather than as a silent free pass.
-  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [], user_codes: [], ai_provider_credentials_1770000000: [] },
+  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [], user_codes: [], ai_provider_credentials_1770000000: [], invitation_reservations: [] },
   nextId: {
     ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1,
-    user_settings: 1, user_codes: 1, ai_provider_credentials_1770000000: 1
+    user_settings: 1, user_codes: 1, ai_provider_credentials_1770000000: 1, invitation_reservations: 1
   },
   // One fault at a time: mixing them makes a red check ambiguous about which fired.
   fault: null,
@@ -114,6 +121,18 @@ const ncbServer = http.createServer((req, res) => {
       const user = USERS[auth.replace('Bearer ', '')];
       return user ? send(200, { status: 'success', data: { user } }) : fail(401, 'invalid session');
     }
+    // The club service account's session channel under the proxy transport: a body token, which is
+    // exactly what the AWS-era protocol returned and what `clubs/ncbAccountClient.js` still reads.
+    // Modelled here so the invitation claim can be measured with the authority it really uses — the
+    // service account — rather than quietly borrowing the caller's bearer, which would make the new
+    // privilege boundary untestable and let a regression that claims AS THE PLAYER pass.
+    if (pathname === '/auth/sign-in/email') {
+      const email = String(body?.email || '');
+      if (email !== process.env.CLUB_NCB_EMAIL || body?.password !== process.env.CLUB_NCB_PASSWORD) {
+        return fail(401, 'invalid club credentials');
+      }
+      return send(200, { status: 'success', token: 'tok-club', data: { token: 'tok-club', user: { id: 'club-svc-1', email } } });
+    }
     // NCB's PUBLIC data route: reachable with no session at all, and only for tables whose
     // policy allows it. It is modelled as strictly credential-free — a request that arrives
     // here carrying an Authorization is refused — because that is the whole property the
@@ -128,8 +147,12 @@ const ncbServer = http.createServer((req, res) => {
       if (ncb.fault === 'data_hang') return;
       if (auth) return fail(400, 'the public route accepts no credential');
       if (!ncb.rows[publicTable]) return fail(404, `unknown table ${publicTable}`);
+      // The same read grammar the authenticated branch below applies: `limit`, `page`, `sort` and
+      // `order` are PARAMETERS, and every other name is a column equality filter. Treating them as
+      // columns turns the claim's `?code=…&limit=200` pool read into "no rows", which would report a
+      // live code as unknown rather than as a broken mock.
       const publicRows = ncb.rows[publicTable].filter((row) => Object.entries(query).every(([key, value]) =>
-        key === 'Instance' || String(row[key]) === String(value)));
+        key === 'Instance' || ['limit', 'page', 'sort', 'order'].includes(key) || String(row[key]) === String(value)));
       ncb.counts.publicRead = (ncb.counts.publicRead || 0) + 1;
       return ok(publicRows);
     }
@@ -148,8 +171,12 @@ const ncbServer = http.createServer((req, res) => {
         ncb.hideReservationReads -= 1;
         return ok([]);
       }
+      // The vendor's read grammar: limit/page/sort/order are PARAMETERS, and every other name in the
+      // query is a column equality filter. Modelling them as columns here would silently turn any
+      // paginated lookup into "no rows", which is exactly how the reservation adapter's
+      // `?code_row_id=…&limit=5` read appeared to find nothing at all.
       let rows = ncb.rows[table].filter((row) => Object.entries(query).every(([key, value]) =>
-        key === 'Instance' || String(row[key]) === String(value)));
+        key === 'Instance' || ['limit', 'page', 'sort', 'order'].includes(key) || String(row[key]) === String(value)));
       if (ncb.fault === 'usage_duplicate' && table === 'ai_quota_usage') {
         rows = [...rows, ...rows.map((r) => ({ ...r, id: r.id + 900 }))];
       }
@@ -185,6 +212,14 @@ const ncbServer = http.createServer((req, res) => {
           && r.period_key === body.period_key && r.decision_key === body.decision_key);
         // The UNIQUE index: a duplicate claim is refused, and the row that won exists.
         if (clash) return fail(409, 'duplicate key on uk_reservation');
+      }
+      if (table === 'invitation_reservations') {
+        // The property the whole reservation design rests on, enforced HERE rather than remembered in
+        // the process: `code_row_id` carries a UNIQUE index, so a second INSERT for the same
+        // user_codes record is refused by the store with the vendor's documented answer. A fake that
+        // tolerated the duplicate would make every concurrency arm in this file meaningless.
+        const clash = ncb.rows.invitation_reservations.some((r) => String(r.code_row_id) === String(body.code_row_id));
+        if (clash) return fail(400, 'Duplicate entry for key code_row_id');
       }
       const row = { id: ncb.nextId[table]++, ...body };
       ncb.rows[table].push(row);
@@ -325,6 +360,17 @@ process.env.NODESEND_PRIVATE_KEY_B64 = PRIV_B64;
 process.env.BRIDGE_API_KEY = 'server-only-bridge-key';
 process.env.NCB_PROXY_BASE = NCB_BASE;
 process.env.NCB_INSTANCE = '55954_bridgemind';
+// The invitation claim needs the same authority production gives it — the club service account — and
+// the mode that uses it. `reservation` is the architecture the owner approved on 2026-11-20: single
+// use is arbitrated by a UNIQUE index on the individual user_codes RECORD id, so the fake enforces it
+// (see the create branch above) instead of merely tolerating a duplicate. Without these lines the
+// route answers 503 in the shipped default mode and the arms below would be measuring a refusal
+// rather than a claim — which is why the default itself gets its own arms (I-12d/I-12e).
+process.env.CLUB_NCB_EMAIL = 'club-service@quota-gate.invalid';
+process.env.CLUB_NCB_PASSWORD = 'club-gate-fixture-password';
+process.env.CLUB_NCB_EXPECTED_USER_ID = 'club-svc-1';
+process.env.INVITATION_CLAIM_MODE = 'reservation';
+process.env.INVITATION_RESERVATION_HMAC_KEY = 'quota-gate-reservation-hmac-key-not-a-real-secret';
 // Low enough that data_hang proves a timeout, high enough to be a real bound.
 process.env.NODESEND_NCB_TIMEOUT_MS = '600';
 process.env.TRICKSTER_BID_URL = 'http://127.0.0.1:1';
@@ -1488,8 +1534,35 @@ resetCodes([
 ]);
 mod.resetInvitationRateBuckets();
 r = await INVITE({ code: 'INV-TWIN' }); j = await readBody(r);
-check('I-7 two live rows for one code is refused, not silently resolved by taking the first',
-  r.status === 503 && j.valid === undefined && j.status === 'invitation_duplicate', JSON.stringify(j));
+// THE RULE THAT REPLACED THIS ARM'S OLD EXPECTATION, on the owner's decision of 2026-11-20: many rows
+// sharing one code value is the NORMAL shape of a bulk invitation, not a data fault. This route used
+// to answer 503 `invitation_duplicate` for it, which made every multi-record code in the table
+// unusable. It must now answer valid, and the subject the old arm really guarded — nobody quietly
+// picking one of two — is guarded better by naming the pick: ascending record id, deterministically.
+const twinOrder = await (mod.default?.invitationClaim || mod.invitationClaim).begin({ code: 'INV-TWIN', email: 'twin@example.test' });
+check('I-7 many live rows for one code are a POOL, not a fault: validation answers valid and the record chosen is the lowest id',
+  r.status === 200 && j.success === true && j.valid === true
+  && twinOrder.ok === true && Number(twinOrder.recordId) === 1,
+  JSON.stringify({ body: j, picked: twinOrder.recordId, outcome: twinOrder.outcome }));
+// …and the deterministic next step: with record 1 held by that reservation, the following caller is
+// moved to record 2 rather than refused, which is what "continue to the next eligible record" means.
+const twinNext = await (mod.default?.invitationClaim || mod.invitationClaim).begin({ code: 'INV-TWIN', email: 'other@example.test' });
+check('I-7b a record already reserved is skipped, not contested: the second caller takes the next id',
+  twinNext.ok === true && Number(twinNext.recordId) === 2, JSON.stringify({ picked: twinNext.recordId, outcome: twinNext.outcome }));
+// The exhausted case keeps the OLD arm's protective intent: nothing is ever spent when no record can
+// be had, and a pool of used rows is answered as exhausted rather than as a usable code.
+{
+  resetCodes([
+    { id: 10, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-SPENT-POOL', used: 1, registered_user_id: 'x' },
+    { id: 11, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-SPENT-POOL', used: 1, registered_user_id: 'y' }
+  ]);
+  mod.resetInvitationRateBuckets();
+  const spentPool = await INVITE({ code: 'INV-SPENT-POOL' }); const spentJson = await readBody(spentPool);
+  const noneLeft = await (mod.default?.invitationClaim || mod.invitationClaim).begin({ code: 'INV-SPENT-POOL', email: 'z@example.test' });
+  check('I-7c a pool where every record is spent is invalid, not "available": exhaustion is answered, never guessed',
+    spentJson.valid === false && noneLeft.ok === false && noneLeft.outcome === 'invitation_exhausted',
+    JSON.stringify({ valid: spentJson.valid, outcome: noneLeft.outcome }));
+}
 ncb.fault = 'data_hang';
 resetCodes([{ id: 3, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-VALID', used: 0 }]);
 mod.resetInvitationRateBuckets();
@@ -1532,19 +1605,113 @@ mod.resetInvitationRateBuckets();
 r = await CONSUME(null, { code: 'INV-FRESH' }); j = await readBody(r);
 check('I-10 consumption requires a session (the code is spent for an account, not for a string)',
   r.status === 401 && j.success !== true, JSON.stringify(j));
-r = await CONSUME('tok-a', { code: 'INV-FRESH', user_id: 999, userId: 'whoever' });
+// A registration in flight, exactly as the sign-up route would have left it: the reservation for the
+// record is held, and the only thing the caller can present afterwards is its own session.
+const liveClaim = (mod.default || mod).invitationClaim;
+const beganInFlight = await liveClaim.begin({ code: 'INV-FRESH', email: 'player.one@example.test' });
+r = await CONSUME('tok-a', { code: 'INV-FRESH', user_id: 999, userId: 'whoever', record_id: 999 });
 j = await readBody(r);
-check('I-11 the spent code is assigned to the SESSION user and a forged body user_id is ignored',
-  r.status === 200 && j.success === true
-  && String(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.user_id) === '101'
-  && ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.used === 1,
-  JSON.stringify(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')));
-r = await CONSUME('tok-b', { code: 'INV-FRESH' }); j = await readBody(r);
-check('I-12 a code already spent cannot be spent by a second account',
-  r.status === 200 && j.success === false && j.reason === 'invitation_not_found', JSON.stringify(j));
+// THE CONTRACT AS IT NOW IS: the invitee is recorded in `registered_user_id`, the vendor's ownership
+// column is left exactly as the administrator set it, and the write is performed by the service
+// account rather than by the caller's own bearer. The forged identity fields — an id, a userId, and a
+// record id — are all inert: recovery takes the record from the reservation and the account from the
+// session, so there is nothing in the body left to steer.
+const codeWriteRequests = () => ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes'));
+{
+  const row = () => ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH');
+  check('I-11 recovery credits the SESSION account: registered_user_id set, ownership column untouched, forged body identity and record id ignored',
+    beganInFlight.ok === true && r.status === 200 && j.success === true && j.recovered === true
+    && String(row()?.registered_user_id) === '101' && row()?.used === 1
+    && String(row()?.user_id) === String(CODE_ROW_USER)
+    && codeWriteRequests().length === 1
+    && codeWriteRequests()[0]?.auth === 'Bearer tok-club'
+    && !('user_id' in (codeWriteRequests()[0]?.body || {})) && !('userId' in (codeWriteRequests()[0]?.body || {})),
+    JSON.stringify({ began: beganInFlight.ok, row: row(), writes: codeWriteRequests().map((q) => ({ auth: q.auth, body: q.body })), allUserCodesCalls: ncb.requests.filter((q) => /user_codes|invitation_reservations/.test(q.pathname)).map((q) => `${q.method} ${q.pathname} auth=${q.auth || '-'} body=${JSON.stringify(q.body || '')}`), answer: j }));
+  // A retry by the account that already owns the record is a SUCCESS, not a decline: telling a player
+  // who finished registering that their valid code failed is its own kind of defect. What keeps this
+  // safe rather than merely friendly is that no second write is attempted.
+  const before = codeWriteRequests().length;
+  const retry = await CONSUME('tok-a', { code: 'INV-FRESH' });
+  const retryJson = await readBody(retry);
+  check('I-11b a retry by the owning account is idempotent and honest: success, alreadyClaimed, recovered, and no second write',
+    retry.status === 200 && retryJson.success === true && retryJson.alreadyClaimed === true && retryJson.recovered === true
+    && codeWriteRequests().length === before && String(row()?.registered_user_id) === '101',
+    JSON.stringify(retryJson));
+}
+r = await CONSUME('tok-b', { code: 'INV-FRESH', record_id: 5 }); j = await readBody(r);
+check('I-12 a second authenticated account recovers nothing and cannot reach the spent record even naming its id',
+  r.status === 200 && j.success === false && j.reason === 'invitation_not_found'
+  && String(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.registered_user_id) === '101'
+  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1,
+  JSON.stringify(j));
+// …and the same refusal when the session itself carries no verified address, which is the case an
+// HMAC-of-email design would have silently waved through.
+{
+  const savedEmail = USERS['tok-c'].email;
+  resetCodes([{ id: 5, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-FRESH', used: 1, registered_user_id: '101' },
+    { id: 9, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-NOADDR', used: 0 }]);
+  const beganNoAddr = await liveClaim.begin({ code: 'INV-NOADDR', email: USERS['tok-c'].email });
+  delete USERS['tok-c'].email;
+  const noAddr = await CONSUME('tok-c', { code: 'INV-NOADDR' });
+  const noAddrJson = await readBody(noAddr);
+  USERS['tok-c'].email = savedEmail;
+  check('I-12n a session whose vendor answer names no address is refused recovery outright, never matched against the body',
+    beganNoAddr.ok === true && noAddr.status === 409 && noAddrJson.error === 'invitation_recovery_identity_unverified'
+    && Number(ncb.rows.user_codes.find((x) => x.code === 'INV-NOADDR')?.used ?? 0) === 0,
+    JSON.stringify({ began: beganNoAddr.ok, status: noAddr.status, body: noAddrJson }));
+}
 r = await CONSUME('tok-b', { code: 'INV-NEVER-EXISTED' }); j = await readBody(r);
 check('I-12b an unknown code is a declined consumption, not a write attempt',
-  r.status === 200 && j.success === false && j.reason === 'invitation_not_found', JSON.stringify(j));
+  r.status === 200 && j.success === false && j.reason === 'invitation_not_found'
+  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1,
+  JSON.stringify(j));
+// The shipped default, measured at the unit the mode switch controls: no privileged writer means the
+// claim refuses outright instead of degrading into a best-effort read-then-write.
+//
+// WHY `mod.default` APPEARS HERE: this harness loads the relay through `import()`, and Node's CJS
+// named-export analysis reads `module.exports` statically. It finds 114 names in bridge.js and stops
+// short of the ones declared in the final export block with computed values — `mod.invitationClaim`
+// and `mod.createInvitationClaim` are therefore undefined here while `mod.default.createInvitationClaim`
+// is the real function. Reaching through `default` is the honest fix; asserting on an undefined import
+// would have been a silently skipped check, which is the one outcome worse than a red one.
+const createInvitationClaim = mod.createInvitationClaim || mod.default?.createInvitationClaim;
+{
+  // THE POOL, MEASURED THROUGH THE ROUTE THAT USED TO REJECT IT. Ten records sharing one value is the
+  // normal shape of a bulk invitation, and the deployed `findUsableInvitationRow` answered
+  // `503 invitation_duplicate` for it — a validation route that refused every multi-record code.
+  // Nine rows in, one available: the answer must be a clean `valid:true`.
+  resetCodes(Array.from({ length: 10 }, (_, i) => ({
+    id: 60 + i, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-POOL',
+    used: i === 9 ? 0 : 1, registered_user_id: i === 9 ? null : `spent-by-${i}`
+  })));
+  mod.resetInvitationRateBuckets();
+  r = await INVITE({ code: 'INV-POOL' }); j = await readBody(r);
+  check('I-12f a code held by ten records is not a fault: validation answers valid, and never a duplicate error',
+    r.status === 200 && j.success === true && j.valid === true, JSON.stringify({ status: r.status, body: j }));
+  // And the ordering rule at the route level: the lowest eligible id is the one the relay points at,
+  // asserted through what the pool looks like afterwards rather than through a returned id, because
+  // this route deliberately returns a boolean and nothing else.
+  check('I-12g validation leaks no record id, no remaining count and no secret column for a multi-record code',
+    JSON.stringify(j).includes('"valid"') && !JSON.stringify(j).includes('69')
+    && !JSON.stringify(j).includes(CODE_SECRET) && !JSON.stringify(j).includes(CODE_ROW_USER), JSON.stringify(j));
+
+  const writerless = createInvitationClaim({ readRows: async () => ({ ok: true, rows: [{ id: 5, code: 'INV-FRESH', used: 0, registered_user_id: null }] }) });
+  const refusedBegin = await writerless.begin({ code: 'INV-FRESH', email: 'a@example.com' });
+  check('I-12d a claim with no reservation store refuses outright, which is what the atomic-only default is',
+    refusedBegin.ok === false && refusedBegin.outcome === 'claim_unavailable', JSON.stringify(refusedBegin));
+
+  const poolStub = { reserve: async () => ({ ok: true, reservationId: 1 }), complete: async () => ({ ok: true }), readByRecordId: async () => ({ ok: true, rows: [] }), pendingForEmailHash: async () => ({ ok: true, rows: [] }) };
+  const allocated = createInvitationClaim({
+    readRows: async () => ({ ok: true, rows: [
+      { id: 6, code: 'INV-ALLOC', used: 0, registered_user_id: 'someone-else' },
+      { id: 7, code: 'INV-ALLOC', used: 1, registered_user_id: 'third' }
+    ] }),
+    writeRow: async () => ({ ok: true }), reservations: poolStub, emailSecret: 'gate-hmac-key-not-a-real-secret-32chars-x'
+  });
+  const allocatedBegin = await allocated.begin({ code: 'INV-ALLOC', email: 'me@example.com' });
+  check('I-12e records that are used or allocated to others make the code exhausted, and nothing is reserved or reassigned',
+    allocatedBegin.ok === false && allocatedBegin.outcome === 'invitation_exhausted', JSON.stringify(allocatedBegin));
+}
 
 // ── per-user credentials ───────────────────────────────────────────────────
 resetCreds([]);

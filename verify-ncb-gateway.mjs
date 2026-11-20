@@ -170,6 +170,11 @@ delete process.env.NODESEND_PRIVATE_KEY_PEM;
 
 const bridge = require(path.join(ROOT, 'bridge.js'));
 const { app, ncbSeal, ncbNativeClient, buildNcbGateway, ncbGatewayClubTables } = bridge;
+// Imported directly rather than through the relay's exports, because section 16 wires a claim channel
+// of its own around a local pool: the objects under test are these modules, and bridge.js supplies the
+// transport, not the logic.
+const { createInvitationReservations } = require('./ncb/invitationReservations.js');
+const createInvitationClaimForGate = require('./ncb/invitationClaim.js').createInvitationClaim;
 
 const server = app.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
@@ -754,16 +759,119 @@ const probeCall = async (method, route, { token = '', body, headers = {} } = {})
     body: { email: 'a@poc.invalid', password: 'pw-a-fixture', name: 'With Lever', hackerField: 'nope' }
   });
   const sentSignUp = upstreamLog.slice(markOpen).find((e) => e.path.endsWith('/sign-up/email'));
-  check('16d. NCB_GATEWAY_ALLOW_SIGN_UP=1 restores the previous behaviour exactly — forwarded, handle minted, body still projected',
-    openMount.health().signUpAllowed === true && opened.status === 200
-    && String(opened.json?.token || '').startsWith('ncbs1.') && sentSignUp
-    && sentSignUp.body?.hackerField === undefined && sentSignUp.body?.password === 'pw-a-fixture',
-    JSON.stringify({ status: opened.status, minted: String(opened.json?.token || '').slice(0, 6), health: openMount.health().signUpAllowed, bodyKeys: Object.keys(sentSignUp?.body ?? {}) }));
+  check('16d. the lever alone is NOT enough: with no privileged claim channel, enabling registration answers 503 and creates nobody',
+    openMount.health().signUpAllowed === true && openMount.health().invitationClaimWired === false
+    && opened.status === 503 && opened.json?.error === 'invitation_claim_unavailable' && !sentSignUp,
+    JSON.stringify({ status: opened.status, error: opened.json?.error, upstreamSignUpCalls: sentSignUp ? 1 : 0 }));
+  // A mount that DOES have a claim channel, so the invitation precondition is measured as a rule and
+  // not merely as an absence. The reader/writer here are local on purpose: the end-to-end claim over
+  // the service account is verify-ncb-integration.mjs section 14's job.
+  const localCodes = [{ id: 7, code: 'GATEWAY-OK-1', used: 0, registered_user_id: null }];
+  // A reservation store of the same shape the relay wires — including the UNIQUE refusal, because an
+  // adapter that always says yes would make the contention arms measure nothing.
+  const localReservations = (() => {
+    const rows = [];
+    let nextId = 1;
+    return createInvitationReservations({
+      request: async ({ path: p, body, query }) => {
+        const seg = String(p).split('/');
+        const verb = seg[0];
+        const idPart = seg[2];
+        if (verb === 'create') {
+          if (rows.some((r) => String(r.code_row_id) === String(body.code_row_id))) {
+            return { ok: false, httpStatus: 400, body: { message: 'Duplicate entry for key code_row_id' } };
+          }
+          const row = { id: nextId++, code_row_id: String(body.code_row_id), invitee_email_hash: body.invitee_email_hash, status: 'pending' };
+          rows.push(row);
+          return { ok: true, httpStatus: 201, body: { id: row.id } };
+        }
+        if (verb === 'read') {
+          const q = new URLSearchParams(query || '');
+          const byRecord = q.get('code_row_id'); const byHash = q.get('invitee_email_hash');
+          let list = rows;
+          if (byRecord !== null) list = list.filter((r) => String(r.code_row_id) === byRecord);
+          if (byHash !== null) list = list.filter((r) => String(r.invitee_email_hash) === byHash);
+          return { ok: true, httpStatus: 200, body: { data: list } };
+        }
+        if (verb === 'update') {
+          const row = rows.find((r) => String(r.id) === idPart);
+          if (!row) return { ok: false, httpStatus: 404 };
+          Object.assign(row, body);
+          return { ok: true, httpStatus: 200, body: { data: row } };
+        }
+        if (verb === 'delete') {
+          const i = rows.findIndex((r) => String(r.id) === idPart);
+          if (i < 0) return { ok: false, httpStatus: 404 };
+          rows.splice(i, 1);
+          return { ok: true, httpStatus: 200 };
+        }
+        return { ok: false, httpStatus: 404 };
+      },
+      table: 'invitation_reservations'
+    });
+  })();
+  const localWrites = [];
+  const localClaim = createInvitationClaimForGate({
+    readRows: async ({ code }) => ({ ok: true, rows: localCodes.filter((r) => r.code === code) }),
+    writeRow: async ({ recordId, userId }) => {
+      const row = localCodes.find((r) => String(r.id) === String(recordId));
+      localWrites.push({ recordId, userId });
+      if (!row) return { ok: false };
+      row.used = 1; row.registered_user_id = userId;
+      return { ok: true };
+    },
+    reservations: localReservations,
+    emailSecret: 'gate-invitation-reservation-hmac-key-not-a-secret'
+  });
+  const withClaim = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_AUTH_RATE_MAX: '5000', NCB_GATEWAY_ALLOW_SIGN_UP: '1' }, invitationClaim: localClaim });
+  const claimApp = require('express')();
+  claimApp.use(require('express').json());
+  claimApp.use(withClaim.router);
+  const claimServer = claimApp.listen(0, '127.0.0.1');
+  await new Promise((r) => claimServer.once('listening', r));
+  const CLAIM_BASE = `http://127.0.0.1:${claimServer.address().port}`;
+  const beforeCodeless = upstreamLog.length;
+  const noCode = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', { body: { email: 'a@poc.invalid', password: 'pw-a-fixture', name: 'No Code' } });
+  const codelessReachedVendor = upstreamLog.slice(beforeCodeless).filter((e) => e.path.endsWith('/sign-up/email')).length;
+  const markClaimed = upstreamLog.length;
+  const withCode = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', { body: { email: 'a@poc.invalid', password: 'pw-a-fixture', name: 'Invited', invitationCode: 'GATEWAY-OK-1' } });
+  const sentWithCode = upstreamLog.slice(markClaimed).find((e) => e.path.endsWith('/sign-up/email'));
+  check('16g. with a claim channel wired: a codeless sign-up is refused without dialling the vendor, and a coded one registers and spends',
+    noCode.status === 403 && noCode.json?.error === 'invitation_required' && codelessReachedVendor === 0
+    && withCode.status === 200 && withCode.json?.invitationClaimed === true
+    && Number(localCodes[0].used) === 1 && String(localCodes[0].registered_user_id) === String(withCode.json?.data?.user?.id),
+    JSON.stringify({ noCode: `${noCode.status}/${noCode.json?.error}`, reachedVendor: codelessReachedVendor, coded: `${withCode.status}/${withCode.json?.invitationClaimed}`, row: localCodes[0] }));
+  const reused = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', { body: { email: 'b@poc.invalid', password: 'pw-b-fixture', invitationCode: 'GATEWAY-OK-1' } });
+  check('16h. the same code cannot be spent twice through this route, and the answer is exhaustion — not a duplicate fault',
+    reused.status === 409 && reused.json?.error === 'invitation_exhausted', `${reused.status}/${reused.json?.error}`);
+  check('16i. the invitation code never travels upstream — the vendor sees exactly its own three fields',
+    withCode.status === 200 && sentWithCode && sentWithCode.body?.invitationCode === undefined
+    && Object.keys(sentWithCode.body ?? {}).sort().join(',') === 'email,name,password',
+    JSON.stringify({ status: withCode.status, bodyKeys: Object.keys(sentWithCode?.body ?? {}) }));
+  await new Promise((r) => claimServer.close(r));
   const truthy = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_ALLOW_SIGN_UP: 'true' } });
   const loose = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_ALLOW_SIGN_UP: '0' } });
   check('16e. the lever is exact: "true"/"0"/anything but "1" leaves registration closed (a typo must not open a public signup)',
     truthy.health().signUpAllowed === false && loose.health().signUpAllowed === false,
     `true=${truthy.health().signUpAllowed} 0=${loose.health().signUpAllowed}`);
+  /* WHICH OUTCOMES MAY FREE A RESERVATION, pinned as a table against the shipped predicate. This is
+     the one decision in registration that cannot be re-litigated after the fact: release too early and
+     a record whose account was quietly created goes to a second registrant, release too late and every
+     mistyped email costs the pool a record forever. Asserting the mapping directly — not only through
+     one outage arm and one duplicate-email arm — is what stops a future edit to the status table from
+     moving a single line and passing. */
+  {
+    const ambiguous = require('./ncb/gateway.js').signUpOutcomeIsAmbiguous;
+    const holds = [[0, 'no answer at all'], [408, 'request timeout'], [500, 'server fault'], [502, 'bad gateway'], [503, 'unavailable'], [504, 'gateway timeout']];
+    const frees = [[400, 'malformed / already-registered'], [401, 'credentials refused'], [403, 'policy refusal'], [422, 'validation refusal'], [429, 'vendor throttle']];
+    const wrong = [
+      ...holds.filter(([s]) => ambiguous(s) !== true).map(([s, w]) => `${s} (${w}) should HOLD`),
+      ...frees.filter(([s]) => ambiguous(s) !== false).map(([s, w]) => `${s} (${w}) should RELEASE`)
+    ];
+    check('16j. an ambiguous account-creation outcome holds the reservation and a decided refusal frees it, across the whole status table',
+      wrong.length === 0 && ambiguous(undefined) === true && ambiguous('') === true && ambiguous(NaN) === true,
+      wrong.join('; ') || `holds=${holds.length} frees=${frees.length}`);
+  }
   // The invitation lookup must survive the new refusal. Measured on a mount that can actually serve it:
   // the shipped relay's reader needs a configured Clubs service account (it answers 503 without one),
   // and its auth throttle had already been spent by sections 8-15 — both of those properties are

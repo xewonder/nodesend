@@ -57,6 +57,12 @@ const USERS = {
 const sessions = new Map();          // cookie value -> user id
 const rows = [];                     // {id, table, user_id, ...fields}
 let nextRowId = 1;
+let newUserId = 1000;
+// Two fault knobs, for the two failure points a registration can split across: the vendor refusing
+// (or never answering) the account creation, and the vendor refusing the claim that must follow it.
+// The second is the one that used to be invisible — an account created with no code spent against it.
+let signUpFault = null;
+let claimFault = null;
 const nativeLog = [];
 const lambdaLog = [];
 const SECRET_MARKER = 'ncb_sec_real_looking_database_secret';
@@ -103,9 +109,25 @@ function answer(req, res, which) {
     if (url.pathname.startsWith('/api/user-auth/')) {
       const verb = url.pathname.slice('/api/user-auth/'.length);
       if (verb === 'sign-in/email' || verb === 'sign-up/email') {
+        if (signUpFault) {
+          // `destroy` is the silence case: the vendor accepts the connection and then says nothing,
+          // which is the shape an operator actually sees during an outage and the one most likely to
+          // be answered with a misleading 401.
+          if (signUpFault.destroy) { req.socket?.destroy(); return; }
+          return send(signUpFault.status, signUpFault.body ?? { status: 'error' });
+        }
         const email = String(body?.email || '').toLowerCase();
+        // SIGN-UP CREATES. The real vendor does, and an account the fake refuses to make would turn
+        // every registration arm into a test of a refusal. A sign-up for an email that already exists
+        // is the duplicate case, and it is answered the way better-auth answers it.
+        if (verb === 'sign-up/email' && USERS[email]) {
+          return send(422, { status: 'error', message: 'User already exists' });
+        }
+        if (!USERS[email]) {
+            if (verb === 'sign-in/email') return send(401, { status: 'error', message: 'Invalid email or password' });
+            USERS[email] = { id: `user-new-${++newUserId}`, password: body?.password, name: body?.name || 'New Player' };
+        }
         const u = USERS[email];
-        if (!u) return send(401, { status: 'error', message: 'Invalid email or password' });
         if (verb === 'sign-in/email' && u.password !== body?.password) {
           return send(401, { status: 'error', message: 'Invalid email or password' });
         }
@@ -137,7 +159,7 @@ function answer(req, res, which) {
       // The club service account is privileged over the authority tables and only over them; a
       // player session stays scoped to its own rows. Both halves of that rule are asserted below, so
       // this line is a description of the arrangement rather than a convenience.
-      const AUTHORITY = ['system_admins', 'clubs', 'club_memberships', 'club_board_collections', 'club_collection_boards', 'user_codes'];
+      const AUTHORITY = ['system_admins', 'clubs', 'club_memberships', 'club_board_collections', 'club_collection_boards', 'user_codes', 'invitation_reservations'];
       // `ai_quota_*` run under a documented `shared_readwrite` policy: every authenticated session in
       // the instance can reach the same rows, so there is NO per-user isolation there. Modelling that
       // honestly is what makes arm 9a mean something — the reason the quota tables are excluded from
@@ -161,6 +183,13 @@ function answer(req, res, which) {
         return send(200, { status: 'success', data: list.slice(0, limit), metadata: { page: 1, limit, hasMore: false, hasPrev: false } });
       }
       if (verb === 'create') {
+        // The reservation table's UNIQUE(code_row_id), enforced HERE. Without it every concurrency arm
+        // in section 14 would be measuring a mock that always says yes, and a green result would mean
+        // nothing about the guarantee the design claims.
+        if (table === 'invitation_reservations'
+          && rows.some((r) => r.table === table && String(r.code_row_id) === String(body?.code_row_id))) {
+          return send(400, { status: 'error', message: 'Duplicate entry for key code_row_id' });
+        }
         // Ownership is assigned from the SESSION, and a `user_id` in the body is discarded — which is
         // the vendor's measured behaviour (`user_id` is a reserved, session-assigned column that a
         // client cannot write). Spreading the body first and the session last is what encodes that;
@@ -172,7 +201,16 @@ function answer(req, res, which) {
       if (verb === 'update') {
         const row = visible().find((r) => String(r.id) === id);
         if (!row) return send(404, { status: 'error', message: 'Record not found or access denied' });
-        Object.assign(row, body);
+        if (table === 'user_codes' && claimFault) {
+          return send(claimFault.status, claimFault.body ?? { status: 'error', message: 'write refused' });
+        }
+        // `user_id` is the vendor's session-assigned ownership column and an update does not move it
+        // (measured with code 891: the PUT persisted `used` while NCB silently dropped `user_id`).
+        // Modelling that drop is what makes arm 11's "the claim never writes user_id" assertion mean
+        // something: without it, a regression to the old column would still look like it worked here.
+        const fields = { ...body };
+        delete fields.user_id;
+        Object.assign(row, fields);
         return send(200, { status: 'success', data: row });
       }
       if (verb === 'delete') {
@@ -196,6 +234,41 @@ const LAMBDA = `http://127.0.0.1:${lambda.address().port}`;
 // Seed the invitation row the registration flow looks up, and a row that must never be reachable
 // through the anonymous route.
 rows.push({ id: 900, table: 'user_codes', user_id: 'club-svc-1', code: 'BRIDGE-2026-KEY', used: 0, registered_user_id: null, issued_by: 'club-svc-1', note: 'internal note that must not be projected', api_key: SECRET_MARKER });
+// The codes section 11 spends. Each arm gets its own row so a failure in one cannot make another
+// pass by accident, and the used-by-another row exists so the refusal is measured rather than
+// asserted: a claim that could not see a spent code would also happily overwrite one.
+rows.push(
+  { id: 930, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-VALID-1', used: 0, registered_user_id: null },
+  { id: 931, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-RACE-1', used: 0, registered_user_id: null },
+  { id: 932, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-CLAIMFAIL-1', used: 0, registered_user_id: null },
+  { id: 933, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-USED-1', used: 1, registered_user_id: 'user-somebody-else' },
+  { id: 934, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-DUP-1', used: 0, registered_user_id: null },
+  { id: 935, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-DUP-1', used: 0, registered_user_id: null },
+  { id: 936, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-OUTAGE-1', used: 0, registered_user_id: null },
+  // allocated-but-unspent: the flag says free, the owner column says otherwise. Handing this to a new
+  // registration would reassign an administrator's audit record; the rule is refused, not judged.
+  { id: 937, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-ALLOC-1', used: 0, registered_user_id: 'user-previous' },
+  // A two-record code, so concurrency can be measured as the store actually resolves it: two callers,
+  // two DIFFERENT records, both registrations succeeding. One record cannot show this.
+  { id: 939, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-POOL2', used: 0, registered_user_id: null },
+  { id: 938, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-POOL2', used: 0, registered_user_id: null },
+  // A record whose registration is refused by the VENDOR because the address already has an account.
+  // That is a DECIDED outcome — no account was created — so the record must go back in the pool, which
+  // is the opposite of the ambiguous case arm 14w measures.
+  { id: 940, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-DEMAIL-1', used: 0, registered_user_id: null },
+  // A TEN-record pool, ids descending on purpose: at the size a bulk invitation is actually issued,
+  // ascending selection has to be produced by the claim, not inherited from the return order.
+  { id: 950, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 949, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 948, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 947, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 946, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 945, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 944, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 943, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 942, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
+  { id: 941, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null }
+);
 // The club authority data, as the service-account path sees it. These rows belong to no player:
 // `clubs/ncbAccountClient.js` reads them as the dedicated club account, which is exactly the model
 // the club feature runs on, so the fake makes that account privileged over the authority tables and
@@ -259,6 +332,19 @@ process.env = {
   // registration refused — and arms 6j/6k measure that default on its own mount rather than leaving
   // it to a comment.
   NCB_GATEWAY_ALLOW_SIGN_UP: '1',
+  // The claim channel this gate measures is the one the owner approved on 2026-11-20: single use
+  // arbitrated by a database UNIQUE index on the individual user_codes RECORD id. The fake above
+  // enforces that index, so a green concurrency arm here means the arbitration was actually tested.
+  // The SHIPPED default remains `atomic-only` — no store, every claim refused — and arms 14p/14s
+  // measure that state on their own mount and unit, so this line cannot make fail-closed untested.
+  INVITATION_CLAIM_MODE: 'reservation',
+  INVITATION_RESERVATION_HMAC_KEY: 'integration-gate-reservation-hmac-key-not-a-secret',
+  // Every request in this gate arrives from 127.0.0.1, and section 14 now drives ten concurrent
+  // registrations plus a dozen sequential ones. At the shipped throttle of 20 per window the arm would
+  // measure a 429 and call it a claim outcome — the same false negative the anonymous-read throttle
+  // already forces this gate to route around above. The throttle itself is measured where it belongs,
+  // on its own mount in verify-ncb-gateway.mjs section 12.
+  NCB_GATEWAY_AUTH_RATE_MAX: '5000',
   CLUB_NCB_EMAIL: 'club-service@poc.invalid',
   CLUB_NCB_PASSWORD: 'club-fixture-password',
   CLUB_NCB_EXPECTED_USER_ID: 'club-svc-1',
@@ -477,10 +563,12 @@ check('6d. an unfiltered public read is refused — the route cannot enumerate i
 const wrongPublicTable = await (await fetch(`${BASE}/ncb/public-data/read/user_settings?code=X`, { headers: { Origin: PROD_ORIGINS[0] } }));
 check('6e. the public route serves one table and no other',
   wrongPublicTable.status === 403, `${wrongPublicTable.status}`);
-const signedUp = await api.authFetch('sign-up/email', { method: 'POST', body: JSON.stringify({ name: 'Cy New', email: 'player-b@poc.invalid', password: 'pw-b-fixture' }) });
-check('6f. sign-up through the gateway answers the shape Login.jsx requires',
-  signedUp?.status === 'success' ? Boolean(signedUp?.data?.user) : /already|exist|Invalid/i.test(String(signedUp?.error ?? '')),
-  JSON.stringify(signedUp).slice(0, 140));
+const codelessBefore = nativeLog.filter((e) => String(e.path).includes('sign-up')).length;
+const codelessSignUp = await api.authFetch('sign-up/email', { method: 'POST', body: JSON.stringify({ name: 'Cy New', email: 'walk-in@poc.invalid', password: 'pw-walk-in-fixture' }) });
+const codelessUpstream = nativeLog.filter((e) => String(e.path).includes('sign-up')).length - codelessBefore;
+check('6f. a sign-up with no invitation is refused by the SERVER, not by the page, and never reaches NCB',
+  codelessSignUp?.httpStatus === 403 && codelessSignUp?.error === 'invitation_required' && codelessUpstream === 0,
+  JSON.stringify(codelessSignUp).slice(0, 140));
 
 // ── 6g-6i. REGISTRATION CLAIMING IS UNAVAILABLE, and that has to be measured, not intended.
 //
@@ -625,15 +713,41 @@ check('7d. its remaining LOCAL validity is bounded by the configured TTL, which 
 
 // ── 9. the server-only tables stay server-only, and the browser set stays open ─
 localStorage.setItem(api.SESSION_TOKEN_KEY, handleA);
-const serverOnly = ['ai_quota_usage', 'ai_quota_config', 'ai_quota_user_override', 'ai_quota_reservation', 'ai_provider_credentials_1770000000'];
+const serverOnly = ['ai_quota_usage', 'ai_quota_config', 'ai_quota_user_override', 'ai_quota_reservation', 'ai_provider_credentials_1770000000',
+  // The arbitration table itself. A signed-in account that could INSERT here could hold every record
+  // of a code it has no right to spend and starve the whole pool — the exact abuse the reservation
+  // exists to prevent, reachable through the route that is deliberately broad.
+  'invitation_reservations'];
 const authorityTables = ['system_admins', 'clubs', 'club_memberships', 'club_board_collections', 'club_collection_boards'];
 const leakedTables = [];
 for (const t of [...serverOnly, ...authorityTables]) {
   const r = await (await fetch(`${BASE}/ncb/data/read/${t}?limit=1`, { headers: { Origin: PROD_ORIGINS[0], Authorization: `Bearer ${handleA}` } })).status;
   if (r !== 403) leakedTables.push(`${t}=${r}`);
 }
-check('9a. quota, credential and club-authority tables are all refused through the player gateway',
+check('9a. quota, credential, reservation and club-authority tables are all refused through the player gateway',
   leakedTables.length === 0, leakedTables.join(' '));
+// Read is only the easiest verb. The reservation table must be unreachable in ALL FOUR, because a
+// player-controlled INSERT is a denial of the pool and a player-controlled DELETE is a free re-spend.
+const reservationVerbs = [
+  ['GET', '/ncb/data/read/invitation_reservations?limit=1'],
+  ['POST', '/ncb/data/create/invitation_reservations'],
+  ['PUT', '/ncb/data/update/invitation_reservations/1'],
+  ['DELETE', '/ncb/data/delete/invitation_reservations/1'],
+  ['GET', '/ncb/public-data/read/invitation_reservations?limit=1']
+];
+const reservationLeaks = [];
+for (const [method, route] of reservationVerbs) {
+  const res = await fetch(`${BASE}${route}`, {
+    method, headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', Authorization: `Bearer ${handleA}` },
+    ...(method === 'GET' ? {} : { body: JSON.stringify({ code_row_id: '1', status: 'pending' }) })
+  });
+  const json = await res.json().catch(() => ({}));
+  // Refused at the TABLE (403 table_not_allowed), before the credential is even parsed — and an
+  // anonymous caller must not reach it through the public family either.
+  if (!(res.status === 403 && ['table_not_allowed', 'write_not_allowed'].includes(json?.error))) reservationLeaks.push(`${method} ${route}=${res.status}/${json?.error}`);
+}
+check('9a2. invitation_reservations is refused to a signed-in player on read, create, update, delete AND the public route — the arbitration is server-only',
+  reservationLeaks.length === 0, reservationLeaks.join(' '));
 // Tables a player's own flow reads or writes. `system_ai_credentials` is deliberately NOT among them:
 // the shipped admin screen reads it, but it holds the system provider key material, and a general
 // player CRUD path is not where that belongs. The refusal is asserted below, so the decision is
@@ -758,6 +872,294 @@ check('12. a rebuilt relay with the same key opens the live handle; a different 
   check('13d. the shipped authority answers a non-sealed credential as unusable, never as an outage',
     legacyAnswer.ok === false && legacyAnswer.status === 401 && legacyAnswer.reason === 'not_sealed',
     JSON.stringify(legacyAnswer));
+}
+
+// ── 14. REGISTRATION, END TO END, INCLUDING THE PARTS THAT USED TO BE INVISIBLE ──
+//
+// Section 6 measured the pieces: the lookup, the projection, and the refusal that made the browser's
+// own claim impossible. This section measures the flow that replaced it — the gateway requiring an
+// invitation server-side, NodeSend writing the claim with the service account, and what happens when
+// either half fails. The scenarios are the ones the release decision turns on, not a tour of the code:
+// valid, invalid, spent, duplicated, concurrent, vendor refusal, vendor silence, a claim that dies
+// AFTER the account exists, and the retry that has to recover it.
+{
+  const rowOf = async (code) => {
+    const r = await (await fetch(`${BASE}/ncb/public-data/read/user_codes?code=${encodeURIComponent(code)}`, { headers: { Origin: PROD_ORIGINS[0] } })).json().catch(() => ({}));
+    return (r?.data ?? []).find((x) => String(x.code) === code) ?? null;
+  };
+  const signUp = async ({ email, code, password = 'pw-flow-fixture', name = 'Flow Player', origin = PROD_ORIGINS[0] }) => {
+    const res = await fetch(`${BASE}/ncb/auth/sign-up/email`, {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, password, ...(code === undefined ? {} : { invitationCode: code }) })
+    });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  };
+  const consume = async (handle, code) => {
+    const res = await fetch(`${BASE}/auth/consume-invitation`, {
+      method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', Authorization: `Bearer ${handle}` },
+      body: JSON.stringify({ code })
+    });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  };
+
+  const fresh = await signUp({ email: 'flow-valid@poc.invalid', code: 'FLOW-VALID-1' });
+  const spentRow = await rowOf('FLOW-VALID-1');
+  check('14a. a valid unused invitation registers: account created, handle minted, code spent on THAT account',
+    fresh.status === 200 && fresh.body?.status === 'success' && String(fresh.body?.token || '').startsWith('ncbs1')
+    && fresh.body?.invitationClaimed === true && Number(spentRow?.used) === 1
+    && String(spentRow?.registered_user_id) === String(fresh.body?.data?.user?.id),
+    JSON.stringify({ status: fresh.status, claimed: fresh.body?.invitationClaimed, row: spentRow }));
+  check('14b. and the response is still the envelope Login.jsx branches on — data.user plus one top-level token',
+    Boolean(fresh.body?.data?.user?.id) && typeof fresh.body?.token === 'string' && !('tokens' in fresh.body),
+    JSON.stringify(Object.keys(fresh.body ?? {})));
+
+  const rowsFor = async (code) => {
+    const r = await (await fetch(`${BASE}/ncb/public-data/read/user_codes?code=${encodeURIComponent(code)}`, { headers: { Origin: PROD_ORIGINS[0] } })).json().catch(() => ({}));
+    return (r?.data ?? []).filter((x) => String(x.code) === code);
+  };
+  // The anonymous public route is throttled per address on purpose (10/window), and by this point in
+  // the run that window is spent — a 429 here would look like "the record does not exist", which is
+  // precisely the kind of false negative that makes a gate lie. So the later arms read the STORE the
+  // write went to. Same rows, no throttle, and strictly stronger evidence: it is the vendor's own
+  // state, not a projected copy of it. Projected fields only are ever printed.
+  const storeRows = (code) => rows.filter((r) => r.table === 'user_codes' && String(r.code) === code)
+    .map(({ id, code: c, used, registered_user_id }) => ({ id, code: c, used, registered_user_id }));
+  const dup = await signUp({ email: 'flow-dup@poc.invalid', code: 'FLOW-DUP-1' });
+  const dupRows = await rowsFor('FLOW-DUP-1');
+  check('14c. two live records for one code are a POOL, not a fault: the lowest id is spent and the next record stays available',
+    dup.status === 200 && dup.body?.invitationClaimed === true
+    && dupRows.length === 2 && Number(dupRows[0]?.used) === 1 && Number(dupRows[0]?.id) === 934
+    && Number(dupRows[1]?.used) === 0 && String(dupRows[1]?.registered_user_id ?? '') === '',
+    JSON.stringify({ status: dup.status, claimed: dup.body?.invitationClaimed, rows: dupRows.map((r) => `${r.id}:${r.used}`) }));
+  const allocated = await signUp({ email: 'flow-alloc@poc.invalid', code: 'FLOW-ALLOC-1' });
+  const afterAlloc = await rowOf('FLOW-ALLOC-1');
+  check('14t. a code whose only record is allocated to somebody else is refused as exhausted, and that owner is left standing',
+    allocated.status === 409 && allocated.body?.error === 'invitation_exhausted'
+    && String(afterAlloc?.registered_user_id) === 'user-previous' && Number(afterAlloc?.used) === 0,
+    JSON.stringify({ status: allocated.status, error: allocated.body?.error, row: afterAlloc }));
+  const spent = await signUp({ email: 'flow-used@poc.invalid', code: 'FLOW-USED-1' });
+  const afterUsed = await rowOf('FLOW-USED-1');
+  check('14d. a code already spent on another account is refused and NOTHING is created or overwritten',
+    spent.status === 409 && spent.body?.error === 'invitation_exhausted'
+    && String(afterUsed?.registered_user_id) === 'user-somebody-else' && Number(afterUsed?.used) === 1,
+    JSON.stringify({ status: spent.status, error: spent.body?.error, row: afterUsed }));
+  const noShape = await signUp({ email: 'flow-shape@poc.invalid' });
+  check('14e. omitting the field entirely is the same refusal — the page is not the authority',
+    noShape.status === 403 && noShape.body?.error === 'invitation_required', `${noShape.status}/${noShape.body?.error}`);
+  const badShape = await signUp({ email: 'flow-shape2@poc.invalid', code: 'NO-SUCH-CODE-XYZ' });
+  check('14f. an unknown code is refused before the vendor is asked to create anything',
+    badShape.status === 403 && badShape.body?.error === 'code_not_found', `${badShape.status}/${badShape.body?.error}`);
+
+  const raced = await Promise.all([
+    signUp({ email: 'race-a@poc.invalid', code: 'FLOW-RACE-1' }),
+    signUp({ email: 'race-b@poc.invalid', code: 'FLOW-RACE-1' })
+  ]);
+  const raceRow = await rowOf('FLOW-RACE-1');
+  const winners = raced.filter((r) => r.status === 200 && r.body?.invitationClaimed === true).length;
+  const refused = raced.filter((r) => r.status === 409).length;
+  check('14g. two simultaneous registrations on one code: exactly one is granted, the other is refused, and the row names one owner',
+    winners === 1 && refused === 1 && Number(raceRow?.used) === 1
+    && raced.some((r) => String(r.body?.data?.user?.id) === String(raceRow?.registered_user_id)),
+    JSON.stringify({ statuses: raced.map((r) => `${r.status}/${r.body?.invitationClaimed ?? r.body?.error}`), owner: raceRow?.registered_user_id }));
+
+  const writesBeforeOutage = nativeLog.filter((e) => e.method === 'PUT' && String(e.path).includes('/user_codes/')).length;
+  signUpFault = { destroy: true };
+  const broke = await signUp({ email: 'flow-outage@poc.invalid', code: 'FLOW-OUTAGE-1' });
+  signUpFault = null;
+  const afterBreak = await rowOf('FLOW-OUTAGE-1');
+  const outageWrites = nativeLog.filter((e) => e.method === 'PUT' && String(e.path).includes('/user_codes/')).length - writesBeforeOutage;
+  check('14h. a vendor that dies during creation gives 503, spends nothing, issues no handle and attempts no claim',
+    broke.status === 503 && broke.body?.error === 'auth_service_unavailable' && !broke.body?.token
+    && Number(afterBreak?.used) === 0 && String(afterBreak?.registered_user_id ?? '') === '' && outageWrites === 0,
+    JSON.stringify({ status: broke.status, error: broke.body?.error, row: afterBreak, claimWrites: outageWrites }));
+  /* THE AMBIGUOUS ANSWER HOLDS THE RECORD. The socket died, so whether NCB created that account is
+     unknown, and "unknown" is not a licence to hand the record to somebody else — that is how one
+     invitation ends up behind two accounts, which is the single failure this whole design exists to
+     make impossible. So the reservation stays, the next registrant is told the pool is spent rather
+     than being quietly given the same record, and the response says so the client does not go and try
+     a DIFFERENT code (each of those retries would cost another record). */
+  const heldAfterAmbiguity = rows.filter((r) => r.table === 'invitation_reservations' && String(r.code_row_id) === '936')
+    .map((r) => `${r.id}:${r.status}`);
+  const secondOnHeld = await signUp({ email: 'flow-outage2@poc.invalid', code: 'FLOW-OUTAGE-1' });
+  const afterSecond = storeRows('FLOW-OUTAGE-1')[0] || null;
+  check('14w. and the reservation is HELD, not returned to the pool: a second registrant cannot take the record whose account-creation answer was lost',
+    broke.body?.invitationHeldForRecovery === true && heldAfterAmbiguity.length === 1
+    && String(heldAfterAmbiguity[0]).endsWith(':pending')
+    && secondOnHeld.status === 409 && secondOnHeld.body?.error === 'invitation_exhausted'
+    && Number(afterSecond?.used) === 0 && String(afterSecond?.registered_user_id ?? '') === '',
+    JSON.stringify({ held: heldAfterAmbiguity, second: `${secondOnHeld.status}/${secondOnHeld.body?.error}`, row: afterSecond, heldFlag: broke.body?.invitationHeldForRecovery }));
+  // The opposite half: the vendor DID answer, and answered "that address already has an account". No
+  // account was created by this request, so the record belongs back in the pool — otherwise every
+  // mistyped email would drain a ten-record pool by one, permanently.
+  const dupe = await signUp({ email: 'player-a@poc.invalid', code: 'FLOW-DEMAIL-1' });
+  // The release runs in the response's `finish` hook, which is AFTER the client has the answer, so the
+  // row is polled rather than assumed absent: a single immediate read would measure the scheduler, not
+  // the design. Bounded, and the bound is reported on failure.
+  const reservationRowsFor = (recordId) => rows.filter((r) => r.table === 'invitation_reservations' && String(r.code_row_id) === String(recordId));
+  const releasedWithin = async (recordId, limitMs = 4000) => {
+    const started = Date.now();
+    for (;;) {
+      if (reservationRowsFor(recordId).length === 0) return Date.now() - started;
+      if (Date.now() - started > limitMs) return null;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  };
+  const releaseLatency = await releasedWithin(940);
+  const thenFresh = await signUp({ email: 'flow-demail-new@poc.invalid', code: 'FLOW-DEMAIL-1' });
+  const dupeRow = storeRows('FLOW-DEMAIL-1')[0] || null;
+  check('14x. a DECIDED vendor refusal (duplicate email) gives the record back: the next registrant gets the same record and spends it once',
+    dupe.status === 400 && dupe.body?.error === 'request_rejected' && dupe.body?.invitationHeldForRecovery === undefined
+    && releaseLatency !== null
+    && thenFresh.status === 200 && thenFresh.body?.invitationClaimed === true
+    && Number(dupeRow?.used) === 1 && String(dupeRow?.registered_user_id) === String(thenFresh.body?.data?.user?.id),
+    JSON.stringify({ dupe: `${dupe.status}/${dupe.body?.error}`, releasedInMs: releaseLatency, fresh: `${thenFresh.status}/${thenFresh.body?.invitationClaimed}`, row: dupeRow }));
+  // TEN concurrent registrations against one code value, over HTTP, through the real mount — the size
+  // at which a bulk invitation is issued and the count an in-process lock would have passed at while
+  // still being wrong across two replicas.
+  const ten = await Promise.all(Array.from({ length: 10 }, (_, n) => signUp({ email: `ten-${n}@poc.invalid`, code: 'FLOW-TEN-1' })));
+  const tenRows = storeRows('FLOW-TEN-1');
+  const tenSpent = tenRows.filter((r) => Number(r.used) === 1);
+  const tenOwners = new Set(tenSpent.map((r) => String(r.registered_user_id)));
+  check('14y. ten simultaneous registrations on one code value: ten accounts, ten DIFFERENT records, no record spent twice and none left behind',
+    ten.every((r) => r.status === 200 && r.body?.invitationClaimed === true)
+    && tenSpent.length === 10 && tenOwners.size === 10
+    && new Set(tenSpent.map((r) => String(r.id))).size === 10
+    && tenRows.find((r) => Number(r.used) === 0) === undefined,
+    JSON.stringify({ statuses: ten.map((r) => `${r.status}/${r.body?.invitationClaimed ?? r.body?.error}`), spent: tenSpent.length, owners: tenOwners.size, free: tenRows.filter((r) => Number(r.used) === 0).map((r) => r.id) }));
+
+  claimFault = { status: 500, body: { status: 'error', message: 'write refused' } };
+  const partial = await signUp({ email: 'flow-partial@poc.invalid', code: 'FLOW-CLAIMFAIL-1' });
+  claimFault = null;
+  const partialRow = storeRows('FLOW-CLAIMFAIL-1')[0] || null;
+  check('14i. failure AFTER account creation is reported honestly: a session is issued, the claim is said to be unconfirmed, and no success is implied',
+    partial.status === 200 && String(partial.body?.token || '').startsWith('ncbs1')
+    && partial.body?.invitationClaimed === false && partial.body?.invitationClaim === 'claim_write_failed'
+    && Number(partialRow?.used) === 0, JSON.stringify({ status: partial.status, claimed: partial.body?.invitationClaimed, outcome: partial.body?.invitationClaim, row: partialRow }));
+  const retry = await consume(partial.body?.token, 'FLOW-CLAIMFAIL-1');
+  const retriedRow = storeRows('FLOW-CLAIMFAIL-1')[0] || null;
+  check('14j. and the retry through the authorized route recovers it — same account, spent once',
+    retry.status === 200 && retry.body?.success === true && Number(retriedRow?.used) === 1
+    && String(retriedRow?.registered_user_id) === String(partial.body?.data?.user?.id),
+    JSON.stringify({ status: retry.status, body: retry.body, row: retriedRow }));
+  const writesBeforeSecondRetry = nativeLog.filter((e) => e.method === 'PUT' && String(e.path).includes('/user_codes/')).length;
+  const retryAgain = await consume(partial.body?.token, 'FLOW-CLAIMFAIL-1');
+  // The retry after a COMPLETED reservation is a success, not a decline: this account already owns the
+  // record, and telling it otherwise would report a finished registration as a failed code. Nothing is
+  // written a second time — that is the half that makes the answer safe rather than merely friendly.
+  check('14k. a second retry is idempotent and honest: alreadyClaimed, and not one more write attempted',
+    retryAgain.status === 200 && retryAgain.body?.success === true && retryAgain.body?.alreadyClaimed === true
+    && retryAgain.body?.recovered === true
+    && nativeLog.filter((e) => e.method === 'PUT' && String(e.path).includes('/user_codes/')).length === writesBeforeSecondRetry,
+    JSON.stringify(retryAgain.body));
+  const strangerClaimRes = await fetch(`${BASE}/auth/consume-invitation`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', Authorization: `Bearer ${handleA}` },
+    body: JSON.stringify({ code: 'FLOW-USED-1', record_id: 933 })
+  });
+  const strangerClaim = await strangerClaimRes.json().catch(() => ({}));
+  const afterStranger = storeRows('FLOW-USED-1')[0] || null;
+  check('14l. an existing account cannot seize a code that is already somebody else\'s, and cannot address it by id either',
+    strangerClaimRes.status === 200 && strangerClaim.success === false
+    && strangerClaim.reason === 'invitation_not_found'
+    && String(afterStranger?.registered_user_id) === 'user-somebody-else',
+    JSON.stringify({ status: strangerClaimRes.status, body: strangerClaim, row: afterStranger }));
+  const anonymousClaim = await fetch(`${BASE}/auth/consume-invitation`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'FLOW-VALID-1' })
+  });
+  check('14m. the claim route needs a session — an anonymous caller cannot spend a code at all',
+    anonymousClaim.status === 401, `${anonymousClaim.status}`);
+
+  const claimWrites = nativeLog.filter((e) => e.method === 'PUT' && String(e.path).includes('/user_codes/'));
+  const wroteOwnId = claimWrites.every((e) => e.body?.user_id === undefined && String(e.body?.registered_user_id ?? '').length > 0);
+  check('14n. every claim write records registered_user_id and NEVER user_id, the vendor\'s ownership column',
+    claimWrites.length >= 2 && wroteOwnId,
+    JSON.stringify({ count: claimWrites.length, bodies: claimWrites.map((e) => Object.keys(e.body ?? {})) }));
+  const crudClaim = await fetch(`${BASE}/ncb/data/update/user_codes/930`, {
+    method: 'PUT', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', Authorization: `Bearer ${handleA}` },
+    body: JSON.stringify({ used: 1, registered_user_id: 'user-aaaa' })
+  });
+  check('14o. the player CRUD path is still refused — restoring registration did not reopen the table',
+    crudClaim.status === 403, `${crudClaim.status}`);
+
+  // The shipped default, measured on its own mount: the lever on but no atomic store configured.
+  const atomicEnv = { ...process.env, NCB_GATEWAY_ALLOW_SIGN_UP: '1' };
+  delete atomicEnv.INVITATION_CLAIM_MODE;
+  const atomicMount = bridge.buildNcbGateway({ env: atomicEnv });
+  const atomicApp = nodeRequire('express')();
+  atomicApp.use(nodeRequire('express').json());
+  atomicApp.use(atomicMount.router);
+  const atomicServer = atomicApp.listen(0, '127.0.0.1');
+  await new Promise((r) => atomicServer.once('listening', r));
+  const atomicSignUp = await fetch(`http://127.0.0.1:${atomicServer.address().port}/ncb/auth/sign-up/email`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'No Store', email: 'no-store@poc.invalid', password: 'pw-flow-fixture', invitationCode: 'FLOW-VALID-1' })
+  });
+  const atomicBody = await atomicSignUp.json().catch(() => ({}));
+  check('14p. in the shipped atomic-only mode a valid code is not enough: registration answers 503 rather than attempt a non-atomic claim',
+    atomicSignUp.status === 503 && atomicBody?.error === 'invitation_claim_unavailable', `${atomicSignUp.status}/${atomicBody?.error}`);
+  const atomicConsume = await fetch(`${BASE}/auth/consume-invitation`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', Authorization: `Bearer ${handleA}` },
+    body: JSON.stringify({ code: 'FLOW-VALID-1' })
+  });
+  check('14q. and the live mount reports the mode it is honouring, so the choice is visible without reading env',
+    (await (await fetch(`${BASE}/health`)).json())?.ncb?.invitationClaim === 'reservation'
+    && (await (await fetch(`${BASE}/health`)).json())?.ncb?.reservationStoreWired === true
+    && atomicMount.health().invitationClaimWired === false,
+    `live=${JSON.stringify((await (await fetch(`${BASE}/health`)).json())?.ncb)} atomic=${atomicMount.health().invitationClaimWired}`);
+  // The reservation table itself, read from the fake: this is the durable artefact the design claims
+  // to produce, so it is asserted rather than inferred from a 200.
+  const reservationRows = rows.filter((r) => r.table === 'invitation_reservations');
+  // Two legitimate states, and no others. `completed` names the account that spent the record;
+  // `pending` is the residue of an attempt whose account-creation answer never arrived — held on
+  // purpose (arm 14w), never aged out, and releasable only by a human who has looked at the record.
+  // What must NEVER appear is a completed row with no invitee, a row in a state this code does not
+  // write, or a row that carries a credential.
+  check('14u. every reservation is completed-and-named or deliberately-pending, and none carries a credential',
+    reservationRows.length >= 15
+    && reservationRows.every((r) => String(r.code_row_id ?? '').length > 0)
+    && reservationRows.every((r) => (r.status === 'completed' && String(r.invitee_user_id ?? '').length > 0) || r.status === 'pending')
+    && reservationRows.filter((r) => r.status === 'completed').length >= 14
+    // Exactly one pending row may exist at this point, and it must be the record arm 14w proved was
+    // held on purpose. A second one means something released nothing when it should have.
+    && reservationRows.filter((r) => r.status === 'pending').every((r) => String(r.code_row_id) === '936')
+    && !JSON.stringify(reservationRows).includes('fixture-cookie') && !JSON.stringify(reservationRows).includes(COOKIE)
+    && !JSON.stringify(reservationRows).includes(SEAL_KEY) && !JSON.stringify(reservationRows).includes('pw-flow-fixture'),
+    JSON.stringify(reservationRows.map((r) => ({ record: r.code_row_id, status: r.status, invitee: r.invitee_user_id }))).slice(0, 320));
+  // Two concurrent registrations against a TWO-record code: the store must let both through, on
+  // DIFFERENT records — the property a mutex-in-one-process could never deliver across replicas.
+  const race2 = await Promise.all([
+    signUp({ email: 'race2-a@poc.invalid', code: 'FLOW-POOL2' }),
+    signUp({ email: 'race2-b@poc.invalid', code: 'FLOW-POOL2' })
+  ]);
+  // Read from the fake's own rows, not the throttled anonymous route: the window is spent by this
+  // point in the run, and a 404-shaped null would look like "the record was never spent".
+  const pool2Rows = storeRows('FLOW-POOL2');
+  check('14v. a two-record code served by two simultaneous registrations spends two DIFFERENT records and both register',
+    race2.every((r) => r.status === 200 && r.body?.invitationClaimed === true)
+    && pool2Rows.filter((r) => Number(r.used) === 1).length === 2
+    && new Set(pool2Rows.map((r) => String(r.registered_user_id))).size === 2,
+    JSON.stringify({ statuses: race2.map((r) => r.status), rows: pool2Rows.map((r) => `${r.id}:${r.used}:${r.registered_user_id}`) }));
+  void atomicConsume;
+  // The other half of the same fail-closed rule, at the unit the mode switch cannot reach inside this
+  // process: INVITATION_CLAIM_MODE is read once at module load, so a second relay would need a child
+  // process. What can be measured here is that the shipped module refuses when no privileged writer
+  // was handed to it — which is precisely what the atomic-only mode relies on.
+  const writerless = bridge.createInvitationClaim({ readRows: async () => ({ ok: true, rows: [] }) });
+  const refusedWriterless = await writerless.begin({ code: 'FLOW-OUTAGE-1', email: 'nobody@example.test' });
+  check('14s. a claim with no reservation store refuses outright instead of half-claiming',
+    refusedWriterless.ok === false && refusedWriterless.outcome === 'claim_unavailable',
+    JSON.stringify({ claim: refusedWriterless.outcome }));
+  await new Promise((r) => atomicServer.close(r));
+
+  const signInStill = await fetch(`${BASE}/ncb/auth/sign-in/email`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'player-a@poc.invalid', password: 'pw-a-fixture' })
+  });
+  const refreshedStill = await fetch(`${BASE}/ncb/auth/get-session`, { headers: { Origin: PROD_ORIGINS[0], Authorization: `Bearer ${handleA}` } });
+  const leakables14 = [COOKIE, 'club-fixture-password', 'pw-flow-fixture', 'pw-a-fixture', SEAL_KEY, SECRET_MARKER];
+  const leaked14 = leakables14.filter((s) => JSON.stringify([fresh.body, spent.body, partial.body, retry.body, atomicBody]).includes(s));
+  check('14r. existing-account sign-in and session refresh are untouched, and no credential appears in any registration response',
+    signInStill.status === 200 && refreshedStill.status === 200 && leaked14.length === 0,
+    `sign-in=${signInStill.status} get-session=${refreshedStill.status} leaked=${leaked14.join(',')}`);
 }
 
 await new Promise((r) => relay.close(r));

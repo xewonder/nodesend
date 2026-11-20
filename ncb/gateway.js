@@ -36,6 +36,10 @@ a client throw away a working login, so an upstream problem answered as 401 logs
 const { Router } = require('express');
 const { createNcbNativeClient, AUTH_VERBS } = require('./nativeClient.js');
 const { createSessionSeal, PREFIX } = require('./sessionSeal.js');
+// The ONE invitation-code rule, shared with the relay's own routes and the claim module. Imported
+// rather than restated: three separate validators in one deployment is what made code `777` read as
+// `valid:true` on one route and `400 bad_code` on the route the browser calls.
+const { normalizeInvitationCode } = require('./invitationCode.js');
 
 const AUTH_ROUTES = [
   { path: '/ncb/auth/sign-in/email', verb: 'sign-in/email', method: 'post', mints: true },
@@ -70,7 +74,11 @@ const AUTHORITY_TABLES = ['system_admins', 'clubs', 'club_memberships',
 // rather than left to a deployment variable that could be set wrongly.
 const SERVER_ONLY_TABLES = [
   'ai_quota_usage', 'ai_quota_config', 'ai_quota_user_override', 'ai_quota_reservation',
-  'ai_provider_credentials_1770000000'
+  'ai_provider_credentials_1770000000',
+  // The reservation table is the arbitration itself. If a signed-in account could insert into it, the
+  // account could hold every record of a code it never redeemed and starve the pool — the exact
+  // failure the reservation is meant to prevent, reachable through the route meant to be broad.
+  'invitation_reservations'
 ];
 // ── WRITE POLICY: which verbs a player may exercise on an allowed table ──────
 // An allow-list that answers "yes, this table" and then forwards read/create/update/delete alike is a
@@ -174,6 +182,35 @@ function authUpstreamStatus(httpStatus) {
   if (status === 403) return { status: 502, error: 'upstream_forbidden' };
   return { status: 502, error: 'upstream_rejected' };
 }
+
+/**
+ * Did the vendor DECIDE, or did we simply stop hearing it?
+ *
+ * This is the question a released reservation turns on, and getting it wrong spends an invitation on
+ * nobody or on the wrong person. A transport failure (`httpStatus 0` — a timeout, an aborted request,
+ * a socket closed mid-flight) and any 5xx mean the request reached a server that was still working on
+ * it: the account may exist at NCB right now, with nothing on this side able to say either way. A 4xx
+ * is different in kind — the vendor read the whole request and refused it, so no account was created
+ * and the record it was holding is genuinely free again.
+ *
+ * Releasing after an ambiguous answer is the bug this predicate exists to prevent: the held record
+ * would go to a SECOND registrant while the first one's account quietly exists, which is exactly the
+ * "one invitation, two accounts" outcome the reservation was built to make impossible. So the
+ * ambiguous branch holds the reservation and recovery finishes it for whichever account authenticates
+ * with that address; only the decided branch gives the record back to the pool.
+ *
+ * The status is the whole authority, because `0` is already what the transport reports when it heard
+ * nothing back. Reading the transport KIND instead would be wrong in both directions: a 422 is
+ * better-auth's ordinary "user already exists", which the vendor decided and which must free the
+ * record, yet it classifies as `unexpected` and would otherwise be held — stranding one invitation per
+ * mistyped email until a small pool was empty.
+ */
+function signUpOutcomeIsAmbiguous(httpStatus) {
+  const status = Number(httpStatus) || 0;
+  if (status === 0) return true;                       // timeout, abort, reset: nothing was heard
+  if (status === 408 || status === 502 || status === 503 || status === 504) return true;
+  return status >= 500;                                // any other server fault may have created it
+}
 // Tighter than sign-in on purpose: this endpoint is anonymous, answers before any credential exists,
 // and is an existence oracle over invitation codes. The route it replaces (`/auth/validate-invitation`)
 // is limited the same way, so this is the same posture rather than a new one.
@@ -259,7 +296,7 @@ function createCorsResolver({ env = process.env, exposedHeaders = null } = {}) {
   };
 }
 
-function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, guestRead = null } = {}) {
+function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, guestRead = null, invitationClaim = null } = {}) {
   const seal = createSessionSeal({ env });
   const ncb = createNcbNativeClient({ env, fetchImpl, timeoutMs: Number(env.NODESEND_NCB_TIMEOUT_MS || 8000) });
   const allowedOrigins = parseAllowList(env);
@@ -332,6 +369,77 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     next();
   });
 
+  // A valid, unused invitation is a SERVER-side precondition on account creation, and this runs
+  // before the auth handler so the check cannot be reordered behind an upstream call. The rule it
+  // replaces is the one the removal of the Lambda exposed: Login.jsx validates the code in the
+  // browser, so a caller that skips the UI never had to present one at all — a client-side check is
+  // not an authorization. See ncb/invitationClaim.js for what a claim can and cannot guarantee.
+  // Mounted as MIDDLEWARE on the path rather than as a second route, for a reason an operator can
+  // check: `routes` in /health is the published count of endpoints this gateway offers, and this is
+  // not a new endpoint — it is a precondition on the one below. A `router.post` here would silently
+  // make the mount say 15 while advertising 14.
+  router.use('/ncb/auth/sign-up/email', async (req, res, next) => {
+    if (req.method !== 'POST') return next();               // the verb route answers everything else
+    if (!signUpAllowed) return next();                 // the refusal below answers, unchanged
+    const requestId = res.get('X-Request-Id') || null;
+    // Registration is only allowed when there is a privileged channel that can record the claim AND a
+    // database that can arbitrate it. Turning the lever on without either is the "open and broken"
+    // state this route exists to end: an account gets created and nothing links it to a code.
+    if (!invitationClaim) {
+      event('ncb_gateway_registration_unclaimed', { requestId });
+      return reply(res, 503, {
+        status: 'error', data: null, error: 'invitation_claim_unavailable',
+        detail: 'registration cannot be enabled until the server-side invitation claim is wired'
+      });
+    }
+    // The code and the address are read here and then removed from the body: neither is a vendor
+    // field, and leaving them in place would make every legitimate registration look like a
+    // dropped-field anomaly in the log. `email` is needed because the reservation is bound to the
+    // address being registered — not as proof of anything, but as the record of what was held.
+    const code = invitationClaim.normalize(req.body?.invitationCode);
+    const email = String(req.body?.email ?? '').trim();
+    delete req.body.invitationCode;
+    if (!code) {
+      event('ncb_gateway_registration_without_invitation', { requestId });
+      return reply(res, 403, { status: 'error', data: null, error: 'invitation_required' });
+    }
+    const begun = await invitationClaim.begin({ code, email });
+    if (!begun.ok) {
+      const status = begun.outcome === 'invitation_exhausted' || begun.outcome === 'already_claimed' ? 409
+        : begun.outcome === 'code_not_found' || begun.outcome === 'code_required' ? 403
+          : 503;   // store unavailable / read failed / claim unavailable are deployment faults, never the caller's
+      event('ncb_gateway_registration_invitation_refused', { outcome: begun.outcome, status, requestId });
+      return reply(res, status, { status: 'error', data: null, error: begun.outcome, detail: begun.reason || null });
+    }
+    req.invitationReservation = begun;
+    // The release rule, stated because the alternative strands records: a reservation taken for a
+    // request that NEVER CREATED AN ACCOUNT is given back, so a wrong password or an upstream outage
+    // cannot empty a ten-record pool one failed attempt at a time. A reservation that outlived an
+    // account creation is NEVER released here — that is the case recovery exists for, and dropping it
+    // would hand a spent-but-unlinked record to the next caller. Nothing in this hook looks at age.
+    //
+    // The third case is the one that costs a record either way, and it is decided by evidence rather
+    // than by optimism: when the vendor's answer never arrived (`invitationAccountOutcomeUnknown`) we
+    // cannot prove no account was created, so the reservation is HELD. Releasing it would put this
+    // record back in play for a second registrant while the first one's account may already exist at
+    // NCB — the exact double-assignment the reservation exists to prevent. The stranded record is the
+    // lesser fault and it is recoverable: the account that authenticates with this address finishes it
+    // through the authorized recovery route, and an operator marks it `abandoned` if that never comes.
+    res.on('finish', () => {
+      const held = req.invitationReservation;
+      if (!held || held.settled || req.invitationAccountCreated) return;
+      if (req.invitationAccountOutcomeUnknown) {
+        held.settled = 'held_for_ambiguous_outcome';
+        event('invitation_reservation_held_ambiguous_outcome', { recordId: held.recordId, requestId });
+        return;
+      }
+      Promise.resolve(invitationClaim.release(held))
+        .then((done) => { if (done && done.ok !== true) event('invitation_release_unconfirmed', { recordId: held.recordId, reason: done.reason }); })
+        .catch(() => event('invitation_release_failed', { recordId: held.recordId }));
+    });
+    return next();
+  });
+
   for (const route of AUTH_ROUTES) {
     router[route.method](route.path, async (req, res) => {
       const requestId = res.get('X-Request-Id') || null;
@@ -397,7 +505,16 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       if (authCall.kind === 'unreachable' || authCall.kind === 'upstream_error') {
         // Never 401. This is the branch the outage turned on.
         event('ncb_gateway_upstream_unavailable', { verb: route.verb, kind: authCall.kind, requestId });
-        return reply(res, 503, { status: 'error', data: null, error: 'auth_service_unavailable' });
+        const held = route.verb === 'sign-up/email' && signUpOutcomeIsAmbiguous(authCall.httpStatus);
+        if (held) req.invitationAccountOutcomeUnknown = true;
+        return reply(res, 503, {
+          status: 'error', data: null, error: 'auth_service_unavailable',
+          // Said to the client because the alternative is worse than it looks: a browser that treats a
+          // timeout as a plain failure retries with ANOTHER code, and each retry quietly takes a
+          // record out of the pool. This says the attempt is unfinished against THIS code and that the
+          // authorized recovery route is what settles it.
+          ...(held ? { invitationHeldForRecovery: true } : {})
+        });
       }
       if (authCall.kind === 'secret_key_rejected') {
         event('ncb_gateway_secret_rejected', { verb: route.verb, requestId });
@@ -424,14 +541,26 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         event('ncb_gateway_rejected', {
           verb: route.verb, status: authCall.httpStatus, mapped: mapped.status, code: safeCode, requestId
         });
+        // A 408 lands here rather than in the outage branch above (the transport classifies it as an
+        // unrecognised answer), and it belongs to the ambiguous half: the vendor had the request and
+        // ran out of time, which is not the same as having refused it. Every other status that reaches
+        // this line is a 4xx decision — bad credentials, duplicate email, a policy refusal — where no
+        // account exists and the record genuinely goes back in the pool.
+        const held = route.verb === 'sign-up/email' && signUpOutcomeIsAmbiguous(authCall.httpStatus);
+        if (held) req.invitationAccountOutcomeUnknown = true;
         return reply(res, mapped.status, {
           status: 'error', data: null, error: mapped.error, code: safeCode,
-          upstream_status: authCall.httpStatus, httpStatus: mapped.status
+          upstream_status: authCall.httpStatus, httpStatus: mapped.status,
+          ...(held ? { invitationHeldForRecovery: true } : {})
         });
       }
 
       const upstreamBody = authCall.json ?? {};
       const user = upstreamBody?.user ?? upstreamBody?.data?.user ?? null;
+      // From this line on, an account exists at the vendor. Whatever happens next — a refused claim,
+      // a missing cookie, a body this route cannot turn into a session — the reservation must survive,
+      // because releasing it would put a record behind an account that was already created.
+      if (route.verb === 'sign-up/email' && user?.id) req.invitationAccountCreated = true;
 
       if (route.renews && !user?.id) {
         // The authority answered, and answered "nobody". That is an invalid session — the opposite
@@ -446,6 +575,27 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       }
 
       if (route.mints && user?.id && authCall.cookiePair) {
+        // THE CLAIM, recorded by NodeSend with the identity the vendor just returned — not one the
+        // caller named. It happens only on the path that hands out a session: if the upstream gave no
+        // cookie there is no account this relay can sign anyone into, so the code stays unused rather
+        // than being spent on an account nobody can reach. A failed or unconfirmed claim is reported
+        // in the body and never turned into a silent success; the client keeps its retry, and the
+        // retry goes through the same authorized route rather than a CRUD write.
+        let claimed = null;
+        if (route.verb === 'sign-up/email' && req.invitationReservation) {
+          const held = req.invitationReservation;
+          const outcome = await invitationClaim.finish({
+            code: held.code, recordId: held.recordId, reservationId: held.reservationId,
+            userId: String(user.id), emailHash: held.emailHash
+          });
+          // `settled` means the reservation has been driven to a conclusion by this request, either
+          // way: the finish hook must not release what is now either spent or awaiting recovery.
+          if (held.settled !== 'released') held.settled = outcome.ok ? 'claimed' : 'held_for_recovery';
+          claimed = { invitationClaimed: outcome.ok === true, invitationClaim: outcome.outcome };
+          if (outcome.outcome === 'claim_conflict') {
+            event('ncb_gateway_registration_conflict', { recordId: held.recordId, requestId });
+          }
+        }
         const token = seal.seal({
           cookie: authCall.cookiePair, userId: String(user.id), instance: ncb.instance,
           email: String(user.email || '')
@@ -453,7 +603,10 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         // `token` at the top level is what src/api.js reads (api.js:131-137). Its own NCB body token,
         // if there is one, is deliberately NOT forwarded: it is not a session channel (measured), and
         // two plausible-looking tokens in one response is how a future reader re-introduces the bug.
-        return reply(res, 200, { status: 'success', data: { user, session: upstreamBody?.session ?? upstreamBody?.data?.session ?? null }, token });
+        return reply(res, 200, {
+          status: 'success', data: { user, session: upstreamBody?.session ?? upstreamBody?.data?.session ?? null }, token,
+          ...(claimed || {})
+        });
       }
 
       if (route.renews && user?.id) {
@@ -622,13 +775,22 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       event('ncb_gateway_public_unfiltered_refused', { table });
       return reply(res, 400, { status: 'error', data: null, error: 'filter_required' });
     }
-    if (code && !/^[A-Za-z0-9-]{4,64}$/.test(code)) return reply(res, 400, { status: 'error', data: null, error: 'bad_code' });
+    // ONE validator, shared with the relay's own invitation routes (ncb/invitationCode.js). The rule
+    // this replaces demanded 4-64 characters from [A-Za-z0-9-], which rejected the owner's reserved
+    // test code `777` with 400 bad_code while POST /auth/validate-invitation accepted the same string
+    // as valid — one field with two opinions, and the browser always met the strict one.
+    const normalizedCode = normalizeInvitationCode(code);
+    if (code && !normalizedCode) return reply(res, 400, { status: 'error', data: null, error: 'bad_code' });
+    // A trimmed code is what the rest of this route filters on; `code` itself stays the caller's
+    // string, because it is a const in this handler and rewriting it would be the kind of mutation
+    // that hides a mismatch between what was asked and what was answered.
+    const filterCode = normalizedCode || code;
     if (id && !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return reply(res, 400, { status: 'error', data: null, error: 'bad_row_id' });
     if (typeof guestRead !== 'function') {
       event('ncb_gateway_public_reader_absent', { table });
       return reply(res, 503, { status: 'error', data: null, error: 'invitation_lookup_unavailable' });
     }
-    const filter = code ? { code } : { id };
+    const filter = filterCode ? { code: filterCode } : { id };
     const read = await guestRead({ table, ...filter });
     if (!read || read.ok !== true) {
       event('ncb_gateway_public_read_failed', { table, reason: read?.reason || 'guest_read_failed' });
@@ -658,6 +820,9 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       // Whether a visitor can create an account through this process at all. A release-readiness
       // question, so it belongs in the health report rather than in an operator's memory.
       signUpAllowed,
+      // Whether enabling registration would actually be safe: with the lever on and no privileged
+      // claim channel, this route refuses rather than creating unlinkable accounts.
+      invitationClaimWired: Boolean(invitationClaim),
       sessionState: 'stateless_sealed_handle',
       restartSafe: true,
       upstreamCookieExposedToClient: false,
@@ -675,4 +840,4 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
   };
 }
 
-module.exports = { buildNcbGateway, createCorsResolver, authUpstreamStatus, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY };
+module.exports = { buildNcbGateway, createCorsResolver, authUpstreamStatus, signUpOutcomeIsAmbiguous, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY };
