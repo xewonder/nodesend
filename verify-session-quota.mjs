@@ -69,12 +69,22 @@ const LEAK_STRINGS = [...Object.keys(USERS), PROVIDER_SECRET, 'PRIVATE KEY', 'se
 const STORAGE_STRINGS = ['ai_quota_config', 'ai_quota_user_override', 'ai_quota_usage', 'ai_quota_reservation'];
 
 // ── the quota store: a real loopback NCB proxy mock ────────────────────────
+/* The identity surface is a property of the PROCESS, not of one scenario. `ncb.requests` is cleared by
+   every `seed()` so each scenario can measure its own calls, which makes it the wrong instrument for a
+   boundary claim: "the club bearer never reached a quota table" evaluated against a reset window would
+   stay green while the earlier sections did exactly that. These two arrays are append-only for the
+   whole run and are what the final boundary arms read. */
+const runCensus = { requests: [], providerRequests: [] };
 const ncb = {
   requests: [],
   // `user_settings` is the AUTHORITATIVE ai_source table the relay now reads. It is in
   // this registry so a read for it is served like any other and, crucially, so a
   // missing-table bug would surface as a 404 rather than as a silent free pass.
-  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [], user_codes: [], ai_provider_credentials_1770000000: [], invitation_reservations: [] },
+  // Registered EMPTY, exactly as a deployment that never configured System AI looks: the tables exist
+  // and hold no rows. Omitting them made an unconfigured deployment read as a STORAGE FAILURE, and the
+  // USE path is right to refuse that loudly — which is how 96 arms went red for a reason belonging to
+  // the fixture rather than the product.
+  rows: { ai_quota_config: [], ai_quota_user_override: [], ai_quota_usage: [], ai_quota_reservation: [], user_settings: [], user_codes: [], ai_provider_credentials_1770000000: [], invitation_reservations: [], system_ai_config: [], system_ai_credentials: [] },
   nextId: {
     ai_quota_config: 1, ai_quota_user_override: 1, ai_quota_usage: 1, ai_quota_reservation: 1,
     user_settings: 1, user_codes: 1, ai_provider_credentials_1770000000: 1, invitation_reservations: 1
@@ -102,7 +112,9 @@ const ncbServer = http.createServer((req, res) => {
     const rowId = pathname.split('/')[4] || null;
     let body = null;
     try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
-    ncb.requests.push({ method: req.method, pathname, table, rowId, query, raw, body, auth, contentType: req.headers['content-type'] || null });
+    const record = { method: req.method, pathname, table, rowId, query, raw, body, auth, contentType: req.headers['content-type'] || null };
+    ncb.requests.push(record);
+    runCensus.requests.push(record);
     const send = (status, payload, type = 'application/json') => {
       res.writeHead(status, { 'content-type': type });
       res.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
@@ -171,6 +183,14 @@ const ncbServer = http.createServer((req, res) => {
         ncb.hideReservationReads -= 1;
         return ok([]);
       }
+      /* A storage-permission denial, modelled apart from every nearby "no rows" answer. It is armed
+         per table rather than by `ncb.fault` because the USE section holds a fault-free store while it
+         reads keys: the four states a resolver must tell apart are ABSENT TABLE (404 unknown table,
+         above), EMPTY TABLE (200 with no rows), DENIED (403, here) and VALID ROWS (200 with rows).
+         It sits BEFORE the primary-key branch: the System AI credential is read by PK, so an arm that
+         armed a denial the read path never reaches would "prove" fail-closed behaviour by measuring a
+         successful read instead. */
+      if (table === 'system_ai_credentials' && ncb.denyCredentialReads) return fail(403, 'forbidden by policy');
       /* A read addressed by primary key in the path is a DIFFERENT call from a filtered list read, and
          NCB answers it differently: `data` is ONE OBJECT, not an array (measured live, and pinned by
          the integration gate's arm 2c). Falling through to the list filter here made every by-key read
@@ -296,6 +316,7 @@ const seed = () => {
   ncb.fault = null;
   ncb.faultHits = {};
   ncb.hideReservationReads = 0;
+  ncb.denyCredentialReads = false;
   ncb.requests.length = 0;
   ncb.counts = {};
   events.length = 0;
@@ -334,6 +355,41 @@ const setUsage = (userId, callsUsed, appliedLimit = DEFAULT_LIMIT) => {
 const claim = (userId, decisionKey) => ncb.rows.ai_quota_reservation.find((r) => String(r.user_id) === String(userId) && r.decision_key === decisionKey);
 const dataCalls = () => ncb.requests.filter((q) => q.pathname.startsWith('/data/'));
 
+/* WHICH IDENTITY MAY ADDRESS WHICH TABLE — the identity surface declared in one place.
+   `club` is the privileged club service account the relay holds and no browser ever sees; a `caller`
+   policy means the authenticated session bearer of whoever made the request. Three policies, because
+   the tables are not equally guarded:
+     • `club-only` — `system_ai_config`, `system_ai_credentials`. Server-side System AI resolution and
+       the admin routes address them, and NOTHING else may: the player gateway refuses both tables
+       outright (`ncb/gateway.js`), so no session-bearer path to them exists to be violated.
+     • `club-allowed` — `invitation_reservations`, `user_codes`. The reservation-first invitation claim
+       arbitrates as the service account, while the shipped atomic-only mode writes them with the
+       caller's own bearer. Both are correct, so a session bearer here is not a leak.
+     • `caller` — every other table in this registry: the quota ledger, the caller's own
+       `user_settings`, and the personal provider credentials, which belong to their owner.
+   A table MISSING from this map is graded `caller`, so a new table cannot acquire a privileged bearer
+   by not being written down. */
+const CLUB_BEARER = 'Bearer tok-club';
+const TABLE_AUTHORITY = {
+  system_ai_config: 'club-only',
+  system_ai_credentials: 'club-only',
+  invitation_reservations: 'club-allowed',
+  user_codes: 'club-allowed',
+  ai_quota_config: 'caller',
+  ai_quota_user_override: 'caller',
+  ai_quota_usage: 'caller',
+  ai_quota_reservation: 'caller',
+  user_settings: 'caller',
+  ai_provider_credentials_1770000000: 'caller'
+};
+const tablePolicy = (name) => TABLE_AUTHORITY[name] ?? 'caller';
+// Both directions of the boundary in one measurement: a club-only table never sees a session bearer,
+// and the club bearer never reaches a table that does not declare it.
+const privilegedViolations = (calls) => calls.filter((q) =>
+  tablePolicy(q.table) === 'club-only'
+    ? q.auth !== CLUB_BEARER
+    : q.auth === CLUB_BEARER && tablePolicy(q.table) !== 'club-allowed');
+
 // ── mocked provider, and a refusal of anything else that is not loopback ────
 const realFetch = globalThis.fetch;
 global.fetch = async (url, opts = {}) => {
@@ -348,7 +404,9 @@ global.fetch = async (url, opts = {}) => {
     const providerAuth = String(headers.Authorization || headers.authorization || '');
     let sentBody = null;
     try { sentBody = JSON.parse(opts.body); } catch { sentBody = opts.body; }
-    world.providerRequests.push({ url: u, auth: providerAuth, body: sentBody, raw: String(opts.body || ''), headers });
+    const providerRecord = { url: u, auth: providerAuth, body: sentBody, raw: String(opts.body || ''), headers };
+    world.providerRequests.push(providerRecord);
+    runCensus.providerRequests.push(providerRecord);
     return new Response(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: 'P7N' } }],
       usage: { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
@@ -530,9 +588,19 @@ r = await fetch(`${B}/ai/chat`, CHAT('tok-a', { user_id: 999, userId: 999, perio
 check('T-identity a body user_id never reaches the store',
   r.status === 200 && ncb.requests.slice(beforeSpoof).every((q) => !/999|1999-01|someone@example/.test(q.pathname + q.raw + JSON.stringify(q.query))),
   ncb.requests.slice(beforeSpoof).map((q) => q.pathname).join(' | '));
-check('T-identity identity travels only as the caller bearer',
-  dataCalls().every((q) => q.auth === 'Bearer tok-a') && dataCalls().length > 0,
-  [...new Set(dataCalls().map((q) => q.auth))].join(','));
+/* Re-scoped, not weakened, when System AI USE started resolving keys server-side: the caller's own
+   operations still travel exclusively as the caller bearer — that clause is unchanged and still the
+   first half of the conjunction — and the ONLY exception is the privileged club identity, which is
+   now permitted by table policy rather than by anywhere it likes. Both halves are measured: no
+   session bearer may address a club-only table, and the club bearer may appear nowhere but a table
+   that declares it. The census is per-table in the detail so a red names the table it found. */
+check('T-identity identity travels only as the caller bearer, except the club service account on the tables that declare it',
+  dataCalls().length > 0
+  && dataCalls().every((q) => tablePolicy(q.table) === 'caller' ? q.auth === 'Bearer tok-a' : true)
+  && privilegedViolations(dataCalls()).length === 0
+  && dataCalls().every((q) => q.auth === 'Bearer tok-a' || q.auth === CLUB_BEARER),
+  `${[...new Set(dataCalls().map((q) => `${q.table}→${q.auth || '-'}`))].join(',')} `
+  + `| violations=${privilegedViolations(dataCalls()).map((q) => `${q.table}→${q.auth}`).join(',') || 'none'}`);
 check('no request ever names a user_id in a body to the store',
   !dataCalls().some((q) => q.method === 'POST' && q.pathname.startsWith('/data/create/') && /999/.test(JSON.stringify(q.body))), '');
 
@@ -1733,9 +1801,31 @@ const createInvitationClaim = mod.createInvitationClaim || mod.default?.createIn
   // And the ordering rule at the route level: the lowest eligible id is the one the relay points at,
   // asserted through what the pool looks like afterwards rather than through a returned id, because
   // this route deliberately returns a boolean and nothing else.
+  /* Repaired 2026-11-21, and the reason is worth keeping in the file. The old form searched the
+     serialised body for the substring "69" (the lowest unused record id in the pool above). This route
+     legitimately answers with a `requestId`, which is a UUID, and a UUID contains "69" often enough
+     that the arm was a coin toss: it went red on this run for a value it has no opinion about, having
+     passed by luck on every run before. A disclosure control that fails at random trains the reader to
+     re-run it, so it is structural now, and strictly stronger: exactly the three fields the route may
+     answer with, no field whose name is an identifier, and none of the pool's private values present
+     anywhere — compared as values, never as a fragment of an unrelated token. Nothing the old form
+     forbade is allowed by the new one; the body simply cannot grow one quietly. */
+  const jKeys = Object.keys(j ?? {}).sort().join(',');
+  /* Not `/id$/i`: that matches `valid`, and the first version of this repaired arm promptly red on the
+     one field this route is required to return. Identifier names are matched as whole segments, and the
+     predicate is checked both ways — it fires on `id`, `record_id`, `recordId`, `row_id`, `user_id`,
+     `userId`, `codeRowId`, `count`, `remaining`, `secret_key`, `total_count`, and stays silent on
+     `valid`, `success`, `requestId`, `status`, `error`, `messageKey`, `code`, `fields`,
+     `alreadyClaimed`, `quota_enabled`. */
+  const isIdentifierField = (k) => k !== 'requestId'
+    && (/(?:^|_)id$/.test(k) || /Id$/.test(k) || /(?:^|_)(?:count|secret_key|remaining)$/i.test(k));
+  const jIdFields = Object.keys(j ?? {}).filter(isIdentifierField);
+  const jLeakedValues = [CODE_SECRET, String(CODE_ROW_USER), 'spent-by-8']
+    .filter((value) => Object.values(j ?? {}).some((field) => String(field).includes(value)));
   check('I-12g validation leaks no record id, no remaining count and no secret column for a multi-record code',
-    JSON.stringify(j).includes('"valid"') && !JSON.stringify(j).includes('69')
-    && !JSON.stringify(j).includes(CODE_SECRET) && !JSON.stringify(j).includes(CODE_ROW_USER), JSON.stringify(j));
+    r.status === 200 && j.success === true && j.valid === true
+    && jKeys === 'requestId,success,valid' && jIdFields.length === 0 && jLeakedValues.length === 0,
+    JSON.stringify({ jKeys, jIdFields, jLeakedValues }));
 
   const writerless = createInvitationClaim({ readRows: async () => ({ ok: true, rows: [{ id: 5, code: 'INV-FRESH', used: 0, registered_user_id: null }] }) });
   const refusedBegin = await writerless.begin({ code: 'INV-FRESH', email: 'a@example.com' });
@@ -1907,10 +1997,18 @@ const dup = await CHAT_WITH('tok-a', { baseUrl, encryptedApiKey: A_SECRET }, 'cr
 check('C-17 quota and idempotency are unchanged on the new path (one decision, one charge)',
   r.status === 200 && dup.status === 200
   && (usageRow('101')?.calls_used ?? 0) === before + 2, `used=${usageRow('101')?.calls_used}`);
-// B was deliberately NOT migrated. Assert the consequence rather than the intention: no route
-// here reads the system credential table, so nothing in this change pretends to server-only.
-check('C-18 no route in this relay reads or writes system_ai_credentials (B deferred, not half-done)',
-  !/system_ai_credentials/.test(bridgeSrcTextForCredCheck())
+/* C-18 was written while B was deliberately NOT migrated, and its job was to stop this relay from
+   pretending otherwise. B is now being built, so a source-text ban on the table name would forbid the
+   fix itself. What stays pinned is the invariant the ban was standing in for: the player-facing
+   gateway never reaches that table, and nothing in THIS suite touched it. Positive coverage for the
+   privileged path lives in verify-system-ai-credentials.mjs, where it can be asserted rather than
+   merely not-forbidden.
+   Dynamic import, not require(): this file is ESM with top-level await, and Node 24 refuses a module
+   that mixes the two formats rather than picking one. */
+const gatewayUnderTest = await import('./ncb/gateway.js');
+const GATEWAY_NEVER_TABLES = gatewayUnderTest.default?.NEVER_THROUGH_THE_GATEWAY ?? gatewayUnderTest.NEVER_THROUGH_THE_GATEWAY;
+check('C-18 the credential table stays off the player gateway, and no request here touches it (B migrated, not silently widened)',
+  Array.isArray(GATEWAY_NEVER_TABLES) && GATEWAY_NEVER_TABLES.includes('system_ai_credentials')
   && !ncb.requests.some((q) => String(q.pathname || '').includes('system_ai_credentials')),
   `${ncb.requests.filter((q) => String(q.pathname || '').includes('system_ai_credentials')).length} touches`);
 // ── 6 of the next spec: no nested-ciphertext grace, because this key size cannot produce one ─
@@ -2404,11 +2502,512 @@ check('P-boot a process-only boot warns about the restart window',
   && /restart can charge the same/i.test(bootProcessOnly.stderr), bootProcessOnly.stderr.slice(0, 200));
 
 console.log = realLog;
+/* The tally moved BELOW the System AI section on purpose: arms registered after the loop would be
+   silently excluded from the printed pass/fail count, which is the one way a gate can look green
+   while never having run. `failed` and the RESULTS line are computed immediately after that section. */
+/* ── SYSTEM AI ROUTES — authorization, disclosure and partial save, over real HTTP ──────────────
+ * Everything above this section pins what the relay did BEFORE this feature. These arms are the
+ * first EXECUTED evidence about the four System AI routes: the routes are booted, requested with
+ * each identity, and their responses and storage effects are read back. The earlier
+ * verify-system-ai-credentials.mjs arms are [EXEC] at module level and [SRC] for wiring; wiring is
+ * exactly what those arms could not prove, and what these do.
+ *
+ * The two tables are seeded HERE rather than in the registry above, so no earlier arm changes
+ * behaviour because this feature exists: nothing before this line ever read them.
+ */
+{
+  const STORED_SECRET = 'system-stored-provider-key';
+  const BROWSER_SECRET = 'system-browser-supplied-key';
+  ncb.rows.system_ai_config = [{
+    id: '1', usage_scope: 'gameplay', enabled: 1, provider: 'alibaba', model: 'qwen3.8-flash',
+    // The gate's own allowed base URL, so the provider mock serves this call exactly like the chat
+    // arms above it. A hard-coded host would test the allow-list instead of the feature.
+    endpoint: baseUrl, credential_id: '19',
+    parameter_overrides: JSON.stringify({ decisionEngine: 'trickster', temperature: 0.4 })
+  }];
+  ncb.rows.system_ai_credentials = [{
+    id: '19', provider: 'alibaba', endpoint: '', user_id: 'club-svc-1',
+    // enc(), the gate's RSA-OAEP helper — not KEY(), which builds the decision-key HEADER. Using the
+    // wrong one seeded an object where ciphertext belonged, and the relay correctly refused to
+    // decrypt it: the 503 was the product being right and the instrument being wrong.
+    encrypted_api_key: enc(STORED_SECRET)
+  }];
+
+  const SYS = async (route, { tok = '', method = 'GET', body } = {}) => {
+    const at = ncb.requests.length;
+    const probes = world.providerCalls;
+    const res = await fetch(`${B}${route}`, {
+      method,
+      headers: { 'content-type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    });
+    const payload = await res.json().catch(() => null);
+    const window = ncb.requests.slice(at);
+    // The census is DATA calls only. Every authenticated route first resolves its session, and
+    // counting that as storage made five arms assert a number that was one too high for a reason
+    // that had nothing to do with what they were measuring.
+    return {
+      status: res.status, body: payload,
+      dataCalls: window.filter((q) => String(q.pathname).startsWith('/data/')).length,
+      dataTables: window.filter((q) => String(q.pathname).startsWith('/data/')).map((q) => q.table),
+      providerCalls: world.providerCalls - probes
+    };
+  };
+
+  // 1. Anonymous. Every route refuses before touching storage or a provider, and the refusal is the
+  // session answer, not a permission answer — a 403 here would mean the guard ran on an identity
+  // that was never established.
+  const anonAdmin = [];
+  anonAdmin.push(await SYS('/ai/system-config', { method: 'GET' }));
+  anonAdmin.push(await SYS('/ai/system-config', { method: 'PUT', body: { usage: 'gameplay', model: 'x' } }));
+  anonAdmin.push(await SYS('/ai/system-credentials/test', { method: 'POST', body: { usage: 'gameplay' } }));
+  const anonStatus = await SYS('/ai/system-status');
+  check('SA-1 anonymous GET/PUT/POST on the admin System AI routes answer 401 with zero storage calls',
+    anonAdmin.every((r) => r.status === 401 && r.dataCalls === 0 && r.providerCalls === 0),
+    anonAdmin.map((r) => `${r.status}/${r.dataCalls}`).join(' '));
+  check('SA-2 anonymous GET /ai/system-status answers 401 with zero storage calls',
+    anonStatus.status === 401 && anonStatus.dataCalls === 0, `${anonStatus.status}/${anonStatus.dataCalls}`);
+
+  // 2. Authenticated non-admin on the admin routes.
+  const playerAdmin = [];
+  playerAdmin.push(await SYS('/ai/system-config', { tok: 'tok-a' }));
+  playerAdmin.push(await SYS('/ai/system-config', { tok: 'tok-a', method: 'PUT', body: { usage: 'gameplay', model: 'x' } }));
+  playerAdmin.push(await SYS('/ai/system-credentials/test', { tok: 'tok-a', method: 'POST', body: { usage: 'gameplay' } }));
+  check('SA-3 an ordinary player is refused 403 on all three admin routes, BEFORE any storage read',
+    playerAdmin.every((r) => r.status === 403 && r.dataCalls === 0 && r.providerCalls === 0),
+    playerAdmin.map((r) => `${r.status}/${r.dataCalls}`).join(' '));
+
+  // 3. Authorized admin reaches its handler.
+  const adminConfig = await SYS('/ai/system-config', { tok: 'tok-admin' });
+  const adminTest = await SYS('/ai/system-credentials/test', { tok: 'tok-admin', method: 'POST', body: { usage: 'gameplay' } });
+  check('SA-4 an administrator reaches the admin routes (not 401/403) and gets a request id back',
+    adminConfig.status !== 401 && adminConfig.status !== 403 && typeof adminConfig.body?.requestId === 'string'
+    && adminTest.status !== 401 && adminTest.status !== 403,
+    `config=${adminConfig.status} test=${adminTest.status}`);
+
+  // 4. The player metadata route, and what it must not say.
+  const status = await SYS('/ai/system-status?usage=gameplay', { tok: 'tok-a' });
+  const bodyKeys = Object.keys(status.body ?? {}).sort().join(',');
+  check('SA-5 an ordinary player CAN read the safe system metadata and it answers 200',
+    status.status === 200 && status.body?.success === true && status.body?.available === true,
+    `${status.status} ${JSON.stringify(status.body).slice(0, 150)}`);
+  check('SA-6 the metadata response carries no credential id, no reference, no key material, no tuning document and no endpoint',
+    !/credentialId|credential_id|parameterOverrides|parameter_overrides|endpoint|encrypted|keyBytes|apiKey/.test(JSON.stringify(status.body)),
+    bodyKeys);
+  check('SA-7 serving that metadata issued NO credential-table read — the player path never touches key material',
+    !status.dataTables.includes('system_ai_credentials') && status.dataTables.includes('system_ai_config'),
+    `tables=${[...new Set(status.dataTables)].join(',')}`);
+  check('SA-8 the derived decision engine is returned in place of the overrides document, with the client rule',
+    status.body?.decisionEngine === 'trickster' && status.body?.configured === true && status.body?.model === 'qwen3.8-flash',
+    `decisionEngine=${status.body?.decisionEngine}`);
+  const badUsage = await SYS('/ai/system-status?usage=anything-else', { tok: 'tok-a' });
+  check('SA-9 usage is validated server-side and an unknown value is refused without a storage read',
+    badUsage.status === 400 && badUsage.dataCalls === 0, `${badUsage.status} ${JSON.stringify(badUsage.body).slice(0, 90)}`);
+
+  // 5. TEST proves the STORED credential. The mock records the outbound credential under `.auth`
+  // (line 351) — the same field the arms above compare — so reading `.headers.authorization` here was
+  // the instrument bug that kept this arm red while the product answered 200. `providerCalls === 1` is
+  // asserted FIRST in the conjunction's meaning, not its order: a header assertion proves nothing
+  // unless the request was actually attempted.
+  const storedProviderAuth = String(world.providerRequests.slice(-1)[0]?.auth ?? '');
+  check('SA-10 TEST sent the server-resolved STORED credential to the provider, in exactly one attempt',
+    adminTest.status === 200 && adminTest.body?.success === true
+    && adminTest.body?.subject === 'saved_configuration' && adminTest.providerCalls === 1
+    && storedProviderAuth === `Bearer ${STORED_SECRET}`,
+    `${adminTest.status} providerCalls=${adminTest.providerCalls} auth=${storedProviderAuth.slice(0, 24)} subject=${adminTest.body?.subject}`);
+  const testWithMaterial = await SYS('/ai/system-credentials/test', {
+    tok: 'tok-admin', method: 'POST', body: { usage: 'gameplay', credentialId: '19', encryptedApiKey: enc(BROWSER_SECRET) }
+  });
+  // Item 3 as a positive claim, and it is the stronger half of SA-11: browser material is not merely
+  // refused on that request — no provider call made anywhere in this run carries it, in the header or
+  // in the body. A refusal that still leaked the supplied key downstream would pass the status check
+  // alone, which is exactly the gap this clause closes.
+  check('SA-11 TEST refuses browser credential material before storage or a provider call, and that key reaches NO provider anywhere in this run',
+    testWithMaterial.status === 400 && testWithMaterial.body?.error === 'client_credential_material_refused'
+    && testWithMaterial.dataCalls === 0 && testWithMaterial.providerCalls === 0
+    && world.providerRequests.every((q) => !String(q.auth).includes(BROWSER_SECRET) && !String(q.raw).includes(BROWSER_SECRET)),
+    `${testWithMaterial.status} providerCalls=${testWithMaterial.providerCalls} leakedIn=${world.providerRequests.filter((q) => String(q.auth).includes(BROWSER_SECRET) || String(q.raw).includes(BROWSER_SECRET)).length} of ${world.providerRequests.length}`);
+
+  // 6. Partial save: omitted fields are preserved, in place, and read back.
+  const partial = await SYS('/ai/system-config', { tok: 'tok-admin', method: 'PUT', body: { usage: 'gameplay', model: 'qwen3.9-max' } });
+  const rowAfter = (ncb.rows.system_ai_config.find((r) => r.usage_scope === 'gameplay') ?? {});
+  check('SA-12 a partial save keeps provider, endpoint, credential reference and the tuning document it did not mention',
+    partial.status === 200 && partial.body?.success === true && partial.body?.credentialPreserved === true
+    && rowAfter.provider === 'alibaba' && rowAfter.endpoint === baseUrl
+    && rowAfter.credential_id === '19' && String(rowAfter.parameter_overrides).includes('temperature')
+    && rowAfter.model === 'qwen3.9-max',
+    JSON.stringify({ s: partial.status, p: rowAfter.provider, c: rowAfter.credential_id, m: rowAfter.model }));
+  // Measured on the wire, not on the seeded object: a save that preserved the credential must issue no
+  // write to the credential table at all. Comparing ciphertext strings here would be meaningless even
+  // if it passed, because the padding makes the stored value differ from what was put in it.
+  const credWritesSoFar = ncb.requests.filter((q) => q.table === 'system_ai_credentials' && q.method !== 'GET').length;
+  check('SA-13 that save rotated NOTHING: no credential-table write was issued, one row, same id',
+    credWritesSoFar === 0 && ncb.rows.system_ai_credentials.length === 1
+    && ncb.rows.system_ai_credentials[0].id === '19' && partial.body?.credentialRotated === false,
+    `credWrites=${credWritesSoFar} rows=${ncb.rows.system_ai_credentials.length}`);
+
+  // 7. Trickster-only installation: a decision-engine save with no provider and no credential at all.
+  const engineOnly = await SYS('/ai/system-config', {
+    tok: 'tok-admin', method: 'PUT', body: { usage: 'tutor', parameterOverrides: { decisionEngine: 'trickster' } }
+  });
+  const tutorRow = (ncb.rows.system_ai_config.find((r) => r.usage_scope === 'tutor') ?? null);
+  check('SA-14 a decision-engine-only save succeeds without provider, model or credential, and creates no credential row',
+    engineOnly.status === 200 && engineOnly.body?.success === true && tutorRow !== null
+    && String(tutorRow.parameter_overrides).includes('trickster') && !tutorRow.credential_id
+    && ncb.rows.system_ai_credentials.length === 1,
+    JSON.stringify({
+      s: engineOnly.status, error: engineOnly.body?.error ?? 'none', detail: engineOnly.body?.detail ?? 'none',
+      stored: tutorRow && { p: tutorRow.provider, m: tutorRow.model, c: tutorRow.credential_id, o: tutorRow.parameter_overrides }
+    }));
+
+  // 8. Prohibited material on SAVE, and an empty save that must not look like success. Rejections are
+  // asserted to happen BEFORE any storage call: a refusal that runs after the write is not a control.
+  const plaintextSave = await SYS('/ai/system-config', { tok: 'tok-admin', method: 'PUT', body: { usage: 'gameplay', apiKey: 'sk-plaintext-not-accepted' } });
+  const brokenCipher = await SYS('/ai/system-config', { tok: 'tok-admin', method: 'PUT', body: { usage: 'gameplay', encryptedApiKey: 'not-this-relays-ciphertext' } });
+  const emptySave = await SYS('/ai/system-config', { tok: 'tok-admin', method: 'PUT', body: { usage: 'gameplay' } });
+  check('SA-15 SAVE rejects a plaintext key, undecryptable ciphertext and an empty request, each with ZERO storage calls',
+    plaintextSave.status === 400 && plaintextSave.body?.error === 'plaintext_provider_keys_are_not_accepted' && plaintextSave.dataCalls === 0
+    && brokenCipher.status === 400 && brokenCipher.body?.error === 'bad_ciphertext' && brokenCipher.dataCalls === 0
+    && emptySave.status === 400 && emptySave.body?.error === 'nothing_to_update' && emptySave.dataCalls === 0,
+    JSON.stringify([`${plaintextSave.status}/${plaintextSave.dataCalls}`, `${brokenCipher.status}/${brokenCipher.dataCalls}`, `${emptySave.status}/${emptySave.dataCalls}`]));
+  check('SA-16 none of those rejections changed the stored configuration or credential',
+    ncb.rows.system_ai_credentials.length === 1
+    && (ncb.rows.system_ai_config.find((r) => r.usage_scope === 'gameplay') ?? {}).model === 'qwen3.9-max',
+    JSON.stringify(ncb.rows.system_ai_config.map((r) => `${r.usage_scope}:${r.model || '-'}`)));
+
+  check('SA-18 the player gateway still refuses the credential table outright, with a table answer not a session one',
+    (await fetch(`${B}/ncb/data/read/system_ai_credentials?limit=1`, { headers: { Authorization: 'Bearer tok-admin' } })).status === 403,
+    'gateway prohibition unchanged');
+}
+
+/* ── SERVER-SIDE USE — /ai/chat resolves the System AI credential itself ────
+ * The contracts above proved an administrator can read, save and test System AI configuration.
+ * These arms prove the part that actually spends money: which credential a gameplay or tutor
+ * request is billed against, and whether the browser can influence that answer.
+ *
+ * Each arm declares its own fixture rather than inheriting the SA section's, because the model the
+ * relay reads is configuration-dependent by design — a test that reused one row could not tell
+ * "selected the gameplay scope" from "used whatever was there first".
+ */
+{
+  const GK = 'system-gameplay-stored-key';
+  const TK = 'system-tutor-stored-key';
+  const INJECTED = 'browser-injected-key';
+  const PERSONAL = 'personal-own-key';
+  const GM = 'qwen3.8-max';
+  const TM = 'qwen3.8-flash';
+  const HOST = `${B}/ai/chat`;
+
+  const seedUse = () => {
+    // These arms make a dozen successful calls, and the earlier sections leave a small cap and a
+    // charged counter behind. Reset the ledger first: without this the 13th call answers 429 and
+    // every "refused for reason X" assertion silently becomes "refused because quota".
+    //
+    // The config row is written WHOLE rather than inherited from whatever an earlier section left in
+    // slot 0, and its period stays `monthly` on purpose. `resolveQuotaConfig` supports monthly only
+    // (bridge.js: QUOTA_PERIOD_TYPE) and returns `unsupported_period` for anything else, which
+    // reserveAiCall turns into 503 quota_service_unavailable — so a fixture that renamed the period
+    // reddened every billed arm in this section for a reason belonging to the fixture. A personal
+    // call still passed, because the own-AI branch never reads the config table at all; that asymmetry
+    // is why the section looked like a System-AI failure instead of a broken seed.
+    ncb.rows.ai_quota_usage = [];
+    ncb.rows.ai_quota_reservation = [];
+    ncb.rows.ai_quota_user_override = [];
+    ncb.rows.ai_quota_config = [{
+      id: ncb.nextId.ai_quota_config++, quota_enabled: 1, default_call_limit: 1000,
+      period_type: 'monthly', updated_at: sqlDate()
+    }];
+    // A fault-free store: an earlier arm may have armed one and this section asserts specific
+    // refusals, so any inherited fault would be attributed to the wrong cause.
+    ncb.fault = null;
+    ncb.hideReservationReads = 0;
+    mod.resetQuotaProcessLedger();
+    ncb.rows.system_ai_config = [
+      { id: '1', usage_scope: 'gameplay', enabled: 1, provider: 'alibaba', model: GM, endpoint: baseUrl, credential_id: '77', parameter_overrides: '{}' },
+      { id: '2', usage_scope: 'tutor', enabled: 1, provider: 'alibaba', model: TM, endpoint: baseUrl, credential_id: '78', parameter_overrides: '{}' }
+    ];
+    ncb.rows.system_ai_credentials = [
+      { id: '77', provider: 'alibaba', endpoint: baseUrl, user_id: 'club-svc-1', encrypted_api_key: enc(GK) },
+      { id: '78', provider: 'alibaba', endpoint: baseUrl, user_id: 'club-svc-1', encrypted_api_key: enc(TK) }
+    ];
+    ncb.denyCredentialReads = false;
+  };
+  const setAiSource = (userId, value) => {
+    ncb.rows.user_settings = ncb.rows.user_settings.filter((r) => String(r.user_id) !== String(userId));
+    if (value !== null) ncb.rows.user_settings.push({ id: 900 + Number(userId), user_id: Number(userId), ai_source: value });
+    mod.resetAiSourceCache(String(userId));
+  };
+  const CHAT2 = async ({ tok = 'tok-a', usage, provider = 'alibaba', model = GM, extra = {} } = {}) => {
+    const at = ncb.requests.length;
+    /* The window, not the tail. `world.providerRequests` is module-global and every section above this
+       one has already pushed into it, so reading `slice(-1)` reported the PREVIOUS arm's credential and
+       model to an arm whose own request was refused before it dispatched anything — a correct 503
+       dressed up as "the wrong key was selected". Lengths are taken before the call and sliced after,
+       and `sent` is exactly one element only when this arm really dispatched one provider request. */
+    const prAt = world.providerRequests.length;
+    const pc = world.providerCalls;
+    const used = usageRow('101')?.calls_used ?? 0;
+    const res = await fetch(HOST, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+      body: JSON.stringify({
+        provider, model,
+        config: { usage, baseUrl, ...extra },
+        messages: [{ role: 'user', content: '1NT' }]
+      })
+    });
+    const body = await res.json().catch(() => null);
+    const window = ncb.requests.slice(at);
+    const sent = world.providerRequests.slice(prAt);
+    const one = sent.length === 1 ? sent[0] : null;
+    return {
+      status: res.status, body,
+      // A red must name its own cause; `error` is the relay's refusal code, and nulls below mean
+      // "this arm dispatched nothing", which is the honest read of a refused call.
+      error: body?.error ?? body?.status ?? null,
+      dataTables: window.map((q) => q.table),
+      providerCalls: world.providerCalls - pc,
+      sentCount: sent.length,
+      // The window itself, so an arm can say "MY request dispatched nothing" without scanning a
+      // module-global array that earlier arms filled with legitimate calls.
+      sent,
+      lastAuth: one ? String(one.auth) : '',
+      lastModel: one ? one.body?.model ?? null : null,
+      charged: (usageRow('101')?.calls_used ?? 0) - used
+    };
+  };
+
+  seedUse();
+  setAiSource('101', 'system');
+
+  const gp = await CHAT2({ usage: 'gameplay' });
+  check('SU-1 gameplay chat is billed against the SERVER-resolved gameplay credential',
+    gp.status === 200 && gp.providerCalls === 1 && gp.lastAuth === `Bearer ${GK}` && gp.lastModel === GM,
+    `${gp.status} ${gp.error} sent=${gp.sentCount} auth=${gp.lastAuth.slice(0, 26)} model=${gp.lastModel}`);
+  check('SU-2 one gameplay call spends exactly one provider request and one quota unit',
+    gp.charged === 1, `charged=${gp.charged} providerRequests=${gp.sentCount}`);
+
+  const tu = await CHAT2({ usage: 'tutor', model: TM });
+  check('SU-3 tutor usage selects the tutor row: different credential AND different model, nothing hardcoded',
+    tu.status === 200 && tu.providerCalls === 1 && tu.lastAuth === `Bearer ${TK}` && tu.lastModel === TM,
+    `${tu.status} ${tu.error} sent=${tu.sentCount} auth=${tu.lastAuth.slice(0, 24)} model=${tu.lastModel}`);
+
+  const injected = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(INJECTED), credentialId: '78', aiSource: 'user', endpoint: 'https://attacker.example/v1' } });
+  check('SU-4 browser-supplied ciphertext, credential id, aiSource and endpoint cannot override the server answer',
+    injected.status === 200 && injected.providerCalls === 1 && injected.lastAuth === `Bearer ${GK}` && injected.lastModel === GM,
+    `${injected.status} ${injected.error} sent=${injected.sentCount} auth=${injected.lastAuth.slice(0, 26)}`);
+  check('SU-5 the injected key reached NO provider request anywhere in this run',
+    world.providerRequests.every((q) => !String(q.auth).includes(INJECTED) && !String(q.raw).includes(INJECTED)),
+    `${world.providerRequests.filter((q) => String(q.auth).includes(INJECTED)).length} leaks`);
+
+  setAiSource('202', 'user');
+  const personal = await CHAT2({ tok: 'tok-b', usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  const personalPrivileged = personal.dataTables.filter((t) => t === 'system_ai_config' || t === 'system_ai_credentials');
+  check('SU-6 personal AI still resolves its own credential and issues NO privileged system-table read',
+    personal.status === 200 && personal.lastAuth === `Bearer ${PERSONAL}` && personalPrivileged.length === 0,
+    `${personal.status} auth=${personal.lastAuth.slice(0, 24)} systemReads=${personalPrivileged.length}`);
+
+  // No configuration row at all: nothing exists to resolve, so the pre-feature path still serves.
+  const noConfig = [...ncb.rows.system_ai_config];
+  ncb.rows.system_ai_config = [];
+  mod.resetAiSourceCache('101');
+  const legacy = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  check('SU-7 an unconfigured installation keeps working on the caller credential, labelled as unconfigured and not as System AI',
+    legacy.status === 200 && legacy.lastAuth === `Bearer ${PERSONAL}`, `${legacy.status} auth=${legacy.lastAuth.slice(0, 22)}`);
+
+  // A configuration that EXISTS but whose credential is gone must NOT degrade to the caller's key.
+  ncb.rows.system_ai_config = noConfig;
+  const savedCreds = ncb.rows.system_ai_credentials;
+  ncb.rows.system_ai_credentials = [];
+  mod.resetAiSourceCache('101');
+  const missingCred = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  check('SU-8 a configured scope with a missing credential refuses, and does NOT fall back to the caller key',
+    missingCred.status === 503 && missingCred.body?.error === 'system_ai_credential_missing'
+    && missingCred.providerCalls === 0 && missingCred.charged === 0,
+    `${missingCred.status} ${missingCred.body?.error} provider=${missingCred.providerCalls} charged=${missingCred.charged}`);
+  ncb.rows.system_ai_credentials = savedCreds;
+
+  ncb.denyCredentialReads = true;
+  mod.resetAiSourceCache('101');
+  const denied = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  ncb.denyCredentialReads = false;
+  check('SU-9 a storage permission denial is distinguished from a missing credential and spends nothing',
+    denied.status === 503 && denied.body?.error === 'system_ai_credential_inaccessible'
+    && denied.providerCalls === 0 && denied.charged === 0,
+    `${denied.status} ${denied.body?.error}`);
+
+  mod.resetAiSourceCache('101');
+  const wrongProvider = await CHAT2({ usage: 'gameplay', provider: 'openai' });
+  const wrongModel = await CHAT2({ usage: 'gameplay', model: 'qwen3.8-turbo' });
+  const wrongUsage = await CHAT2({ usage: 'billing' });
+  const noUsage = await CHAT2({ usage: undefined });
+  check('SU-10 provider and model mismatches are refused rather than silently redirected',
+    wrongProvider.status === 403 && wrongProvider.body?.error === 'system_ai_provider_mismatch'
+    && wrongModel.status === 403 && wrongModel.body?.error === 'system_ai_model_mismatch'
+    && [wrongProvider, wrongModel].every((r) => r.providerCalls === 0 && r.charged === 0),
+    JSON.stringify([wrongProvider.status, wrongProvider.body?.error, wrongModel.status, wrongModel.body?.error]));
+  check('SU-11 an unusable usage value is refused, while a missing one takes the documented default',
+    wrongUsage.status === 400 && wrongUsage.body?.error === 'usage_must_be_gameplay_or_tutor'
+    && wrongUsage.providerCalls === 0
+    && noUsage.status === 200 && noUsage.lastAuth === `Bearer ${GK}`,
+    JSON.stringify({ bad: [wrongUsage.status, wrongUsage.body?.error], blank: [noUsage.status, noUsage.lastAuth.slice(0, 18)] }));
+
+  ncb.rows.system_ai_config = noConfig.map((r) => ({ ...r, enabled: 0 }));
+  mod.resetAiSourceCache('101');
+  const disabled = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  check('SU-12 a disabled scope refuses with its own code instead of serving the caller credential',
+    disabled.status === 503 && disabled.body?.error === 'system_ai_disabled' && disabled.providerCalls === 0,
+    `${disabled.status} ${disabled.body?.error}`);
+  seedUse();
+  mod.resetAiSourceCache('101');
+
+  const anon = await CHAT2({ tok: '' });
+  check('SU-13 an anonymous chat is still refused before any authority or storage work',
+    anon.status === 401 && anon.dataTables.length === 0, `${anon.status}/${anon.dataTables.length}`);
+
+  // The settings-row-absent case is the one the first attempt of this change got wrong: an account
+  // with no recorded choice must keep its current behaviour, not be told System AI is broken.
+  setAiSource('101', null);
+  const noSettings = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } });
+  check('SU-14 a caller with NO user_settings row keeps the legacy path and is not failed for a missing system credential',
+    noSettings.status === 200 && noSettings.lastAuth === `Bearer ${PERSONAL}`,
+    `${noSettings.status} auth=${noSettings.lastAuth.slice(0, 22)}`);
+  setAiSource('101', 'system');
+
+  const after = await CHAT2({ usage: 'gameplay' });
+  check('SU-15 after all of that the server path is intact and billing is unchanged (one request, one charge)',
+    after.status === 200 && after.lastAuth === `Bearer ${GK}` && after.charged === 1,
+    `${after.status} charged=${after.charged}`);
+
+  /* ── SR — THE HIDDEN-CONFIGURATION BILLING GATE ─────────────────────────────
+   * `system_ai_config` answering 200 with no rows is the shape of BOTH "this installation never
+   * configured System AI" and "the rows exist and row-level security hides them from the club
+   * account". They are indistinguishable by any read the relay can make, so the difference must be a
+   * declared deployment fact — and the property to prove is that the declared-mandatory side of that
+   * difference cannot spend the caller's key.
+   *
+   * The pair SR-1/SR-2 is the whole test: one request, one fixture, one variable (`SYSTEM_AI_REQUIRED`),
+   * opposite outcomes. Everything after it proves the gate costs nothing that was already working.
+   * The flag is read per request by the relay, so one process measures both rules.
+   */
+  // Sets the rule for the request `run` performs and leaves it set: the next call states its own rule,
+  // and the section clears the variable when it finishes. A `finally` that "restored" the value it had
+  // just been handed would only make a reader believe the flag had been put back.
+  const withRequired = async (value, run) => {
+    if (value === null) delete process.env.SYSTEM_AI_REQUIRED;
+    else process.env.SYSTEM_AI_REQUIRED = value;
+    return run();
+  };
+
+  // SR-1: the default rule, recorded here so SR-2 measures a decision and not a coincidence.
+  seedUse();
+  const hiddenRows = [...ncb.rows.system_ai_config];
+  ncb.rows.system_ai_config = [];
+  setAiSource('101', 'system');
+  const offBefore = await withRequired(null, () => CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } }));
+  check('SR-1 with SYSTEM_AI_REQUIRED unset an explicit System AI caller on an empty configuration keeps the legacy path (the rollback state)',
+    offBefore.status === 200 && offBefore.lastAuth === `Bearer ${PERSONAL}` && offBefore.sentCount === 1,
+    `${offBefore.status} ${offBefore.error} auth=${offBefore.lastAuth.slice(0, 22)}`);
+
+  // SR-2 + SR-3: identical request, flag on. Nothing dispatches, so the caller cannot be billed.
+  const reservationsBefore = ncb.rows.ai_quota_reservation.length;
+  const usageBefore = usageRow('101')?.calls_used ?? 0;
+  // Counted, not boolean: earlier arms in this run legitimately sent this same key to the provider
+  // (SR-1 sent it seconds ago), so "the key appears somewhere in the capture" proves nothing. What is
+  // falsifiable is that SR-2 ADDED no dispatch carrying it.
+  const personalSentBefore = world.providerRequests.filter((q) => String(q.auth).includes(PERSONAL) || String(q.raw).includes(PERSONAL)).length;
+  const onRefused = await withRequired('1', () => CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } }));
+  const personalSentAfter = world.providerRequests.filter((q) => String(q.auth).includes(PERSONAL) || String(q.raw).includes(PERSONAL)).length;
+  check('SR-2 with SYSTEM_AI_REQUIRED=1 the SAME hidden-configuration request is refused, not served on the caller credential',
+    onRefused.status === 503 && onRefused.error === 'system_ai_required_config_missing'
+    && onRefused.lastAuth === '' && onRefused.sentCount === 0,
+    `${onRefused.status} ${onRefused.error} sent=${onRefused.sentCount} auth=${onRefused.lastAuth.slice(0, 22)}`);
+  check('SR-3 that refusal reserved nothing, charged nothing and dispatched no provider request of its own',
+    onRefused.providerCalls === 0 && onRefused.charged === 0 && onRefused.sent.length === 0
+    && ncb.rows.ai_quota_reservation.length === reservationsBefore
+    && (usageRow('101')?.calls_used ?? 0) === usageBefore
+    && personalSentAfter === personalSentBefore,
+    `reservations=${ncb.rows.ai_quota_reservation.length - reservationsBefore} charged=${onRefused.charged} personalDispatches=${personalSentBefore}->${personalSentAfter}`);
+
+  // SR-4: the gate must not disturb a deployment whose rows are actually readable.
+  ncb.rows.system_ai_config = hiddenRows;
+  setAiSource('101', 'system');
+  const onConfigured = await withRequired('1', () => CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } }));
+  check('SR-4 with SYSTEM_AI_REQUIRED=1 and the configuration readable, the system credential is still the one that pays',
+    onConfigured.status === 200 && onConfigured.sentCount === 1 && onConfigured.lastAuth === `Bearer ${GK}`,
+    `${onConfigured.status} ${onConfigured.error} auth=${onConfigured.lastAuth.slice(0, 24)}`);
+
+  // SR-5: legacy is preserved for the requests that never selected System AI — no recorded choice at all.
+  ncb.rows.system_ai_config = [];
+  setAiSource('101', null);
+  const onNoChoice = await withRequired('1', () => CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } }));
+  check('SR-5 an account with NO recorded ai_source still takes the legacy path under SYSTEM_AI_REQUIRED=1 (never opted in, never refused)',
+    onNoChoice.status === 200 && onNoChoice.lastAuth === `Bearer ${PERSONAL}`,
+    `${onNoChoice.status} ${onNoChoice.error} auth=${onNoChoice.lastAuth.slice(0, 22)}`);
+  ncb.rows.system_ai_config = hiddenRows;
+  setAiSource('101', 'system');
+
+  // SR-6: the other half of "empty OR INACCESSIBLE". A denied read is refused whatever the flag says —
+  // it was never a fallback, and this pins that the new gate did not become the only guard.
+  const deniedBoth = [];
+  for (const mode of [null, '1']) {
+    seedUse();
+    setAiSource('101', 'system');
+    ncb.denyCredentialReads = true;
+    deniedBoth.push(await withRequired(mode, () => CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL) } })));
+    ncb.denyCredentialReads = false;
+  }
+  check('SR-6 an inaccessible credential is refused with its own code under BOTH flag states, and never falls back to the caller key',
+    deniedBoth.length === 2 && deniedBoth.every((r) => r.status === 503
+      && r.error === 'system_ai_credential_inaccessible' && r.sentCount === 0 && r.charged === 0),
+    deniedBoth.map((r) => `${r.status}/${r.error}/${r.sentCount}`).join(' '));
+
+  // SR-7: the rule is observable, so a deployment can be proved rather than remembered. Both states are
+  // read through the helper — the SR-6 loop above leaves the flag SET, and an unwrapped "off" read here
+  // would have been an arm passing for the wrong reason.
+  const healthOff = await withRequired(null, () => fetch(`${B}/health`).then((r) => r.json()));
+  const healthOn = await withRequired('1', () => fetch(`${B}/health`).then((r) => r.json()));
+  check('SR-7 /health.systemAi reports the rule each request is judged under, and whether a privileged channel exists to judge it with',
+    healthOff.systemAi?.required === false && healthOn.systemAi?.required === true
+    && healthOn.systemAi?.channelConfigured === true
+    && !JSON.stringify(healthOn.systemAi).includes('system_ai_config'),
+    JSON.stringify({ off: healthOff.systemAi, on: healthOn.systemAi }));
+  seedUse();
+  setAiSource('101', 'system');
+  delete process.env.SYSTEM_AI_REQUIRED;
+}
+
+/* The privilege boundary, censused over the append-only run record rather than a scenario window.
+   `ncb.requests` is emptied by every `seed()`, so an arm that reads it at the end describes only the
+   last scenario — which is why the census below reads `runCensus`, and why the claim in the arm name
+   is now true instead of aspirational. C-18 stays exactly as it is and stays green — it runs before
+   these arms — and this is what it becomes once the routes exist: touching the credential table is
+   allowed, but only ever as the service account. A player bearer anywhere in this census is the
+   regression this catches. */
+const runData = runCensus.requests.filter((q) => q.pathname.startsWith('/data/'));
+const sysCredTouches = runData.filter((q) => q.table === 'system_ai_credentials');
+check('SA-19 every credential-table request in this suite was made by the club service account, never a player bearer',
+  sysCredTouches.length > 0 && sysCredTouches.every((q) => q.auth === CLUB_BEARER),
+  `${sysCredTouches.length} touches: ${[...new Set(sysCredTouches.map((q) => q.auth))].join(' | ') || 'none'}`);
+check('SA-20 the club bearer reached only the tables whose declared policy allows it, across the whole process run',
+  runData.length > 0 && privilegedViolations(runData).length === 0,
+  `${runData.filter((q) => q.auth === CLUB_BEARER).length} club-bearer calls of ${runData.length}; `
+  + `violations=${privilegedViolations(runData).map((q) => `${q.table}→${q.auth}`).slice(0, 4).join(', ') || 'none'}`);
+/* The privileged identity is a STORAGE identity. If it ever appeared as the credential on an outbound
+   provider call, the deployment would be paying for inference with an account that is not an AI
+   account, and a session token would have left the process — which no other arm in this file can see,
+   because the provider capture is a different array from the storage capture. */
+check('SA-21 no session bearer was ever the credential on an outbound provider request',
+  runCensus.providerRequests.length > 0
+  && !runCensus.providerRequests.some((q) => Object.keys(USERS).some((t) => String(q.auth).includes(t))),
+  `${runCensus.providerRequests.filter((q) => Object.keys(USERS).some((t) => String(q.auth).includes(t))).length} of ${runCensus.providerRequests.length} carry a session token`);
+
 let failed = 0;
 for (const x of results) {
   if (!x.pass) failed++;
   console.log(`${x.pass ? 'PASS' : 'FAIL'}  ${x.name}${x.detail ? '   [' + x.detail + ']' : ''}`);
 }
+
 console.log(`\nRESULTS: ${results.length - failed}/${results.length} passed, ${failed} failed  (variant=${VARIANT})`);
 console.log('MOCKED: NCB (session authority AND the four ai_quota_* tables) and the AI provider are loopback');
 console.log('fakes; the relay under test is the real exported app over a real socket. Two child processes boot');

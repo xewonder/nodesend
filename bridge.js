@@ -667,6 +667,47 @@ async function relayAI(req, res, operation) {
     if (!["alibaba", "openai"].includes(provider)) {
       return res.status(400).json({ success: false, error: "Unsupported AI provider", requestId });
     }
+
+    /* The authority for this call, decided BEFORE any credential is resolved or any quota is spent.
+       A mismatch between what the browser asked for and what the deployment configured is REFUSED
+       rather than redirected: silently swapping the provider or the model would send a request to a
+       system the caller never chose, under a key they never approved, and every log line downstream
+       would look like the intended thing happened. */
+    const authority = await resolveSystemAiAuthority(req, config);
+    if (authority.error) {
+      safeEvent("system_ai_use_refused", {
+        code: authority.error.code, operation,
+        userId: req.bridgeUser?.id ?? null, requestId
+      });
+      return res.status(authority.error.status).json({
+        success: false, status: authority.error.code, error: authority.error.code,
+        // Operator-facing only, and only where the resolver has something specific to say. A client
+        // that ignores unknown fields is unaffected.
+        ...(authority.error.detail ? { detail: authority.error.detail } : {}),
+        requestId
+      });
+    }
+    const systemOn = authority.system === true;
+    if (systemOn && provider !== authority.provider) {
+      safeEvent("system_ai_use_provider_mismatch", { requestId, userId: req.bridgeUser?.id ?? null });
+      return res.status(403).json({
+        success: false, status: "system_ai_provider_mismatch", error: "system_ai_provider_mismatch",
+        detail: "The configured System AI provider differs from the one requested.", requestId
+      });
+    }
+    if (systemOn && typeof model === "string" && model.trim() !== "" && model.trim() !== authority.model) {
+      safeEvent("system_ai_use_model_mismatch", { requestId, userId: req.bridgeUser?.id ?? null });
+      return res.status(403).json({
+        success: false, status: "system_ai_model_mismatch", error: "system_ai_model_mismatch",
+        detail: "The configured System AI model differs from the one requested.", requestId
+      });
+    }
+    // The endpoint is the server's for a System call; a personal call keeps its own config untouched.
+    const effConfig = systemOn ? { ...config, baseUrl: authority.endpoint || config?.baseUrl } : config;
+    // One key source per call, and for a System call there is exactly one possible answer: the
+    // credential the relay resolved itself. `config.encryptedApiKey` and `config.credentialId` are
+    // not consulted on that path, so they cannot override it even when a client sends them.
+    const keyForThisCall = async () => (systemOn ? authority.apiKey : await resolveRequestApiKey(req, effConfig));
     let result;
     if (operation === "models") {
       if (provider === "alibaba") {
@@ -678,9 +719,9 @@ async function relayAI(req, res, operation) {
       // Model discovery is a provider call too, so a credential referenced by id must be
       // resolved here rather than left to the inline path. A failure is reported the same way
       // the request above reports it, and never as an empty model list.
-      const discoveredKey = await resolveRequestApiKey(req, config);
+      const discoveredKey = await keyForThisCall();
       result = await requestProvider({
-        provider, config, resolvedApiKey: discoveredKey, path: "/models", method: "GET", lifecycle, requestId
+        provider, config: effConfig, resolvedApiKey: discoveredKey, path: "/models", method: "GET", lifecycle, requestId
       });
       if (!result.ok) {
         res.setHeader("Server-Timing", timeHeader({ ...result.metrics, relayTotalMs: lifecycle.elapsed() }));
@@ -724,10 +765,10 @@ async function relayAI(req, res, operation) {
       // The connectivity probe spends no quota, but it still needs a key, and the key may now
       // live only in this relay. Failing here is the correct answer: an admin must not be told
       // a credential works when it cannot be resolved.
-      resolvedApiKey = await resolveRequestApiKey(req, config);
+      resolvedApiKey = await keyForThisCall();
     }
     if (operation === "chat") {
-      resolvedApiKey = await resolveRequestApiKey(req, config);
+      resolvedApiKey = await keyForThisCall();
       reservation = await reserveAiCall(req, res);
       if (!reservation.allowed) {
         const status = reservation.reason === "quota_service_unavailable" || reservation.reason === "auth_required"
@@ -752,7 +793,7 @@ async function relayAI(req, res, operation) {
     }
 
     result = await requestProvider({
-      provider, config, resolvedApiKey,
+      provider, config: effConfig, resolvedApiKey,
       path: "/chat/completions", body: providerBody, lifecycle, requestId
     });
     // Browser callers can inspect these headers if the request completes.
@@ -2881,6 +2922,11 @@ app.get("/health", (req, res) => res.json({
   // `configured:true, sessionActive:false` means a sign-in is not currently held (a live fact).
   // No credential, email, table name or row ever appears here.
   clubs: clubHealth(clubMount),
+  /* Which USE rule this process enforces, and whether it has a privileged channel to enforce it with.
+     Two booleans and no name, no table and no host: `required` is the half of the row-level-security
+     migration that lives in this container, and an operator proving a deploy needs to SEE it land
+     rather than infer it from a 503 that only appears when a row goes missing. */
+  systemAi: { required: systemAiRequired(), channelConfigured: Boolean(getSystemAi()) },
   // The player gateway reports what an operator actually needs to page on: whether it can mint a
   // session handle at all, and how wide it is allowed to be. Counts and booleans only — no origin,
   // no table name, no key, and never the upstream cookie or a sealed handle.
@@ -3506,7 +3552,425 @@ const clubMount = buildClubMount({
     return { ok: true, id: resolved.userId, role: resolved.role };
   }
 });
+/* THE USE AUTHORITY — who decides which credential a chat is billed against.
+ *
+ * The caller's RECORDED aiSource, read from `user_settings` through the same resolver the quota path
+ * already trusts. `config.aiSource` is never consulted: the field that decides which key the
+ * deployment pays with cannot be the one the payer sends.
+ *
+ * The three states, and they are deliberately different:
+ *   • recorded `user` (personal) -> `{ system: false }`. Nothing here reads a system table, so a
+ *     personal call costs exactly what it cost before this feature and touches nothing it did not.
+ *   • recorded `system` with an AUTHORITATIVE row -> server-side resolution, and the browser's
+ *     credentialId / ciphertext / endpoint are not merely ignored, they cannot be reached.
+ *   • `system` only as a DEFAULT (no settings row, a duplicated row, or a value this relay does not
+ *     recognise — all three arrive as `reason` set) -> `{ system: false }`. That is the legacy
+ *     behaviour for an installation that never configured anything, and it is the difference between
+ *     serving a deployment and taking it down: refusing here would make every unconfigured account
+ *     fail, which is the mistake the first attempt at this change made and 94 quota arms caught.
+ *     Defaulting to system is not the same as claiming a System AI credential is configured.
+ */
+function systemAiUseError(category) {
+  // Distinct codes for distinct facts, all 503 so no client discards a valid session over a
+  // deployment problem. A single "system AI unavailable" string would make an operator choose
+  // between retyping a key, fixing RLS and checking a quota, and only one of those is ever true.
+  const CODES = {
+    [SYSTEM_AI_CATEGORY.CONFIG_ABSENT]: "system_ai_not_configured",
+    [SYSTEM_AI_CATEGORY.CREDENTIAL_REFERENCE_MISSING]: "system_ai_credential_missing",
+    [SYSTEM_AI_CATEGORY.CREDENTIAL_ABSENT]: "system_ai_credential_missing",
+    [SYSTEM_AI_CATEGORY.CREDENTIAL_VALUE_EMPTY]: "system_ai_credential_empty",
+    [SYSTEM_AI_CATEGORY.CREDENTIAL_DECRYPT_FAILED]: "system_ai_credential_decrypt_failed",
+    [SYSTEM_AI_CATEGORY.ACCESS_DENIED]: "system_ai_credential_inaccessible",
+    [SYSTEM_AI_CATEGORY.STORAGE_UNREACHABLE]: "system_ai_storage_unavailable",
+    [SYSTEM_AI_CATEGORY.RESPONSE_UNREADABLE]: "system_ai_storage_unreadable",
+    [SYSTEM_AI_CATEGORY.DUPLICATE_ROWS]: "system_ai_configuration_ambiguous",
+    config_incomplete: "system_ai_not_configured"
+  };
+  return { status: 503, code: CODES[category] ?? "system_ai_unavailable" };
+}
+
+/* THE ONE AMBIGUITY THIS RELAY CANNOT RESOLVE BY READING, and so must be told about.
+ * An empty `system_ai_config` read has two causes, and NCB answers both with HTTP 200 and no rows:
+ *   1. the installation never configured System AI;
+ *   2. the rows EXIST and are hidden from this account — an ownership or row-level-security change
+ *      (which is precisely what `private` on these two tables does to a row stamped to another user).
+ * Cause 2 is indistinguishable from cause 1 by any read this process can make, so the difference has
+ * to be a declared deployment fact rather than an inference. Left as an inference it is a billing
+ * fault, not a cosmetic one: an explicit System AI request that finds no configuration falls through
+ * to the caller's own provider key, the request SUCCEEDS, the screen still says System AI, and the
+ * deployment pays nothing while the player does.
+ *   • `SYSTEM_AI_REQUIRED` unset — the default, and every deployment running today: cause 1 and cause
+ *     2 both keep the pre-feature path. Refusing here would take down an installation that never
+ *     adopted System AI, which is the mistake the first attempt at this change made and 94 quota arms
+ *     caught.
+ *   • `SYSTEM_AI_REQUIRED` on: cause 2 is refused with its own code, and no key of the caller's is
+ *     ever resolved, reserved or spent on that request.
+ * Read at decision time, exactly as `INVITATION_CLAIM_MODE` is, so the rule is observable on
+ * `/health` and exercisable without booting a second process.
+ */
+const systemAiRequired = () => /^(1|true|yes|on)$/i.test(String(process.env.SYSTEM_AI_REQUIRED ?? "").trim());
+
+async function resolveSystemAiAuthority(req, config) {
+  const source = await resolveUserAiSource(req, req.bridgeUser?.id);
+  if (source?.aiSource !== AI_SOURCE_SYSTEM || source.reason) return { system: false, reason: source?.reason ?? null };
+  const rawUsage = config?.usage;
+  const blank = rawUsage === undefined || rawUsage === null || String(rawUsage).trim() === '';
+  // A missing usage is the deployment-skew case (the shipped bundle predates the field) and falls
+  // back to gameplay; a PRESENT but unusable usage is a client bug and is refused rather than
+  // guessed at, because silently picking a scope would bill tutoring against the gameplay model.
+  const scope = blank ? 'gameplay' : systemAiUsage(rawUsage);
+  if (!scope) return { system: true, error: { status: 400, code: "usage_must_be_gameplay_or_tutor" } };
+  const svc = getSystemAi();
+  if (!svc) return { system: true, error: { status: 503, code: "system_ai_channel_unavailable" } };
+  const resolved = await svc.resolve(scope);
+  if (!resolved.ok) {
+    /* The one category that is allowed to fall through, and it is not a fallback to personal
+       credentials: CONFIG_ABSENT means this deployment has no System AI configuration row at all, so
+       there is nothing server-side TO resolve and the caller's own ciphertext is the only thing that
+       can work. That is the pre-feature status quo for an installation that never adopted this, not a
+       bypass of it — and it is the branch `SYSTEM_AI_REQUIRED` exists to close, because an empty read
+       is also exactly what a row-level-security change makes a hidden row look like. See the note
+       above `systemAiRequired`.
+
+       Every other failure is a hard refusal, because in those cases the configuration DOES exist and
+       is broken — a missing, empty, undecryptable or unreachable credential, a disabled scope, an
+       ambiguous pair of rows. Serving the caller's key there would be exactly the silent substitution
+       this function exists to prevent: the request would succeed, be billed as System AI, and no log
+       would say the configured credential was not used. */
+    if (resolved.category === SYSTEM_AI_CATEGORY.CONFIG_ABSENT && !systemAiRequired()) {
+      safeEvent("system_ai_use_unconfigured_legacy_path", { usage: scope });
+      return { system: false, reason: "unconfigured" };
+    }
+    if (resolved.category === SYSTEM_AI_CATEGORY.CONFIG_ABSENT) {
+      // Its own code, because the two readings of an empty read are NOT collapsed into one answer:
+      // this says "this deployment mandates System AI and the configuration is not readable", which
+      // an operator acts on by checking row ownership and policy — not by retyping a provider key.
+      // No `apiKey` is returned from here by construction, so there is nothing for a callsite to bill.
+      return {
+        system: true,
+        error: {
+          status: 503, code: "system_ai_required_config_missing",
+          detail: "SYSTEM_AI_REQUIRED is enabled and no configuration row is readable for this usage scope. An empty read and a row hidden by row-level security answer identically, so nothing was resolved and the caller's own credential was NOT used."
+        }
+      };
+    }
+    return { system: true, error: systemAiUseError(resolved.category) };
+  }
+  if (resolved.enabled !== true) return { system: true, error: { status: 503, code: "system_ai_disabled" } };
+  return {
+    system: true, scope, apiKey: resolved.apiKey,
+    provider: resolved.provider, model: resolved.model, endpoint: resolved.endpoint
+  };
+}
+
 app.use(clubMount.router);
+
+/* THE SYSTEM AI AUTHORITY.
+ *
+ * System AI configuration and its provider credential are administrative state, so they are read
+ * and written here — on routes that authenticate the caller and then check the Bridge Admin role —
+ * and never through the browser-facing table CRUD path. That path was already closed by design
+ * (`ncb/gateway.js`: `system_ai_credentials` is excluded from the allow-list outright, and the write
+ * policy grades `system_ai_config` read-only); the defect was that the client read the resulting 403
+ * as "no credential exists". Closing the table and opening the route are two halves of ONE change,
+ * which is why the gateway prohibition is untouched here and must stay untouched.
+ *
+ * Storage access goes through `clubMount.account`, the same privileged identity the club store and
+ * the invitation claim already use, and never through the caller's bearer. That distinction is the
+ * whole design: a player session must not be able to read, or to repoint, the key the deployment
+ * pays with.
+ *
+ * NOT A SECURITY CLAIM ABOUT NCB. Both tables are `shared_readwrite` at the vendor, which means an
+ * authenticated NCB session that addresses the API directly can read this ciphertext and write over
+ * it. Routing the browser away from the tables removes one path; it does not make the table safe,
+ * and nothing here should be described as having done so. Closing that gap is an RLS decision the
+ * owner makes in NCB, not something this relay can grant itself.
+ *
+ * `USE` is deliberately NOT changed in this pass. `/ai/chat` still resolves the key the way it did,
+ * so gameplay and tutoring keep working exactly as they do today; server-side resolution of the
+ * playing path is the remaining piece and is reported as such rather than half-done here.
+ */
+const {
+  createSystemAiCredentials, CATEGORY: SYSTEM_AI_CATEGORY
+} = require("./ncb/systemAiCredentials.js");
+
+let systemAiService = null;
+function getSystemAi() {
+  if (systemAiService) return systemAiService;
+  // The privileged channel is optional in the same sense Clubs is: a deployment without it gets a
+  // named 503 on these three routes, never a silently unguarded path.
+  if (!clubMount.account || clubMount.account.configured !== true) return null;
+  try {
+    systemAiService = createSystemAiCredentials({
+      account: clubMount.account,
+      decrypt: decryptProviderApiKey,
+      event: safeEvent
+    });
+  } catch {
+    return null;
+  }
+  return systemAiService;
+}
+
+const SYSTEM_AI_USAGES = ["gameplay", "tutor"];
+const systemAiUsage = (value) => {
+  const usage = String(value ?? "").trim().toLowerCase();
+  return SYSTEM_AI_USAGES.includes(usage) ? usage : null;
+};
+
+// A storage category is not an HTTP status, and collapsing them is how a policy denial gets reported
+// as a missing credential. One table, spelled once.
+const SYSTEM_AI_HTTP = {
+  [SYSTEM_AI_CATEGORY.ACCESS_DENIED]: 403,
+  [SYSTEM_AI_CATEGORY.STORAGE_UNREACHABLE]: 503,
+  [SYSTEM_AI_CATEGORY.RESPONSE_UNREADABLE]: 503,
+  [SYSTEM_AI_CATEGORY.DUPLICATE_ROWS]: 503,
+  [SYSTEM_AI_CATEGORY.WRITE_UNCONFIRMED]: 502,
+  [SYSTEM_AI_CATEGORY.WRITE_REFUSED]: 502,
+  [SYSTEM_AI_CATEGORY.CONFIG_ABSENT]: 200,
+  [SYSTEM_AI_CATEGORY.CREDENTIAL_REFERENCE_MISSING]: 200,
+  [SYSTEM_AI_CATEGORY.CREDENTIAL_ABSENT]: 200,
+  [SYSTEM_AI_CATEGORY.CREDENTIAL_VALUE_EMPTY]: 200,
+  [SYSTEM_AI_CATEGORY.CREDENTIAL_DECRYPT_FAILED]: 200,
+  // Client faults stay 400. `nothing_to_update` in particular must never be reportable as success: a
+  // tick for a request that changed nothing is how a silent form bug survives a release.
+  nothing_to_update: 400,
+  bad_usage: 400,
+  bad_provider: 400,
+  bad_model: 400,
+  bad_ciphertext: 400
+};
+
+/* THE PLAYER-FACING METADATA ROUTE.
+ *
+ * Session-guarded, not admin-guarded, because an ordinary player legitimately needs to know whether
+ * System AI exists — that is what decides which engine a board shows and whether the model picker has
+ * anything to offer. What it must not need is the table. Until now the browser read `system_ai_config`
+ * itself through the gateway to find that out, and this route is what replaces the last direct read.
+ *
+ * It costs one config read and NO credential-table read, and the response carries no credential id,
+ * reference, key metadata or endpoint value. Identity comes only from the validated session: there is
+ * no user_id field here to forge, and `usage` is validated server-side.
+ */
+app.get("/ai/system-status", requireBridgeSession, async (req, res) => {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const usage = systemAiUsage(req.query?.usage ?? "gameplay");
+  if (!usage) return res.status(400).json({ success: false, error: "usage_must_be_gameplay_or_tutor", requestId });
+  const svc = getSystemAi();
+  if (!svc) return systemAiUnavailable(res, requestId);
+  try {
+    const state = await svc.publicStatus(usage);
+    if (!state.ok) {
+      return res.status(SYSTEM_AI_HTTP[state.category] ?? 503).json({
+        success: false, error: state.category, detail: state.detail ?? "", requestId
+      });
+    }
+    return res.json({
+      success: true, usage: state.usage, configured: state.configured, enabled: state.enabled,
+      available: state.available, provider: state.provider, model: state.model,
+      // One derived value, not the administrator's tuning document: see publicStatus.
+      decisionEngine: state.decisionEngine, requestId
+    });
+  } catch {
+    return res.status(502).json({ success: false, error: "system_ai_status_unreadable", requestId });
+  }
+});
+
+/* The only record this relay keeps of a connection test, and it is in-process on purpose: there is
+   no durable column for it and inventing one would be a schema change. So the answer it feeds the
+   screen is explicitly per-process — "Configured" is a storage fact, "Connection tested" is not, and
+   conflating the two is the bug this split exists to prevent. A container restart clears it, which is
+   honest; a stale tick that survives a restart would not be. */
+const systemAiTestLedger = new Map();
+function systemAiTestStamp(usage) {
+  const hit = systemAiTestLedger.get(usage);
+  if (!hit) return { status: "not_tested", detail: "no connection test has run in this process" };
+  return { status: hit.ok ? "tested_success" : "tested_failure", at: hit.at, category: hit.category, provider: hit.provider, model: hit.model };
+}
+
+function systemAiUnavailable(res, requestId) {
+  safeEvent("system_ai_channel_unavailable", { requestId });
+  return res.status(503).json({
+    success: false,
+    error: "system_ai_channel_unavailable",
+    detail: "The privileged storage channel (the club service account) is not configured on this deployment, so System AI cannot be read or written. Nothing was simulated.",
+    requestId
+  });
+}
+
+// ── READ (metadata only): what the admin screen is allowed to know ──────────
+app.get("/ai/system-config", requireBridgeSession, requireBridgeAdmin, async (req, res) => {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const usage = systemAiUsage(req.query?.usage ?? "gameplay");
+  if (!usage) return res.status(400).json({ success: false, error: "usage_must_be_gameplay_or_tutor", requestId });
+  const svc = getSystemAi();
+  if (!svc) return systemAiUnavailable(res, requestId);
+  try {
+    const state = await svc.describe(usage);
+    if (!state.ok) {
+      return res.status(SYSTEM_AI_HTTP[state.category] ?? 502).json({
+        success: false, error: state.category, detail: state.detail ?? "", requestId
+      });
+    }
+    return res.json({
+      success: true,
+      usage,
+      // Configured is a storage fact and Connection tested is a different one. The client is not
+      // allowed to derive either from the other, so both are always present.
+      configured: state.configured === true,
+      enabled: state.enabled === true,
+      provider: state.provider,
+      model: state.model,
+      endpointSet: state.endpointSet === true,
+      parameterOverrides: state.parameterOverrides ?? null,
+      credential: state.credential,
+      connectionTest: systemAiTestStamp(usage),
+      requestId
+    });
+  } catch {
+    return res.status(502).json({ success: false, error: "system_ai_read_failed", detail: "the System AI state could not be read", requestId });
+  }
+});
+
+// ── SAVE: configuration plus in-place credential rotation, admin-only ───────
+app.put("/ai/system-config", requireBridgeSession, requireBridgeAdmin, async (req, res) => {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const body = req.body ?? {};
+  const usage = systemAiUsage(body.usage);
+  if (!usage) return res.status(400).json({ success: false, error: "usage_must_be_gameplay_or_tutor", requestId });
+  // Refused explicitly rather than dropped, exactly as the personal-credential route does: a client
+  // that sends a raw provider key has misunderstood the contract, and accepting it would hide that.
+  if (body.apiKey !== undefined && body.apiKey !== null && String(body.apiKey).trim() !== "") {
+    return res.status(400).json({
+      success: false, error: "plaintext_provider_keys_are_not_accepted",
+      detail: "Send encryptedApiKey, produced with GET /crypto/public-key.", requestId
+    });
+  }
+  if (body.provider !== undefined && !["alibaba", "openai"].includes(String(body.provider).trim().toLowerCase())) {
+    return res.status(400).json({ success: false, error: "unsupported_ai_provider", requestId });
+  }
+  const svc = getSystemAi();
+  if (!svc) return systemAiUnavailable(res, requestId);
+  try {
+    const saved = await svc.save({
+      usage,
+      // Passed through RAW, not collapsed to a boolean: `enabled` absent has to mean "leave it as it
+      // is", and coercing it here would flip System AI off on every save that did not mention it.
+      enabled: body.enabled,
+      provider: body.provider,
+      model: body.model,
+      endpoint: body.endpoint,
+      parameterOverrides: body.parameterOverrides === undefined ? undefined : JSON.stringify(body.parameterOverrides),
+      encryptedApiKey: body.encryptedApiKey
+    });
+    if (!saved.ok) {
+      safeEvent("system_ai_save_refused", { usage, category: saved.category, requestId });
+      return res.status(SYSTEM_AI_HTTP[saved.category] ?? 502).json({
+        success: false, error: saved.category, detail: saved.detail ?? "",
+        credentialRotated: saved.credentialRotated === true,
+        configWritten: saved.configWritten !== false ? true : false,
+        orphanCleanup: saved.orphanCleanup ?? "not_applicable",
+        requestId
+      });
+    }
+    // A save changes what a test would prove, so the previous stamp is dropped instead of being
+    // allowed to keep claiming success for a configuration that no longer exists.
+    systemAiTestLedger.delete(usage);
+    safeEvent("system_ai_saved", { usage, provider: saved.provider, credentialRotated: saved.credentialRotated, requestId });
+    return res.json({
+      success: true, usage, provider: saved.provider, model: saved.model, enabled: saved.enabled,
+      credentialRotated: saved.credentialRotated === true,
+      credentialPreserved: saved.credentialPreserved === true,
+      connectionTest: systemAiTestStamp(usage), requestId
+    });
+  } catch {
+    return res.status(502).json({ success: false, error: "system_ai_save_failed", requestId });
+  }
+});
+
+// ── TEST: proves the STORED credential works, and takes nothing from the browser ──
+/* One field is accepted: the usage scope. Not a credential id, not a key, not ciphertext. An
+   existing saved credential must be tested as it is actually configured — accepting the material
+   instead would let a caller prove that SOME key works and read it as proof that the stored one
+   does, which is the opposite of what the button is for. */
+app.post("/ai/system-credentials/test", requireBridgeSession, requireBridgeAdmin, async (req, res) => {
+  const requestId = req.nodeSendRequestId || requestIdentity(req, res);
+  const body = req.body ?? {};
+  const unexpected = Object.keys(body).filter((key) => key !== "usage");
+  if (unexpected.length) {
+    return res.status(400).json({
+      success: false, error: "client_credential_material_refused",
+      detail: `This route takes only { usage }; the credential under test is the one already configured. Unexpected: ${unexpected.join(", ")}`,
+      requestId
+    });
+  }
+  const usage = systemAiUsage(body.usage);
+  if (!usage) return res.status(400).json({ success: false, error: "usage_must_be_gameplay_or_tutor", requestId });
+  const svc = getSystemAi();
+  if (!svc) return systemAiUnavailable(res, requestId);
+
+  let resolved = null;
+  try {
+    resolved = await svc.resolve(usage);
+  } catch {
+    return res.status(503).json({ success: false, error: SYSTEM_AI_CATEGORY.STORAGE_UNREACHABLE, requestId });
+  }
+  if (!resolved.ok) {
+    systemAiTestLedger.set(usage, { ok: false, at: Date.now(), category: resolved.category });
+    safeEvent("system_ai_test_unresolved", { usage, category: resolved.category, requestId });
+    return res.status(SYSTEM_AI_HTTP[resolved.category] ?? 502).json({
+      success: false, error: resolved.category, detail: resolved.detail ?? "", usage,
+      subject: "saved_configuration", connectionTest: systemAiTestStamp(usage), requestId
+    });
+  }
+
+  const lifecycle = requestLifecycle(req, res, requestId);
+  try {
+    const result = await requestProvider({
+      provider: resolved.provider,
+      // `baseUrl` is the field the provider layer actually reads; `endpoint` is the storage column
+      // name. Passing only the latter left the request with no URL and the call failed as
+      // provider_unreachable — the two names are not interchangeable and this is now explicit.
+      config: { baseUrl: resolved.endpoint || undefined, endpoint: resolved.endpoint || undefined },
+      resolvedApiKey: resolved.apiKey,
+      path: "/chat/completions",
+      body: { model: resolved.model, messages: [{ role: "user", content: "Reply only with OK" }] },
+      lifecycle,
+      requestId
+    });
+    // Classified by status alone. The upstream body can contain a request id, an account label or a
+    // echoed key fragment, and an administrator only needs to know which thing failed.
+    const category = result.ok ? "ok"
+      : (result.status === 401 || result.status === 403) ? "provider_rejected_credential"
+        : result.status === 404 ? "provider_model_not_found"
+          : result.status === 429 ? "provider_rate_limited" : "provider_error";
+    systemAiTestLedger.set(usage, { ok: result.ok, at: Date.now(), category, provider: resolved.provider, model: resolved.model });
+    safeEvent("system_ai_test_result", { usage, provider: resolved.provider, status: result.status, category, requestId });
+    return res.json({
+      success: result.ok,
+      category,
+      provider: resolved.provider,
+      model: resolved.model,
+      credentialTested: true,
+      // Names the subject of the proof, because the distinction is the point: this call tested the
+      // configuration the deployment ALREADY HAS, not whatever is sitting unsaved in an
+      // administrator's form. A screen that shows "tested" without saying which is inviting the
+      // reader to believe a draft was proven.
+      subject: "saved_configuration",
+      connectionTest: systemAiTestStamp(usage),
+      requestId
+    });
+  } catch (error) {
+    systemAiTestLedger.set(usage, { ok: false, at: Date.now(), category: "provider_unreachable" });
+    safeEvent("system_ai_test_error", { usage, name: error?.name || "Error", requestId });
+    return res.status(502).json({
+      success: false, error: "provider_unreachable", usage,
+      subject: "saved_configuration", connectionTest: systemAiTestStamp(usage), requestId
+    });
+  } finally {
+    lifecycle.dispose();
+  }
+});
 
 /* THE PRIVILEGED INVITATION CLAIM, the reservation store behind it, and the mode that gates them.
 
