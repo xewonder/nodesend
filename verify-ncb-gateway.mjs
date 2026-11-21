@@ -72,9 +72,14 @@ function fakeNcb(req, res) {
       }
       if (verb === 'sign-in/email' || verb === 'sign-up/email') {
         if (signinFault) {
-          return send(signinFault.status,
-            { code: signinFault.code, message: signinFault.message, status: 'failed' },
-            signinFault.headers ?? {});
+          // `envelope` lets one arm answer the way better-auth actually does for a validation failure:
+          // the code nested under `error`, or a list of per-field issues. The default stays the flat
+          // top-level body, because that is the shape the gateway already handled — a mock that could
+          // only ever emit it would make every nested-shape arm a description of the mock instead of a
+          // test of the code.
+          const payload = signinFault.envelope
+            ?? { code: signinFault.code, message: signinFault.message, status: 'failed' };
+          return send(signinFault.status, payload, signinFault.headers ?? {});
         }
         const u = USERS[body?.email];
         if (!u || (verb === 'sign-in/email' && u.password !== body?.password)) return send(401, { code: 'USER_NOT_FOUND', message: 'Invalid email or password' });
@@ -444,8 +449,15 @@ const burstStatuses = burstResults.map((r) => r.status);
 const limited = burstResults.find((r) => r.status === 429);
 check('8c. a credential-stuffing burst is throttled rather than forwarded forever',
   (burstStatuses.filter((s) => s === 429).length) > 0, JSON.stringify([...new Set(burstStatuses)]));
-check('8d. a 429 carries Retry-After, so a client backs off instead of hammering',
-  limited && /^\d+$/.test(String(limited.headers['retry-after'] ?? '')), `retry-after=${limited?.headers['retry-after']}`);
+check('8d. a 429 carries Retry-After AND the full error envelope, so the throttle is translatable too',
+  limited && /^\d+$/.test(String(limited.headers['retry-after'] ?? ''))
+  // This is the one refusal this gateway produces from its OWN counter rather than from the vendor, so
+  // it is where `too_many_attempts` is the only code a client can get. Asserting the envelope here is
+  // what makes "every auth refusal answers in the contract" a tested statement instead of a claim
+  // about the vendor-shaped paths only.
+  && limited.json?.error === 'too_many_attempts' && limited.json?.code === 'TOO_MANY_ATTEMPTS'
+  && limited.json?.messageKey === 'auth.rate_limited' && Array.isArray(limited.json?.fields),
+  `retry-after=${limited?.headers['retry-after']} body=${JSON.stringify(limited?.json ?? null)}`);
 check('8e. the burst never reached upstream more times than the window allows',
   upstreamLog.filter((e) => e.path === '/api/user-auth/sign-in/email').length <= 30, String(upstreamLog.filter((e) => e.path === '/api/user-auth/sign-in/email').length));
 
@@ -766,7 +778,18 @@ const probeCall = async (method, route, { token = '', body, headers = {} } = {})
   // A mount that DOES have a claim channel, so the invitation precondition is measured as a rule and
   // not merely as an absence. The reader/writer here are local on purpose: the end-to-end claim over
   // the service account is verify-ncb-integration.mjs section 14's job.
-  const localCodes = [{ id: 7, code: 'GATEWAY-OK-1', used: 0, registered_user_id: null }];
+  // One record per contract arm, so a failure in one cannot make another pass by accident. The two
+  // extra codes exist for the release-vs-hold arms below: each needs its OWN record to observe.
+  const localCodes = [
+    { id: 7, code: 'GATEWAY-OK-1', used: 0, registered_user_id: null },
+    { id: 8, code: 'GATEWAY-DECIDED-1', used: 0, registered_user_id: null },
+    { id: 9, code: 'GATEWAY-AMBIGUOUS-1', used: 0, registered_user_id: null },
+    // Two more, for the arms that need a reservation to have been TAKEN before the vendor answers.
+    // A code on the lever-only mount would never get that far: with no claim channel it refuses at
+    // 503 before dialling, so the assertion would be testing the refusal, not the code contract.
+    { id: 10, code: 'GATEWAY-ISSUES-1', used: 0, registered_user_id: null },
+    { id: 11, code: 'GATEWAY-UNKNOWN-1', used: 0, registered_user_id: null }
+  ];
   // A reservation store of the same shape the relay wires — including the UNIQUE refusal, because an
   // adapter that always says yes would make the contention arms measure nothing.
   const localReservations = (() => {
@@ -821,6 +844,14 @@ const probeCall = async (method, route, { token = '', body, headers = {} } = {})
       return { ok: true };
     },
     reservations: localReservations,
+    // Mirror production here: bridge.js wires a record reader, and WITHOUT it a release cannot check
+    // whether the record was spent, so `release()` refuses rather than guessing. Omitting it made this
+    // fixture look like a decided refusal failed to free its record, when the code was in fact failing
+    // closed correctly. The gate has to be as complete as the mount it claims to measure.
+    readRecord: async ({ recordId }) => {
+      const row = localCodes.find((r) => String(r.id) === String(recordId)) || null;
+      return { ok: true, row };
+    },
     emailSecret: 'gate-invitation-reservation-hmac-key-not-a-secret'
   });
   const withClaim = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_AUTH_RATE_MAX: '5000', NCB_GATEWAY_ALLOW_SIGN_UP: '1' }, invitationClaim: localClaim });
@@ -848,6 +879,88 @@ const probeCall = async (method, route, { token = '', body, headers = {} } = {})
     withCode.status === 200 && sentWithCode && sentWithCode.body?.invitationCode === undefined
     && Object.keys(sentWithCode.body ?? {}).sort().join(',') === 'email,name,password',
     JSON.stringify({ status: withCode.status, bodyKeys: Object.keys(sentWithCode?.body ?? {}) }));
+  /* ── 16j–16p: THE ERROR CONTRACT, AND THE ONE LINE IT MUST NEVER CROSS ─────
+     A validation failure means the vendor DECIDED, so it must free the record. An outage means it
+     never answered, so it must not. Putting a precise, translatable code on those responses cannot be
+     allowed to blur that line, which is why each arm asserts the code, the key, the absence of vendor
+     prose AND what happened to the reservation, in one check. */
+  const vendorSentinel = 'ZZ-VENDOR-SENTINEL-NEVER-ECHO-9f2c';
+  signinFault = {
+    status: 400,
+    // The nested shape better-auth answers for validation — the one a top-level-only read lost.
+    envelope: { error: { code: 'PASSWORD_TOO_SHORT', message: `${vendorSentinel} password too short` }, status: 'failed' }
+  };
+  const decided = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', {
+    body: { email: 'e@poc.invalid', password: 'pw-e-fixture', name: 'Decided', invitationCode: 'GATEWAY-DECIDED-1' }
+  });
+  signinFault = null;
+  const decidedReleased = (await localReservations.findIdForRecord(8)) === null;
+  check('16j. a nested validation refusal keeps its precise code, never echoes vendor prose, and frees the record it was holding',
+    decided.status === 400 && decided.json?.error === 'request_rejected' && decided.json?.code === 'PASSWORD_TOO_SHORT'
+    && decided.json?.messageKey === 'auth.password_too_short' && JSON.stringify(decided.json?.fields) === '["password"]'
+    && !JSON.stringify(decided.json).includes(vendorSentinel)
+    && decided.json?.invitationHeldForRecovery === undefined && decidedReleased,
+    JSON.stringify({ status: decided.status, body: decided.json, released: decidedReleased }));
+
+  // The dangerous neighbour: same route, same player, but the vendor never answered. A 500 may have
+  // created an account, so the reservation must survive and the client must be told to recover.
+  signinFault = { status: 500, envelope: { status: 'error', message: `${vendorSentinel} internal` } };
+  const ambiguous = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', {
+    body: { email: 'g@poc.invalid', password: 'pw-g-fixture', name: 'Ambiguous', invitationCode: 'GATEWAY-AMBIGUOUS-1' }
+  });
+  signinFault = null;
+  const ambiguousStillHeld = (await localReservations.findIdForRecord(9)) !== null;
+  check('16k. an ambiguous upstream fault is never dressed up as a validation error: 503, reservation held, and it says so',
+    ambiguous.status === 503 && ambiguous.json?.error === 'auth_service_unavailable'
+    && ambiguous.json?.code === 'AUTH_SERVICE_UNAVAILABLE' && ambiguous.json?.messageKey === 'auth.service_unavailable'
+    && ambiguous.json?.invitationHeldForRecovery === true && ambiguousStillHeld
+    && Number(localCodes.find((r) => r.id === 9).used) === 0 && !JSON.stringify(ambiguous.json).includes(vendorSentinel),
+    JSON.stringify({ status: ambiguous.status, body: ambiguous.json, held: ambiguousStillHeld }));
+
+  const nestedAuth = await callAt(PROBE_BASE, 'POST', '/ncb/auth/sign-in/email', {
+    body: { email: 'nobody@poc.invalid', password: 'wrong-on-purpose' }
+  });
+  check('16l. login refusals answer in the same shape as signup, so the frontend keeps one code path',
+    nestedAuth.status === 401 && nestedAuth.json?.error === 'invalid_credentials'
+    && nestedAuth.json?.code === 'USER_NOT_FOUND' && nestedAuth.json?.messageKey === 'auth.invalid_credentials'
+    && JSON.stringify(nestedAuth.json?.fields) === '["email"]' && Array.isArray(nestedAuth.json?.fields),
+    JSON.stringify({ status: nestedAuth.status, body: nestedAuth.json }));
+
+  signinFault = { status: 422, envelope: { error: { errors: [{ code: 'USERNAME_TAKEN', message: `${vendorSentinel} taken` }] } } };
+  const issues = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', {
+    body: { email: 'h@poc.invalid', password: 'pw-h-fixture', name: 'Taken', invitationCode: 'GATEWAY-ISSUES-1' }
+  });
+  signinFault = null;
+  check('16m. an issues-array body still yields a code — the other shape validation fails in',
+    issues.status === 400 && issues.json?.code === 'USERNAME_TAKEN'
+    && issues.json?.messageKey === 'auth.username_taken' && JSON.stringify(issues.json?.fields) === '["username"]'
+    && !JSON.stringify(issues.json).includes(vendorSentinel),
+    JSON.stringify({ status: issues.status, body: issues.json }));
+
+  const NEWCODE = 'SOMETHING_NCB_INVENTED_LAST_WEEK';
+  signinFault = { status: 400, envelope: { error: { code: NEWCODE, message: vendorSentinel } } };
+  const unknown = await callAt(CLAIM_BASE, 'POST', '/ncb/auth/sign-up/email', {
+    body: { email: 'i@poc.invalid', password: 'pw-i-fixture', name: 'Unknown', invitationCode: 'GATEWAY-UNKNOWN-1' }
+  });
+  signinFault = null;
+  // An unmapped code must never be dropped: relaying it verbatim is what lets the frontend special-case
+  // it before this repository ships anything. Only the key may be generic.
+  check('16n. an unmapped vendor code is relayed verbatim with a generic key — never a null code',
+    unknown.status === 400 && unknown.json?.code === NEWCODE
+    && unknown.json?.messageKey === 'auth.request_rejected' && unknown.json?.error === 'request_rejected'
+    && JSON.stringify(unknown.json?.fields) === '[]' && !JSON.stringify(unknown.json).includes(vendorSentinel),
+    JSON.stringify({ status: unknown.status, body: unknown.json }));
+
+  check('16o. a refusal with no vendor code at all still carries a code and a key, so nothing branches on null',
+    noCode.status === 403 && noCode.json?.code === 'INVITATION_REQUIRED'
+    && noCode.json?.messageKey === 'auth.invitation_required' && Array.isArray(noCode.json?.fields),
+    JSON.stringify(noCode.json));
+  check('16p. exhaustion, a store fault and a closed lever are three different answers, with three codes',
+    reused.status === 409 && reused.json?.code === 'INVITATION_EXHAUSTED'
+    && reused.json?.messageKey === 'auth.invitation_exhausted'
+    && opened.json?.code === 'INVITATION_CLAIM_UNAVAILABLE' && opened.json?.messageKey === 'auth.registration_unavailable'
+    && closed.json?.code === 'REGISTRATION_CLOSED' && closed.json?.messageKey === 'auth.registration_closed',
+    JSON.stringify({ reused: reused.json?.code, opened: opened.json?.code, closed: closed.json?.code }));
   await new Promise((r) => claimServer.close(r));
   const truthy = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_ALLOW_SIGN_UP: 'true' } });
   const loose = bridge.buildNcbGateway({ env: { ...process.env, NCB_GATEWAY_ALLOW_SIGN_UP: '0' } });
@@ -902,6 +1015,92 @@ await new Promise((r) => probeServer.close(r));
 
 await new Promise((r) => server.close(r));
 await new Promise((r) => fake.close(r));
+
+/* ── 17. THE CONTRACT AS DATA ───────────────────────────────────────────────
+   The arms above prove behaviour over HTTP. These prove the TABLES, because a contract that only
+   exists in responses is a contract someone can quietly break by editing one row. A gate that
+   re-typed these values would pass while the shipped ones drifted, so they are read from the module.
+*/
+{
+  const g = require('./ncb/gateway.js');
+  const codeRows = Object.entries(g.AUTH_ERROR_CONTRACT);
+  const orphanBuckets = codeRows.filter(([, row]) => !Object.prototype.hasOwnProperty.call(g.AUTH_BUCKET_CONTRACT, row.bucket))
+    .map(([code]) => code);
+  check('17a. every vendor code maps to a bucket the gateway already knows, so no recognised code can answer without a messageKey',
+    codeRows.length >= 12 && orphanBuckets.length === 0, orphanBuckets.join(','));
+
+  // The invariant that keeps the error surface from quietly swallowing a shape: any code that is not
+  // token-shaped is not a code, and prose must never become one.
+  check('17b. a code is a token, never prose: free text, over-long and empty values all yield null',
+    g.extractUpstreamAuthCode({ message: 'Password must contain at least 8 characters, got "hunter2@corp.example"' }) === null
+    && g.extractUpstreamAuthCode({ error: { message: 'x'.repeat(300) } }) === null
+    && g.extractUpstreamAuthCode({ code: 'TOO_LONG_' + 'Z'.repeat(48) }) === null
+    && g.extractUpstreamAuthCode({ code: '' }) === null
+    && g.extractUpstreamAuthCode({ code: 'has spaces and $yms' }) === null
+    && g.extractUpstreamAuthCode(null) === null && g.extractUpstreamAuthCode(undefined) === null,
+    'shape guard');
+
+  // Precedence: the flat envelope wins. Not cosmetic — if the nested value won, a vendor that puts a
+  // generic code on top and a specific one inside would have the specific one relayed, and the two
+  // families are not the same claim.
+  check('17c. envelope precedence is fixed: the top-level code wins over a nested one',
+    g.extractUpstreamAuthCode({ code: 'EMAIL_ALREADY_EXISTS', error: { code: 'USER_ALREADY_EXISTS' } }) === 'EMAIL_ALREADY_EXISTS'
+    && g.extractUpstreamAuthCode({ error: { code: 'USER_ALREADY_EXISTS' }, data: { code: 'NOPE_NOPE' } }) === 'USER_ALREADY_EXISTS',
+    g.extractUpstreamAuthCode({ code: 'EMAIL_ALREADY_EXISTS', error: { code: 'USER_ALREADY_EXISTS' } }));
+
+  // The coupling that matters most: a code may sharpen a message, it may never move the line between
+  // "release the record" and "hold the record". That line is decided by HTTP status and nothing else,
+  // so the answer must be identical whether or not the code is one this table has ever seen.
+  check('17d. recognising a code cannot change whether a reservation is held: the predicate reads status, never code',
+    g.signUpOutcomeIsAmbiguous(400) === false && g.signUpOutcomeIsAmbiguous(422) === false
+    && g.signUpOutcomeIsAmbiguous(500) === true && g.signUpOutcomeIsAmbiguous(0) === true
+    // The code table deliberately carries no status at all, which is the strongest form of this
+    // guarantee: there is no field to read. Asserting its absence is what stops someone adding one.
+    && codeRows.every(([, row]) => row.status === undefined)
+    && Object.values(g.AUTH_BUCKET_CONTRACT).every((r) => r.status === undefined)
+    && g.authErrorFields('PASSWORD_TOO_SHORT', { status: 400, error: 'request_rejected' }).status === 400
+    && g.authErrorFields('EMAIL_NOT_VERIFIED', { status: 502, error: 'upstream_forbidden' }).status === 502
+    && g.authErrorFields('TOO_MANY_REQUESTS', { status: 429, error: 'upstream_rate_limited' }).status === 429
+    && g.authErrorFields('NOT_IN_ANY_TABLE', { status: 400, error: 'request_rejected' }).status === 400,
+    'status is never taken from the code table');
+
+  // Two spellings of one outcome is normal (`code_required` and `invitation_required`); two ANSWERS
+  // for one code is a contract break, because the frontend switches on the code and would get a
+  // different status or key depending on which internal token the claim happened to return.
+  const invitationRows = Object.values(g.INVITATION_REFUSAL_CONTRACT);
+  const invitationCodes = invitationRows.map((r) => r.code);
+  const aliased = [...new Set(invitationCodes.filter((c, i) => invitationCodes.indexOf(c) !== i))];
+  const aliasDivergence = aliased.filter((c) => {
+    const answers = new Set(invitationRows.filter((r) => r.code === c).map((r) => `${r.status}|${r.messageKey}`));
+    return answers.size !== 1;
+  });
+  check('17e. one code, one answer: aliased outcomes agree exactly, reservation codes are all INVITATION_* and token-shaped',
+    aliased.join(',') === 'INVITATION_REQUIRED' && aliasDivergence.length === 0
+    && [...new Set(invitationCodes)].every((c) => c.startsWith('INVITATION_') && g.CODE_SHAPE.test(c))
+    && codeRows.every(([c]) => g.CODE_SHAPE.test(c)) && invitationRows.length >= 12,
+    JSON.stringify({ aliased, diverged: aliasDivergence }));
+
+  // Two outcomes that read alike to a player and must not share an answer: the code was wrong, versus
+  // the pool ran out.
+  check('17f. an unknown invitation and an exhausted one are different answers at different statuses',
+    g.INVITATION_REFUSAL_CONTRACT.code_not_found.status === 403
+    && g.INVITATION_REFUSAL_CONTRACT.code_not_found.code === 'INVITATION_NOT_FOUND'
+    && g.INVITATION_REFUSAL_CONTRACT.invitation_exhausted.status === 409
+    && g.INVITATION_REFUSAL_CONTRACT.invitation_exhausted.code === 'INVITATION_EXHAUSTED'
+    && g.INVITATION_REFUSAL_CONTRACT.code_not_found.messageKey !== g.INVITATION_REFUSAL_CONTRACT.invitation_exhausted.messageKey,
+    JSON.stringify({ nf: g.INVITATION_REFUSAL_CONTRACT.code_not_found, ex: g.INVITATION_REFUSAL_CONTRACT.invitation_exhausted }));
+
+  // The direction of last resort. Every refusal this table can name is a 403, a 409 or a 503 — never a
+  // 2xx and never a 401, because a 401 here would read to the app as "your session is bad" and sign a
+  // player out over an invitation problem.
+  check('17g. no reservation refusal is ever a 2xx or a 401, and an unmapped outcome answers as a deployment fault',
+    invitationRows.every((r) => [403, 409, 503].includes(r.status))
+    && invitationRows.every((r => typeof r.status === 'number' && typeof r.messageKey === 'string'))
+    && invitationRows.filter((r) => r.status >= 400 && r.status < 500 && r.status !== 403 && r.status !== 409).length === 0
+    && g.AUTH_BUCKET_CONTRACT[g.FALLBACK_BUCKET.code] === undefined
+    && g.FALLBACK_BUCKET.messageKey === 'auth.request_failed',
+    JSON.stringify({ statuses: [...new Set(invitationRows.map((r) => r.status))].sort(), fallback: g.FALLBACK_BUCKET }));
+}
 
 const failed = results.filter((r) => !r.pass);
 for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? `   [${r.detail}]` : ''}`);

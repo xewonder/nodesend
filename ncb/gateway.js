@@ -211,6 +211,178 @@ function signUpOutcomeIsAmbiguous(httpStatus) {
   if (status === 408 || status === 502 || status === 503 || status === 504) return true;
   return status >= 500;                                // any other server fault may have created it
 }
+
+/* ── THE AUTHENTICATION ERROR CONTRACT ──────────────────────────────────────
+   One shape for every refusal this gateway relays: an HTTP status, a stable
+   machine-readable `code`, and a `messageKey` the frontend translates. Never a
+   vendor sentence.
+
+   Why a second field set rather than a better `error`. `error` is a BUCKET and it
+   is already load-bearing: `invalid_credentials`, `request_rejected`,
+   `upstream_forbidden`, `upstream_rate_limited` and `invalid_session` are what
+   clients branch on today, and renaming one to make it more precise would move the
+   frontend's behaviour for a reason it cannot see. So the bucket stays exactly as
+   it is, and the precision lives in `code`, which is the vendor's own token
+   (`PASSWORD_TOO_SHORT`, `EMAIL_ALREADY_EXISTS`) plus the reservation vocabulary
+   this relay owns.
+
+   The bug that prompted this: `code` was read from the top level only
+   (`json?.code`), while the success path in this same file already accepts both
+   `{ user }` and `{ data: { user } }`. An error nested as `{ error: { code } }` —
+   which is what better-auth answers for validation failures — therefore produced
+   `code: null` and left the client holding nothing but `request_rejected`. A
+   password that was too short and a request that was malformed looked identical,
+   which is a translation problem, not a display problem. Reading the same two
+   families symmetrically is what closes it.
+
+   Nothing in this contract copies vendor prose. `message` fields are read for a
+   code and then dropped: an upstream validation message can quote the value it
+   rejected, which for sign-up is a password or an email address, and those must
+   never ride a response body, a log line, or the error contract.
+*/
+const CODE_SHAPE = /^[A-Z0-9_-]{2,48}$/;
+// Fixed order, first token-shaped match wins. The paths are the two envelope families
+// (top-level and nested under `error`) plus the array-of-issues shape better-auth uses when several
+// fields fail at once. A value that is not token-shaped is not a code, and is never relayed.
+const UPSTREAM_CODE_PATHS = [
+  (j) => j?.code,
+  (j) => j?.error?.code,
+  (j) => j?.data?.code,
+  (j) => j?.data?.error?.code,
+  (j) => j?.error?.errors?.[0]?.code,
+  (j) => j?.errors?.[0]?.code,
+  (j) => j?.error?.errors?.[0]?.issue?.code,
+  (j) => j?.issues?.[0]?.code
+];
+
+function extractUpstreamAuthCode(body) {
+  for (const pick of UPSTREAM_CODE_PATHS) {
+    let value;
+    try { value = pick(body); } catch { continue; }
+    const text = String(value ?? '').trim();
+    if (CODE_SHAPE.test(text)) return text;
+  }
+  return null;
+}
+
+/**
+ * What the frontend can say to a player, per code the vendor is known to answer here.
+ * Provenance is deliberately uneven and is named per row, because a guess dressed up as a measured
+ * code is how this table would become fiction:
+ *   live    — observed from the deployed vendor through this relay
+ *   owner   — reported by the owner from a real attempt, shape not captured here
+ *   modelled— how this repository's own gates answer the same failure today
+ * An unknown-but-token-shaped code is STILL relayed unchanged; only `messageKey` falls back. So a new
+ * vendor code reaches the frontend intact the day NCB starts sending it, without a deploy.
+ */
+// A row carries NO status. That is not an oversight and the gate now asserts it: status is what
+// decides whether an invitation reservation is held or released, and a table that offered a status
+// would be read within one careless edit.
+const AUTH_ERROR_CONTRACT = Object.freeze({
+  INVALID_EMAIL_OR_PASSWORD: { bucket: 'invalid_credentials', messageKey: 'auth.invalid_credentials', fields: ['email', 'password'], provenance: 'live' },
+  USER_NOT_FOUND: { bucket: 'invalid_credentials', messageKey: 'auth.invalid_credentials', fields: ['email'], provenance: 'modelled' },
+  SESSION_REVOKED: { bucket: 'invalid_session', messageKey: 'auth.session_expired', fields: [], provenance: 'modelled' },
+  PASSWORD_TOO_SHORT: { bucket: 'request_rejected', messageKey: 'auth.password_too_short', fields: ['password'], provenance: 'owner' },
+  PASSWORD_TOO_LONG: { bucket: 'request_rejected', messageKey: 'auth.password_too_long', fields: ['password'], provenance: 'modelled' },
+  PASSWORD_COMPROMISED: { bucket: 'request_rejected', messageKey: 'auth.password_compromised', fields: ['password'], provenance: 'modelled' },
+  EMAIL_ALREADY_EXISTS: { bucket: 'request_rejected', messageKey: 'auth.email_taken', fields: ['email'], provenance: 'owner' },
+  USER_ALREADY_EXISTS: { bucket: 'request_rejected', messageKey: 'auth.email_taken', fields: ['email'], provenance: 'modelled' },
+  USERNAME_ALREADY_EXISTS: { bucket: 'request_rejected', messageKey: 'auth.username_taken', fields: ['username'], provenance: 'modelled' },
+  USERNAME_TAKEN: { bucket: 'request_rejected', messageKey: 'auth.username_taken', fields: ['username'], provenance: 'modelled' },
+  INVALID_NAME: { bucket: 'request_rejected', messageKey: 'auth.name_invalid', fields: ['name'], provenance: 'modelled' },
+  INVALID_EMAIL: { bucket: 'request_rejected', messageKey: 'auth.email_invalid', fields: ['email'], provenance: 'modelled' },
+  EMAIL_NOT_VERIFIED: { bucket: 'upstream_forbidden', messageKey: 'auth.email_unverified', fields: ['email'], provenance: 'modelled' },
+  TOO_MANY_REQUESTS: { bucket: 'upstream_rate_limited', messageKey: 'auth.rate_limited', fields: [], provenance: 'modelled' }
+});
+const UNKNOWN_CODE_MESSAGE_KEY = 'auth.request_rejected';
+const MAX_CONTRACT_FIELDS = 4;
+
+/* The bucket vocabulary this gateway has always answered with, mapped to a stable code and a
+   translation key. It is keyed by `error` rather than by status because two different refusals can
+   share a status and must not share a message: 401 is `invalid_credentials` for a wrong password and
+   `invalid_session` for a handle this relay cannot open, and telling a player to retype their password
+   when their session simply expired is precisely the confusion this contract exists to end.
+
+   Every row preserves the bucket string, the HTTP status and the extra keys already in circulation,
+   so an old client sees exactly what it saw before plus three fields it can ignore. */
+const AUTH_BUCKET_CONTRACT = Object.freeze({
+  origin_not_allowed: { code: 'ORIGIN_NOT_ALLOWED', messageKey: 'auth.origin_not_allowed' },
+  too_many_attempts: { code: 'TOO_MANY_ATTEMPTS', messageKey: 'auth.rate_limited' },
+  sign_up_unavailable: { code: 'REGISTRATION_CLOSED', messageKey: 'auth.registration_closed' },
+  gateway_unconfigured: { code: 'GATEWAY_UNCONFIGURED', messageKey: 'auth.gateway_misconfigured' },
+  gateway_misconfigured: { code: 'GATEWAY_MISCONFIGURED', messageKey: 'auth.gateway_misconfigured' },
+  invalid_session: { code: 'INVALID_SESSION', messageKey: 'auth.session_invalid' },
+  invalid_credentials: { code: 'INVALID_CREDENTIALS', messageKey: 'auth.invalid_credentials' },
+  auth_service_unavailable: { code: 'AUTH_SERVICE_UNAVAILABLE', messageKey: 'auth.service_unavailable' },
+  storage_unavailable: { code: 'STORAGE_UNAVAILABLE', messageKey: 'auth.service_unavailable' },
+  upstream_forbidden: { code: 'UPSTREAM_FORBIDDEN', messageKey: 'auth.upstream_refused' },
+  upstream_rejected: { code: 'UPSTREAM_REJECTED', messageKey: 'auth.upstream_refused' },
+  upstream_rate_limited: { code: 'UPSTREAM_RATE_LIMITED', messageKey: 'auth.rate_limited' },
+  request_rejected: { code: 'REQUEST_REJECTED', messageKey: 'auth.request_rejected' },
+  invitation_claim_unavailable: { code: 'INVITATION_CLAIM_UNAVAILABLE', messageKey: 'auth.registration_unavailable' },
+  invitation_required: { code: 'INVITATION_REQUIRED', messageKey: 'auth.invitation_required' }
+});
+const FALLBACK_BUCKET = Object.freeze({ code: 'REQUEST_FAILED', messageKey: 'auth.request_failed' });
+
+/* The reservation vocabulary this relay owns, in the same shape as the vendor's codes, so the
+   frontend has exactly one field to switch on for every refusal. `error` keeps the string clients
+   already branch on; `status` is unchanged from the existing mapping. The distinction that matters
+   here is the one the task set: an invalid code, an exhausted pool and a deployment fault are three
+   different answers to a player and must never arrive as the same generic body — while none of them
+   may carry a record id, a reservation id or the invitation value itself, because the anonymous
+   lookup is an existence oracle and this response is readable by anyone who can reach it. */
+const INVITATION_REFUSAL_CONTRACT = Object.freeze({
+  code_required: { code: 'INVITATION_REQUIRED', status: 403, messageKey: 'auth.invitation_required', fields: ['invitationCode'] },
+  invitation_required: { code: 'INVITATION_REQUIRED', status: 403, messageKey: 'auth.invitation_required', fields: ['invitationCode'] },
+  code_not_found: { code: 'INVITATION_NOT_FOUND', status: 403, messageKey: 'auth.invitation_not_found', fields: ['invitationCode'] },
+  invitation_exhausted: { code: 'INVITATION_EXHAUSTED', status: 409, messageKey: 'auth.invitation_exhausted', fields: ['invitationCode'] },
+  already_claimed: { code: 'INVITATION_ALREADY_CLAIMED', status: 409, messageKey: 'auth.invitation_claimed', fields: ['invitationCode'] },
+  claim_conflict: { code: 'INVITATION_CLAIM_CONFLICT', status: 409, messageKey: 'auth.invitation_conflict', fields: [] },
+  claim_unavailable: { code: 'INVITATION_CLAIM_UNAVAILABLE', status: 503, messageKey: 'auth.registration_unavailable', fields: [] },
+  reservation_store_unavailable: { code: 'INVITATION_STORE_UNAVAILABLE', status: 503, messageKey: 'auth.invitation_store_unavailable', fields: [] },
+  invitation_read_failed: { code: 'INVITATION_READ_FAILED', status: 503, messageKey: 'auth.invitation_lookup_failed', fields: [] },
+  invitation_pool_unpaged: { code: 'INVITATION_POOL_UNPAGED', status: 503, messageKey: 'auth.invitation_lookup_failed', fields: [] },
+  claim_write_failed: { code: 'INVITATION_WRITE_FAILED', status: 503, messageKey: 'auth.invitation_write_failed', fields: [] },
+  claim_unconfirmed: { code: 'INVITATION_WRITE_UNCONFIRMED', status: 503, messageKey: 'auth.invitation_write_failed', fields: [] }
+});
+
+/**
+ * The refusal body for a claim outcome. An outcome this table has never seen answers as a deployment
+ * fault at 503, which is the direction that cannot leak anything and cannot tell a player their valid
+ * code was wrong. It is deliberately NOT mapped to 4xx: an unknown outcome means the relay does not
+ * know whether an account or a reservation exists, and guessing wrong there costs an invitation.
+ */
+function invitationRefusal(outcome) {
+  const known = INVITATION_REFUSAL_CONTRACT[String(outcome ?? '')];
+  if (known) return { error: String(outcome), code: known.code, status: known.status, messageKey: known.messageKey, fields: known.fields };
+  return {
+    error: String(outcome ?? 'claim_unavailable'),
+    code: 'INVITATION_CLAIM_UNAVAILABLE', status: 503,
+    messageKey: 'auth.invitation_lookup_failed', fields: []
+  };
+}
+
+/**
+ * The relayed error fields for one upstream answer.
+ *
+ * The HTTP `status` ALWAYS comes from `authUpstreamStatus` and never from the code table. That is
+ * deliberate: the 4xx-versus-5xx line is what decides whether an invitation reservation is held or
+ * released, so letting a newly-seen vendor code move a status would couple a translation change to a
+ * single-use guarantee. Codes may name a failure more precisely; they may not reschedule it.
+ *
+ * The `bucket` in `error` is the compatibility surface old clients branch on. Every row of the table
+ * repeats the bucket the status-only mapping already produces for that status, so recognising a code
+ * sharpens `code`/`messageKey`/`fields` and moves nothing else.
+ */
+function authErrorFields(code, mapped) {
+  const known = code ? AUTH_ERROR_CONTRACT[code] : null;
+  return {
+    error: known ? known.bucket : mapped.error,
+    messageKey: known ? known.messageKey : (code ? UNKNOWN_CODE_MESSAGE_KEY : null),
+    fields: known ? known.fields.slice(0, MAX_CONTRACT_FIELDS) : [],
+    status: mapped.status
+  };
+}
 // Tighter than sign-in on purpose: this endpoint is anonymous, answers before any credential exists,
 // and is an existence oracle over invitation codes. The route it replaces (`/auth/validate-invitation`)
 // is limited the same way, so this is the same posture rather than a new one.
@@ -354,6 +526,33 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     if (!res.headersSent) res.status(status).json(body);
   }
 
+  /* Every authentication refusal is composed here, so the contract cannot drift one call site at a
+     time. A caller names the bucket it has always named in `error`; this fills the stable `code` and
+     the translatable `messageKey` that bucket has, and no auth response can leave this function
+     without both. `error`, the status, and every extra key a site already sent (`reason`, `detail`,
+     `upstream_status`, `invitationHeldForRecovery`) come out exactly as they do today — the new fields
+     sit beside them, which is what keeps an old client on the branch it already takes.
+
+     `code` is UPPER_SNAKE because that is the vendor's own convention, and mixing two vocabularies in
+     one field is how a frontend ends up switching on both. `messageKey` is dotted-lowercase because it
+     is a translation key, never a value to compare against vendor text.
+
+     The fallback is the part that makes this a contract: an `error` string this table has never seen
+     still gets a code and a key, so the frontend can treat `messageKey` as always present rather than
+     null-guarding it into meaninglessness.
+  */
+  function authRefusal(res, status, error, extra = {}) {
+    const row = AUTH_BUCKET_CONTRACT[error] || FALLBACK_BUCKET;
+    const { code, messageKey, fields, ...rest } = extra;
+    return reply(res, status, {
+      status: 'error', data: null, error,
+      code: code ?? row.code,
+      messageKey: messageKey ?? row.messageKey,
+      fields: fields ?? row.fields ?? [],
+      ...rest
+    });
+  }
+
   // Origin control lives in ONE place, and it is the app-wide `cors()` call in bridge.js — see
   // `corsOrigin` below. Doing it here instead would have been a lie: the relay's cors() runs first,
   // reflects whatever Origin it is given, and answers the preflight before this router is ever
@@ -387,9 +586,9 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     // state this route exists to end: an account gets created and nothing links it to a code.
     if (!invitationClaim) {
       event('ncb_gateway_registration_unclaimed', { requestId });
-      return reply(res, 503, {
-        status: 'error', data: null, error: 'invitation_claim_unavailable',
-        detail: 'registration cannot be enabled until the server-side invitation claim is wired'
+      return authRefusal(res, 503, 'invitation_claim_unavailable', {
+        detail: 'registration cannot be enabled until the server-side invitation claim is wired',
+        fields: []
       });
     }
     // The code and the address are read here and then removed from the body: neither is a vendor
@@ -401,15 +600,25 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     delete req.body.invitationCode;
     if (!code) {
       event('ncb_gateway_registration_without_invitation', { requestId });
-      return reply(res, 403, { status: 'error', data: null, error: 'invitation_required' });
+      const missing = invitationRefusal('invitation_required');
+      return authRefusal(res, missing.status, 'invitation_required', {
+        code: missing.code, messageKey: missing.messageKey, fields: missing.fields
+      });
     }
     const begun = await invitationClaim.begin({ code, email });
     if (!begun.ok) {
-      const status = begun.outcome === 'invitation_exhausted' || begun.outcome === 'already_claimed' ? 409
-        : begun.outcome === 'code_not_found' || begun.outcome === 'code_required' ? 403
-          : 503;   // store unavailable / read failed / claim unavailable are deployment faults, never the caller's
-      event('ncb_gateway_registration_invitation_refused', { outcome: begun.outcome, status, requestId });
-      return reply(res, status, { status: 'error', data: null, error: begun.outcome, detail: begun.reason || null });
+      // The ternary this replaces decided 409 / 403 / 503 from the outcome; the table decides the same
+      // three numbers, and adds the code and key. Nothing here may echo the submitted invitation value
+      // — it is a live code, and this route answers before any credential exists.
+      const refusal = invitationRefusal(begun.outcome);
+      event('ncb_gateway_registration_invitation_refused', { outcome: begun.outcome, status: refusal.status, requestId });
+      // `detail` carries only the relay's own reason token (never a vendor body, never a record id,
+      // never the invitation value): this route answers before any credential exists, so everything it
+      // says is readable by an anonymous caller.
+      return authRefusal(res, refusal.status, refusal.error, {
+        code: refusal.code, messageKey: refusal.messageKey, fields: refusal.fields,
+        detail: begun.reason || null
+      });
     }
     req.invitationReservation = begun;
     // The release rule, stated because the alternative strands records: a reservation taken for a
@@ -450,7 +659,7 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       if (retryAfter > 0) {
         res.setHeader('Retry-After', String(retryAfter));
         event('ncb_gateway_rate_limited', { verb: route.verb, requestId });
-        return reply(res, 429, { status: 'error', data: null, error: 'too_many_attempts' });
+        return authRefusal(res, 429, 'too_many_attempts');
       }
 
       const needed = route.verb !== 'sign-in/email' && route.verb !== 'sign-up/email'
@@ -472,9 +681,11 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       // created by a request that reaches this process.
       if (route.verb === 'sign-up/email' && !signUpAllowed) {
         event('ncb_gateway_sign_up_refused', { verb: route.verb, requestId });
-        return reply(res, 403, {
-          status: 'error', data: null, error: 'sign_up_unavailable',
-          detail: 'registration is temporarily closed on this deployment; signing in still works'
+        // `fields: []` on purpose. This is a deployment state, not a form error, and highlighting an
+        // input would tell the player the fix is in something they typed.
+        return authRefusal(res, 403, 'sign_up_unavailable', {
+          detail: 'registration is temporarily closed on this deployment; signing in still works',
+          fields: []
         });
       }
       // Only the fields this verb is defined to take reach the vendor; the count of what was dropped is
@@ -487,14 +698,17 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         const resolved = resolveHandle(req);
         if (resolved.kind === 'misconfigured') {
           event('ncb_gateway_seal_unconfigured', { verb: route.verb, requestId });
-          return reply(res, 503, { status: 'error', data: null, error: 'gateway_unconfigured' });
+          return authRefusal(res, 503, 'gateway_unconfigured');
         }
         if (resolved.kind !== 'ok') {
           // `not_sealed` is the honest answer for a stale NCB body token left in localStorage from
           // the old proxy: it is not a session here, and it is renewed the moment the app signs in
           // again. It is 401 because the credential really is unusable — and only then.
           event('ncb_gateway_unauthenticated', { reason: resolved.kind, verb: route.verb, requestId });
-          return reply(res, 401, { status: 'error', data: null, error: 'invalid_session', reason: resolved.kind });
+          // `reason` stays: it is the transport's own token (missing / not_sealed / expired / invalid /
+          // wrong_instance), never a vendor sentence, and it is what lets the app distinguish "sign in
+          // again" from "this handle is forged" without a second round trip.
+          return authRefusal(res, 401, 'invalid_session', { reason: resolved.kind, fields: [] });
         }
         authCall = await ncb.auth(route.verb, {
           method: route.method === 'get' ? 'GET' : 'POST',
@@ -510,8 +724,10 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         event('ncb_gateway_upstream_unavailable', { verb: route.verb, kind: authCall.kind, requestId });
         const held = route.verb === 'sign-up/email' && signUpOutcomeIsAmbiguous(authCall.httpStatus);
         if (held) req.invitationAccountOutcomeUnknown = true;
-        return reply(res, 503, {
-          status: 'error', data: null, error: 'auth_service_unavailable',
+        return authRefusal(res, 503, 'auth_service_unavailable', {
+          // No fields: nothing the player typed is in question, and highlighting an input here is how a
+          // vendor outage becomes a user blaming their own password.
+          fields: [],
           // Said to the client because the alternative is worse than it looks: a browser that treats a
           // timeout as a plain failure retries with ANOTHER code, and each retry quietly takes a
           // record out of the pool. This says the attempt is unfinished against THIS code and that the
@@ -521,7 +737,7 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       }
       if (authCall.kind === 'secret_key_rejected') {
         event('ncb_gateway_secret_rejected', { verb: route.verb, requestId });
-        return reply(res, 502, { status: 'error', data: null, error: 'gateway_misconfigured' });
+        return authRefusal(res, 502, 'gateway_misconfigured');
       }
       if (authCall.kind !== 'ok') {
         /* THE UPSTREAM ANSWER IS A FACT WITH THREE KINDS, and collapsing them was the original bug.
@@ -537,9 +753,13 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
            gateway it knew nothing about. The vendor's own error CODE is carried out — whitelisted to a
            token-shaped string, never a free-text body — because on the next single attempt it is the
            difference between "fix the headers" and "this account is not verified". */
-        const upstreamCode = String(authCall.json?.code ?? '').trim();
-        const safeCode = /^[A-Z0-9_-]{2,48}$/.test(upstreamCode) ? upstreamCode : null;
+        // Read the code from every envelope the vendor is known to use, not just the top level.
+        // No vendor sentence is ever copied forward from here: only the token, and only if it is a
+        // token. A validation message can quote the value it rejected, and on sign-up that value is a
+        // password or an address.
+        const safeCode = extractUpstreamAuthCode(authCall.json);
         const mapped = authUpstreamStatus(authCall.httpStatus);
+        const contract = authErrorFields(safeCode, mapped);
         if (mapped.retryAfterSeconds) res.setHeader('Retry-After', String(mapped.retryAfterSeconds));
         event('ncb_gateway_rejected', {
           verb: route.verb, status: authCall.httpStatus, mapped: mapped.status, code: safeCode, requestId
@@ -551,9 +771,19 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         // account exists and the record genuinely goes back in the pool.
         const held = route.verb === 'sign-up/email' && signUpOutcomeIsAmbiguous(authCall.httpStatus);
         if (held) req.invitationAccountOutcomeUnknown = true;
-        return reply(res, mapped.status, {
-          status: 'error', data: null, error: mapped.error, code: safeCode,
-          upstream_status: authCall.httpStatus, httpStatus: mapped.status,
+        // `error` keeps answering to the same bucket it always did, so an existing client that has
+        // never heard of `messageKey` still takes the same branch. The precise code and the
+        // translatable key sit beside it. Nothing here copies vendor text, record ids, reservation ids
+        // or the invitation value itself into the response: `upstream_status` is a number, and the
+        // reservation is addressed nowhere in this body at all.
+        // When the vendor sent no recognisable code, `code` falls back to the bucket's own token
+        // rather than to null — a null here is exactly what left the frontend inventing its own
+        // message. `messageKey` is never null on this path.
+        return authRefusal(res, contract.status, contract.error, {
+          code: safeCode || AUTH_BUCKET_CONTRACT[contract.error]?.code || FALLBACK_BUCKET.code,
+          messageKey: contract.messageKey || FALLBACK_BUCKET.messageKey,
+          fields: contract.fields,
+          upstream_status: authCall.httpStatus, httpStatus: contract.status,
           ...(held ? { invitationHeldForRecovery: true } : {})
         });
       }
@@ -574,7 +804,10 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
         // This rule belongs to get-session ONLY. Sign-out and change-password legitimately answer
         // without a user object, and demanding one there turns a successful sign-out into a 401.
         event('ncb_gateway_upstream_no_session', { verb: route.verb, requestId });
-        return reply(res, 401, { status: 'error', data: null, error: 'invalid_session', reason: 'upstream_no_session' });
+        // `upstream_no_session` names a DIFFERENT fact than a bad handle: the authority answered and
+        // said nobody is signed in. Collapsing the two is what signed players out during an outage, so
+        // the reason stays distinguishable in the body and the code stays the session code.
+        return authRefusal(res, 401, 'invalid_session', { reason: 'upstream_no_session', fields: [] });
       }
 
       if (route.mints && user?.id && authCall.cookiePair) {
@@ -843,4 +1076,10 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
   };
 }
 
-module.exports = { buildNcbGateway, createCorsResolver, authUpstreamStatus, signUpOutcomeIsAmbiguous, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY };
+// The error contract is exported as data, not as a description of it: a gate that re-typed these
+// tables would pass while the shipped contract drifted.
+module.exports = {
+  buildNcbGateway, createCorsResolver, authUpstreamStatus, signUpOutcomeIsAmbiguous, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY,
+  extractUpstreamAuthCode, authErrorFields, AUTH_ERROR_CONTRACT, AUTH_BUCKET_CONTRACT, INVITATION_REFUSAL_CONTRACT,
+  FALLBACK_BUCKET, UNKNOWN_CODE_MESSAGE_KEY, CODE_SHAPE
+};

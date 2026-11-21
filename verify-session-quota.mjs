@@ -1579,7 +1579,10 @@ mod.resetInvitationRateBuckets();
 r = await INVITE({ code: 'INV-VALID' }); j = await readBody(r);
 ncb.fault = null;
 check('I-8 an unreachable store is 503, never a confident valid:false',
-  r.status === 503 && j.valid === undefined && j.status === 'invitation_service_unavailable',
+  r.status === 503 && j.valid === undefined && j.status === 'invitation_service_unavailable'
+  // The code is the point: a 503 with no code reads to a client the same as any other failure, and the
+  // player is told their valid invitation is wrong because the vendor was having a bad afternoon.
+  && j.code === 'INVITATION_READ_FAILED' && j.messageKey === 'auth.invitation_lookup_failed',
   JSON.stringify(j));
 // I-9 — the abuse control, measured rather than described.
 resetCodes([{ id: 4, user_id: CODE_ROW_USER, secret_key: CODE_SECRET, code: 'INV-VALID', used: 0 }]);
@@ -1597,9 +1600,12 @@ check('I-9 the anonymous route is throttled per address, then answers 429 with R
 mod.resetInvitationRateBuckets();
 const readsBeforeLocal = ncb.counts.publicRead || 0;
 r = await INVITE({ code: '' });
+const localBody = await readBody(r);
 check('I-9b a missing code is refused locally, before any storage call',
-  r.status === 400 && (ncb.counts.publicRead || 0) === readsBeforeLocal,
-  `status=${r.status} storage reads added=${(ncb.counts.publicRead || 0) - readsBeforeLocal}`);
+  r.status === 400 && (ncb.counts.publicRead || 0) === readsBeforeLocal
+  && localBody.code === 'INVITATION_CODE_INVALID' && localBody.messageKey === 'auth.invitation_invalid'
+  && localBody.valid === undefined,
+  `status=${r.status} storage reads added=${(ncb.counts.publicRead || 0) - readsBeforeLocal} body=${JSON.stringify(localBody)}`);
 r = await INVITE({ code: 'x'.repeat(400) });
 check('I-9c an over-long code is refused locally, so it cannot be used to spray the store',
   r.status === 400, String(r.status));
@@ -1645,14 +1651,18 @@ const codeWriteRequests = () => ncb.requests.filter((q) => q.pathname.startsWith
   const retryJson = await readBody(retry);
   check('I-11b a retry by the owning account is idempotent and honest: success, alreadyClaimed, recovered, and no second write',
     retry.status === 200 && retryJson.success === true && retryJson.alreadyClaimed === true && retryJson.recovered === true
-    && codeWriteRequests().length === before && String(row()?.registered_user_id) === '101',
+    && codeWriteRequests().length === before && String(row()?.registered_user_id) === '101'
+    // Same vocabulary as /ncb/auth/*, asserted here because this route is the one the app retries on.
+    && retryJson.code === 'INVITATION_ALREADY_CLAIMED' && retryJson.messageKey === 'auth.invitation_claimed'
+    && Array.isArray(retryJson.fields),
     JSON.stringify(retryJson));
 }
 r = await CONSUME('tok-b', { code: 'INV-FRESH', record_id: 5 }); j = await readBody(r);
 check('I-12 a second authenticated account recovers nothing and cannot reach the spent record even naming its id',
   r.status === 200 && j.success === false && j.reason === 'invitation_not_found'
   && String(ncb.rows.user_codes.find((x) => x.code === 'INV-FRESH')?.registered_user_id) === '101'
-  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1,
+  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1
+  && j.code === 'INVITATION_NOT_FOUND' && j.messageKey === 'auth.invitation_not_found',
   JSON.stringify(j));
 // …and the same refusal when the session itself carries no verified address, which is the case an
 // HMAC-of-email design would have silently waved through.
@@ -1667,14 +1677,36 @@ check('I-12 a second authenticated account recovers nothing and cannot reach the
   USERS['tok-c'].email = savedEmail;
   check('I-12n a session whose vendor answer names no address is refused recovery outright, never matched against the body',
     beganNoAddr.ok === true && noAddr.status === 409 && noAddrJson.error === 'invitation_recovery_identity_unverified'
-    && Number(ncb.rows.user_codes.find((x) => x.code === 'INV-NOADDR')?.used ?? 0) === 0,
+    && Number(ncb.rows.user_codes.find((x) => x.code === 'INV-NOADDR')?.used ?? 0) === 0
+    // A distinct code matters here specifically: "we could not prove who you are" must never be
+    // rendered as "that invitation code is wrong", which is the message a bare 409 invites.
+    && noAddrJson.code === 'INVITATION_RECOVERY_IDENTITY_UNVERIFIED'
+    && noAddrJson.messageKey === 'auth.recovery_identity_unverified',
     JSON.stringify({ began: beganNoAddr.ok, status: noAddr.status, body: noAddrJson }));
 }
 r = await CONSUME('tok-b', { code: 'INV-NEVER-EXISTED' }); j = await readBody(r);
 check('I-12b an unknown code is a declined consumption, not a write attempt',
   r.status === 200 && j.success === false && j.reason === 'invitation_not_found'
-  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1,
+  && ncb.requests.filter((q) => q.pathname.startsWith('/data/update/user_codes')).length === 1
+  && j.code === 'INVITATION_NOT_FOUND',
   JSON.stringify(j));
+// The recovery route must never answer with a raw claim outcome as its only signal. Whatever the
+// internal token, a caller gets a code and a key — and the two are not allowed to imply a status this
+// route did not choose (an unmapped outcome answers 503, never 4xx).
+{
+  // Read the vocabulary off the loaded relay rather than re-importing the gateway: a gate that pulls
+  // its own copy of the module would be asserting a second instance of the table, not the one the
+  // routes this arm just exercised are answering from.
+  const contract = (mod.default || mod).ncbInvitationRefusalContract;
+  const rows = Object.values(contract);
+  const everyOutcomeHasACode = rows.every((r) => typeof r.code === 'string' && typeof r.messageKey === 'string');
+  // 401 would read to the app as a session problem and sign a player out over an invitation one; a 2xx
+  // would report a refusal as a success. Neither is allowed for any outcome in the vocabulary.
+  const badStatuses = rows.filter((r) => r.status === 401 || r.status < 400 || r.status > 504).map((r) => r.code);
+  check('I-12c the recovery vocabulary is complete: every claim outcome has a code and a key, and none answers 401 or 2xx',
+    everyOutcomeHasACode && badStatuses.length === 0 && rows.length >= 12,
+    JSON.stringify({ unmapped: rows.filter((r) => !r.code || !r.messageKey).length, badStatuses }));
+}
 // The shipped default, measured at the unit the mode switch controls: no privileged writer means the
 // claim refuses outright instead of degrading into a best-effort read-then-write.
 //

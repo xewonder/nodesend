@@ -60,7 +60,7 @@ const crypto = require("crypto");
 // account client and the storage adapter can be read and tested without wading through the relay.
 // bridge.js contributes one thing this file cannot: its own session resolver.
 const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs");
-const { buildNcbGateway, createCorsResolver } = require("./ncb/gateway");
+const { buildNcbGateway, createCorsResolver, INVITATION_REFUSAL_CONTRACT } = require("./ncb/gateway");
 const { createInvitationClaim } = require("./ncb/invitationClaim");
 const { createInvitationReservations } = require("./ncb/invitationReservations");
 const { normalizeInvitationCode: sharedInvitationCode } = require("./ncb/invitationCode.js");
@@ -2179,26 +2179,58 @@ async function consumeInvitationDecision(req) {
     // No verified address to match on. Refusing is the only honest answer: falling back to the body
     // would be the impersonation this route exists to prevent.
     safeEvent("invitation_recovery_identity_unavailable", { requestId: req.nodeSendRequestId ?? null });
-    return { status: 409, body: { error: "invitation_recovery_identity_unverified" } };
+    // A code and key here too, because this is the one refusal that CANNOT be distinguished from
+    // "your code is invalid" by a client that only reads `error` — and they are opposite messages to a
+    // player: one says the code is wrong, the other says this deployment could not prove who they are.
+    return { status: 409, body: { error: "invitation_recovery_identity_unverified",
+      code: "INVITATION_RECOVERY_IDENTITY_UNVERIFIED", messageKey: "auth.recovery_identity_unverified", fields: [] } };
   }
   const outcome = await invitationClaim.recover({ email, userId: String(userId) });
+  // THE SAME CONTRACT AS /ncb/auth/*. This route is part of registration, so a frontend that has to
+  // learn two vocabularies — one for sign-up and one for the retry that finishes it — is a frontend
+  // that will special-case one of them wrong. The codes come from the gateway's own table rather than
+  // a copy here, because two lists of the same names drift apart by construction. `success` and
+  // `reason` are untouched: an existing caller keeps working, and a code and key are added beside them.
+  // Only code, messageKey and fields are picked. The table also carries the status a /ncb route would
+  // answer, and spreading it in here would put a `status` key in a body that has never had one — a
+  // field the caller could easily read as the HTTP status, which this route decides for itself.
+  const contractFor = (key) => {
+    const row = INVITATION_REFUSAL_CONTRACT[key];
+    return row
+      ? { code: row.code, messageKey: row.messageKey, fields: row.fields }
+      : { code: "INVITATION_CLAIM_UNAVAILABLE", messageKey: "auth.request_failed", fields: [] };
+  };
   if (outcome.ok) {
-    return { status: 200, body: { success: true, recovered: outcome.recovered === true, alreadyClaimed: outcome.outcome === "already_claimed" } };
+    const claimed = outcome.outcome === "already_claimed";
+    return { status: 200, body: {
+      success: true, recovered: outcome.recovered === true, alreadyClaimed: claimed,
+      code: claimed ? "INVITATION_ALREADY_CLAIMED" : "INVITATION_CLAIMED",
+      messageKey: claimed ? "auth.invitation_claimed" : "auth.invitation_claimed_now", fields: []
+    } };
   }
   switch (outcome.outcome) {
     case "code_not_found":
       // Nothing pending for this account. The plain registration path already covers a fresh code, so
       // this is a decline, not an outage — and it must not be reported as one.
-      return { status: 200, body: { success: false, reason: "invitation_not_found" } };
+      return { status: 200, body: { success: false, reason: "invitation_not_found",
+        code: "INVITATION_NOT_FOUND", messageKey: "auth.invitation_not_found", fields: [] } };
     case "claim_unavailable":
-      return { status: 503, body: { error: "invitation_claim_unavailable" } };
+      return { status: 503, body: { error: "invitation_claim_unavailable", ...contractFor("claim_unavailable") } };
     case "reservation_store_unavailable":
     case "invitation_read_failed":
-      return { status: 503, body: { error: outcome.outcome } };
+    case "invitation_pool_unpaged":
+      return { status: 503, body: { error: outcome.outcome, ...contractFor(outcome.outcome) } };
     case "claim_conflict":
-      return { status: 409, body: { error: "invitation_claim_conflict" } };
+      return { status: 409, body: { error: "invitation_claim_conflict", ...contractFor("claim_conflict") } };
+    case "claim_write_failed":
+    case "claim_unconfirmed":
+      return { status: 503, body: { error: outcome.outcome === "claim_unconfirmed" ? "invitation_write_unconfirmed" : outcome.outcome,
+        ...contractFor(outcome.outcome) } };
     default:
-      return { status: 503, body: { error: outcome.outcome === "claim_unconfirmed" ? "invitation_write_unconfirmed" : outcome.outcome } };
+      // An outcome this switch has never seen answers as a deployment fault, never as a player error,
+      // and never with a code invented here: the generic one is honest about not knowing.
+      return { status: 503, body: { error: outcome.outcome, code: "INVITATION_CLAIM_UNAVAILABLE",
+        messageKey: "auth.request_failed", fields: [] } };
   }
 }
 
@@ -2215,10 +2247,21 @@ async function validateInvitationHandler(req, res) {
   const decision = await validateInvitationDecision(req, req.body);
   if (decision.status !== 200) {
     safeEvent("invitation_validation_unavailable", { requestId, status: decision.status });
+    // The 400 here means "you did not give me a code I could even look up"; a 503 means the lookup
+    // could not be performed. They have looked identical in this response for as long as the route
+    // existed, which is how a vendor outage ends up displayed to a player as a bad invitation code.
+    //
+    // NOT `INVITATION_REQUIRED`: this branch answers for an absent value and for one that is present
+    // but unusable (empty, over-long, a control word). Telling someone who pasted a 400-character
+    // string that they forgot to enter a code is the same class of unhelpful answer this task exists
+    // to remove, and the middleware's 403 is where "none was supplied" is actually decided.
+    const validationFault = decision.status === 400
+      ? { code: "INVITATION_CODE_INVALID", messageKey: "auth.invitation_invalid" }
+      : { code: "INVITATION_READ_FAILED", messageKey: "auth.invitation_lookup_failed" };
     return res.status(decision.status).json({
       success: false,
       status: decision.status === 400 ? "invalid_invitation_code" : decision.body.error,
-      error: decision.body.error, requestId
+      error: decision.body.error, ...validationFault, fields: [], requestId
     });
   }
   safeEvent("invitation_validated", { requestId, valid: decision.body.valid });
@@ -2233,8 +2276,14 @@ async function consumeInvitationHandler(req, res) {
       requestId, status: decision.status, reason: String(decision.body.error ?? "rejected"),
       userId: req.bridgeUser?.id ?? null
     });
+    // `code` and `messageKey` are carried, not recomposed. This handler builds its own envelope, and
+    // an earlier revision of this change put the contract only in the decision — which meant every
+    // field was computed correctly and then dropped on the way out. A green unit test would have
+    // described the decision function while the wire still carried nothing but `error`.
     return res.status(decision.status).json({
-      success: false, status: decision.body.error, error: decision.body.error, requestId
+      success: false, status: decision.body.error, error: decision.body.error,
+      code: decision.body.code, messageKey: decision.body.messageKey, fields: decision.body.fields ?? [],
+      requestId
     });
   }
   safeEvent("invitation_consumed", { requestId, userId: req.bridgeUser?.id ?? null,
@@ -2245,6 +2294,12 @@ async function consumeInvitationHandler(req, res) {
   return res.status(200).json({ success: decision.body.success === true,
     ...(decision.body.reason ? { reason: decision.body.reason } : {}),
     ...(decision.body.alreadyClaimed === true ? { alreadyClaimed: true } : {}),
+    // A success carries a code too. "This call spent your code" and "a previous call did, this one
+    // finished the bookkeeping" are different facts, and a client that only has `success: true` cannot
+    // tell the player which one happened — the same ambiguity that made the original error unclear.
+    ...(decision.body.code ? { code: decision.body.code } : {}),
+    ...(decision.body.messageKey ? { messageKey: decision.body.messageKey } : {}),
+    fields: decision.body.fields ?? [],
     // `recovered` is the difference between "this call spent a code" and "this call finished a
     // registration a previous call had already reserved". A client that cannot tell them apart
     // cannot report the truth to the person waiting on the screen.
@@ -3751,6 +3806,12 @@ module.exports = {
   // The upstream-refusal status table, exported so the gate asserts the mapping the relay actually
   // uses rather than a copy of it that could drift.
   ncbAuthUpstreamStatus: require("./ncb/gateway.js").authUpstreamStatus,
+  // The error contract as shipped data, so a gate asserts the vocabulary the relay actually answers
+  // with instead of a transcription of it that could drift.
+  ncbAuthErrorContract: require("./ncb/gateway.js").AUTH_ERROR_CONTRACT,
+  ncbAuthBucketContract: require("./ncb/gateway.js").AUTH_BUCKET_CONTRACT,
+  ncbInvitationRefusalContract: require("./ncb/gateway.js").INVITATION_REFUSAL_CONTRACT,
+  extractUpstreamAuthCode: require("./ncb/gateway.js").extractUpstreamAuthCode,
   // The authority that turns a sealed handle into a proven NCB identity, and the transport decision
   // that decides whether it is consulted at all. Exported because the gates must assert the SHIPPED
   // behaviour — a harness that rebuilt either of these locally would be testing a copy.
