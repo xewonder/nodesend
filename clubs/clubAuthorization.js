@@ -44,6 +44,14 @@
  * a working deployment, and `storeSuperAdmin !== true` denies. This is deliberately stricter than
  * the local gateway's role fallback.
  *
+ * ONE OPERATION IS ANONYMOUS: `GET /clubs/options`, named in `PUBLIC_READ_OPS` below, because the
+ * club picker sits on the sign-up form where no session can exist yet. It answers active club
+ * `id`/`name` pairs and nothing about a person. Every other route in this file authenticates first,
+ * including `POST /me/club` — joining a club still requires the account that is joining it.
+ * Because it is published to strangers it is also the one read throttled BEFORE any storage call,
+ * using the relay's existing per-address window injected as `limits.publicRateHit`; a mount built
+ * without one closes the read rather than serving it unthrottled.
+ *
  * ROUTES ARE UNPREFIXED. NodeSend serves `/clubs/...` and `/me/club/...` — the same grammar as
  * `/ai/...` and `/trickster/...`. BridgeMind's browser transport strips the `/api` prefix it uses
  * against its local Express server before dialing this host, so the two agree without either one
@@ -91,6 +99,37 @@ const BODY_FIELDS = Object.freeze({
   listCollectionBoards: { query: [], body: [] },
   startClubBoard: { query: [], body: ['original_seat'] }
 });
+
+/**
+ * THE ANONYMOUS READ SURFACE — one operation, declared as data so it cannot grow by accretion.
+ *
+ * WHY IT EXISTS. `GET /clubs/options` feeds the club picker on the SIGN-UP form. A visitor has no
+ * account yet, so by definition they have no sealed handle, so requiring a session there made
+ * pre-registration club discovery impossible: the browser sent no Authorization (correctly) and
+ * NodeSend answered 401 (also correctly, for a route that demanded one). The 401 was authentication,
+ * never permission — which is why no role check is being relaxed here.
+ *
+ * WHAT MAKES THIS SAFE TO SERVE ANONYMOUSLY, stated as the rule a future entry must satisfy:
+ * the answer must carry no personal data and no per-caller scope. `listActiveClubs()` returns
+ * `{id, name}` for ACTIVE clubs only, bounded by `schema.rowLimit`, and reads no membership,
+ * user, administrator, collection or `system_admins` row.
+ *
+ * It is a list of OPERATIONS, never a path prefix: a prefix would silently inherit whatever route
+ * someone mounts there next.
+ */
+const PUBLIC_READ_OPS = Object.freeze(['clubOptions']);
+
+/**
+ * The bucket namespace the anonymous read throttles itself under.
+ *
+ * The limiter is NOT defined here — the relay already owns one (`invitationRateHit` in bridge.js: a
+ * bounded, in-process, per-address window with a Retry-After answer) and it arrives through
+ * `limits`, the same seam `authenticate` arrives by. What this prefix buys is a SEPARATE BUDGET
+ * inside that one mechanism: keyed on the bare address, a visitor opening the registration form
+ * would eat the address's invitation-validation allowance, and the two features would lock each
+ * other out during the exact flow where both are used together.
+ */
+const PUBLIC_RATE_NAMESPACE = 'club-options';
 
 // The mounted surface, as data. Exported so a gate can assert that every operation the client
 // prepares is actually served here and that nothing extra is — a route that exists only in a
@@ -468,12 +507,18 @@ function respondServiceUnavailable(res, detail) {
  * @param {Function} options.authenticate resolves the caller's OWN session; must return
  *   `{ ok, id, role }` or `{ ok: false, status, code }`. Required: there is no second auth path.
  * @param {object} [options.limits]
+ * @param {Function} [options.publicRateHit] the relay's EXISTING per-address window
+ *   (`invitationRateHit` in bridge.js), passed as a value the way `authenticate` is passed rather
+ *   than reached for. This module never imports the relay, so there is no require cycle back into
+ *   the entry module, and the limiter stays one mechanism with one set of tuning variables.
+ *   Absent means the anonymous read is CLOSED, not unthrottled — see the branch in resolveContext.
  */
 function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
   if (typeof authenticate !== 'function') {
     throw new TypeError('createClubRouter needs the session authenticator');
   }
   const router = Router();
+  const publicRateHit = typeof limits.publicRateHit === 'function' ? limits.publicRateHit : null;
   // `maxBoards` bounds one import; `maxRowLimit` bounds one list. The client clamps its own page
   // size to 100 and the server must not trust that clamp — an unbounded `limit` is how a list
   // endpoint turns into a memory incident on a shared relay.
@@ -491,6 +536,67 @@ function createClubRouter({ store = null, authenticate, limits = {} } = {}) {
     const shape = validateRequestShape(op, { query: req.query, body: req.body ?? {} });
     if (shape) {
       return void res.status(shape.status).json(shape.body);
+    }
+
+    // THE ONE ANONYMOUS PATH. Everything below it is skipped rather than weakened: no session is
+    // resolved, no membership is read, no authority is consulted — because this answer says nothing
+    // about a person. Skipping the session also means no `get-session` round trip and no
+    // membership/system_admins read per anonymous request, which matters on a shared relay where
+    // this route is hit by every visitor who opens the registration form.
+    //
+    // Three structural limits, all tested by the gate:
+    //   * keyed on `req.method === 'GET'`, so mounting a mutating route on a public operation would
+    //     authenticate like any other operation instead of inheriting anonymity from a name;
+    //   * the shape check above has ALREADY run, and `clubOptions` declares no query field and no
+    //     body field, so `?search=`, `?user_id=` or a JSON body is refused 400
+    //     `client_identity_refused` before this line. An anonymous caller cannot filter or widen the
+    //     answer, only take it as issued;
+    //   * the read is throttled BEFORE any storage call, so an over-budget caller costs this process
+    //     nothing at the vendor. The key is the socket address that `req.ip` reports — the relay sets
+    //     no `trust proxy`, so `X-Forwarded-For` is NOT consulted and a spoofed header cannot mint a
+    //     fresh bucket. If the deployment ever sits behind a proxy that must be believed, that is a
+    //     deliberate change to make here, not one to discover.
+    if (req.method === 'GET' && PUBLIC_READ_OPS.includes(op)) {
+      // NO LIMITER, NO PUBLIC READ. A mount built without the injected window serves this answer
+      // rather than running unthrottled: silent publication is the failure a safeguard must not have.
+      // Its own error name, because `club_store_unavailable` would blame storage for a wiring fact
+      // and send an operator to the wrong table.
+      if (!publicRateHit) {
+        return void res.status(503).json({
+          error: 'club_public_read_unconfigured',
+          detail: 'The anonymous club read requires a per-address limiter and none was supplied, so the public read is closed. Authenticated club routes are unaffected.'
+        });
+      }
+      const retryAfter = publicRateHit(`${PUBLIC_RATE_NAMESPACE}:${String(req.ip ?? 'unknown')}`);
+      if (Number(retryAfter) > 0) {
+        res.setHeader('Retry-After', String(Math.ceil(Number(retryAfter))));
+        if (!res.headersSent) {
+          return void res.status(429).json({
+            error: 'too_many_requests',
+            detail: 'Club discovery is rate limited. Try again shortly.',
+            retryAfterSeconds: Math.ceil(Number(retryAfter))
+          });
+        }
+        return void undefined;
+      }
+      if (!store) {
+        // Fail closed, exactly as every other club route does. Without storage the honest answer is
+        // "the club backend is not here", never a 200 with an empty picker that reads as "no club
+        // has been created yet" to someone choosing where to sign up.
+        return void respondServiceUnavailable(res,
+          'No privileged club store adapter is configured; the public club list was not invented as an empty one.');
+      }
+      return {
+        userId: null,
+        anonymous: true,
+        session: null,
+        membership: null,
+        membershipRequest: null,
+        decision: { allow: true, scope: { public: true } },
+        ownerClubId: null,
+        collectionStatus: null,
+        boardNumber
+      };
     }
 
     let session = null;
@@ -873,5 +979,11 @@ module.exports = {
   validateRequestShape,
   validateClubInput,
   authorizeClubOperation,
-  createClubRouter
+  createClubRouter,
+  // Exported so the gate can pin the anonymous surface to exactly one operation rather than trusting
+  // a comment: an entry added here is a route published to unauthenticated callers.
+  PUBLIC_READ_OPS,
+  // And the bucket it lives in, so a gate can prove the public read does not spend the
+  // invitation-validation allowance of the same address.
+  PUBLIC_RATE_NAMESPACE
 };

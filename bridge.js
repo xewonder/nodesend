@@ -3489,6 +3489,14 @@ function mpGatewayHealth() {
  */
 const clubMount = buildClubMount({
   env: process.env,
+  // THE SAME PER-ADDRESS WINDOW the anonymous invitation route already uses, handed over as a value
+  // rather than reached for: `clubs/` must not require this file (the club module is loaded from here,
+  // so a require back would see this module's exports before they are assigned). `clubOptions` calls
+  // it under its own `club-options:` bucket prefix, so opening the registration form cannot spend an
+  // address's invitation-validation allowance, and the limiter stays one mechanism with the tuning
+  // variables it already has (INVITATION_RATE_MAX / INVITATION_RATE_WINDOW_MS) — no new knob, and no
+  // second throttle to reason about at 3am.
+  limits: { publicRateHit: invitationRateHit },
   // The relay's ONE session resolver, adapted to the shape the club router expects. The status is
   // carried through rather than flattened: an unreachable session authority is 503, a bad token is
   // 401, and collapsing the two would make a client discard a valid session on a transient failure.

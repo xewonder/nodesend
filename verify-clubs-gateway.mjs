@@ -1462,12 +1462,13 @@ const expressLib = require('express');
 const SCHEMA_OBJECT = JSON.parse(READY_ENV_SOURCE_SCHEMA());
 function READY_ENV_SOURCE_SCHEMA() { return process.env.CLUB_NCB_SCHEMA_JSON; }
 
-async function serveIsolated({ env, fetchImpl }) {
+async function serveIsolated({ env, fetchImpl, limits }) {
   const instance = expressLib();
   instance.use(expressLib.json({ limit: '1mb' }));
   const mount = buildClubMount({
     env,
     fetchImpl,
+    limits,
     authenticate: async (req) => {
       const token = String(req.get('authorization') ?? '').replace(/^Bearer\s+/, '');
       const user = SESSIONS[token];
@@ -1685,8 +1686,11 @@ check('18f. the active-clubs filter queries active=1, never active=active (item 
   && !clubReads.some((row) => /active=active/.test(row.search)),
   clubReads.map((row) => row.search).join(' ;; '));
 check('18g. and it returns the active clubs only, with the inactive one filtered not mislabelled',
-  activeOptions.status === 200 && activeOptions.body.data.every((row) => row.id !== '12' && row.id !== '13'),
-  JSON.stringify(activeOptions.body.data.map((row) => row.id)));
+  activeOptions.status === 200 && (activeOptions.body?.data || []).length > 0
+  && activeOptions.body.data.every((row) => row.id !== '12' && row.id !== '13'),
+  // The `?.` here is load-bearing: this arm used to dereference `body.data.map(...)` unconditionally,
+  // so when the route answered a non-200 the GATE crashed and every later arm went unreported.
+  JSON.stringify(activeOptions.body?.data?.map?.((row) => row.id) ?? activeOptions.body?.error ?? null));
 
 const setInactive = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'active' } });
 const setBack = await ask('POST', '/clubs/12/status', { token: CALLER_TOKEN, body: { status: 'inactive' } });
@@ -2082,6 +2086,193 @@ check('18r. a collections mapping without created_by_user_id is refused at boot 
     narrowSearch.status === 200 && narrowSearch.body?.data?.truncated === true,
     `${narrowSearch.status} ${narrowSearch.text.slice(0, 160)}`);
   await narrowScan.close();
+}
+
+// ── 21. THE ANONYMOUS CLUB-OPTIONS READ — public in name, and bounded in fact ──────────────────
+// `GET /clubs/options` is the registration form's club picker, so it must answer a visitor who has
+// no session. That makes it the one club surface published to anonymous callers, and these arms exist
+// to keep it exactly that: the same rows an authenticated user sees, active clubs only, no personal
+// data, no filter the caller can supply, no write, no authority read — and still a 503 rather than an
+// empty list when storage cannot be read, because a picker that renders "no club exists yet" is a
+// claim about the deployment that an unreadable table does not entitle anyone to make.
+{
+  const tableOfPath = (row) => String(row.pathname).split('/')[3] || '';
+  const activeIds = tables.clubs.filter((r) => String(r.active) === '1').map((r) => String(r.id)).sort();
+  const inactiveIds = tables.clubs.filter((r) => String(r.active) !== '1').map((r) => String(r.id)).sort();
+  const membershipsBefore = tables.club_memberships.length;
+
+  const callsBefore = dataCalls.length;
+  const anonOptions = await ask('GET', '/clubs/options');
+  const window = dataCalls.slice(callsBefore);
+  const tablesTouched = new Set(window.map(tableOfPath));
+  check('21a. an ANONYMOUS GET /clubs/options answers 200 with the active clubs (a visitor has no session yet)',
+    anonOptions.status === 200 && Array.isArray(anonOptions.body.data) && activeIds.length > 0
+    && JSON.stringify(anonOptions.body.data.map((r) => String(r.id)).sort()) === JSON.stringify(activeIds),
+    `${anonOptions.status} got=${JSON.stringify(anonOptions.body.data?.map?.((r) => r.id))} active=${JSON.stringify(activeIds)} inactive=${JSON.stringify(inactiveIds)}`);
+  check('21b. inactive clubs are absent from the anonymous answer, not merely unlisted by the client',
+    inactiveIds.length > 0 && (anonOptions.body.data || []).length > 0
+    && anonOptions.body.data.every((r) => !inactiveIds.includes(String(r.id))),
+    JSON.stringify(anonOptions.body.data?.map?.((r) => r.id)));
+  check('21c. each anonymous option row carries id and name and NOTHING else (no status, user, role or membership field)',
+    (anonOptions.body.data || []).length > 0
+    && anonOptions.body.data.every((row) => JSON.stringify(Object.keys(row).sort()) === JSON.stringify(['id', 'name'])),
+    JSON.stringify(anonOptions.body.data?.map?.((r) => Object.keys(r))));
+  check('21d. the anonymous read touched only the clubs table — no membership, system_admins, directory or collection read',
+    tablesTouched.size === 1 && tablesTouched.has('clubs'),
+    [...tablesTouched].join(',') || 'no data calls');
+  check('21e. and it issued no write of any kind',
+    window.every((row) => row.method === 'GET'),
+    [...new Set(window.map((row) => row.method))].join(','));
+  check('21f. this route cannot hand out membership: the memberships table is byte-for-byte unchanged',
+    tables.club_memberships.length === membershipsBefore,
+    `before=${membershipsBefore} after=${tables.club_memberships.length}`);
+
+  // The scope of the answer must not be a caller parameter. `clubOptions` declares no query field and
+  // no body field, so the shape check refuses these BEFORE the anonymous branch is reached.
+  const smuggled = [];
+  for (const probe of ['/clubs/options?search=Glyfada', '/clubs/options?user_id=1', '/clubs/options?club_id=10', '/clubs/options?limit=999']) {
+    const callsAtProbe = dataCalls.length;
+    const refused = await ask('GET', probe);
+    smuggled.push({ probe, status: refused.status, error: refused.body?.error, dataCalls: dataCalls.length - callsAtProbe });
+  }
+  check('21g. an anonymous caller cannot filter, re-scope or widen the answer: every supplied field is refused, with no data call made',
+    smuggled.every((row) => row.status === 400 && row.error === 'client_identity_refused' && row.dataCalls === 0),
+    JSON.stringify(smuggled));
+
+  clubReadRefusal = { table: 'clubs', fragment: /(^|&)active=/, status: 500, body: { status: 'failed', error: 'read refused' } };
+  const anonRefused = await ask('GET', '/clubs/options');
+  clubReadRefusal = null;
+  check('21h. an unreadable club table answers the anonymous caller with a controlled 503, never a 200 carrying an empty picker',
+    anonRefused.status === 503 && anonRefused.body.error === 'club_account_request_failed' && anonRefused.body.data === undefined,
+    `${anonRefused.status} ${anonRefused.text.slice(0, 140)}`);
+  const anonRestored = await ask('GET', '/clubs/options');
+  check('21i. positive control: with the refusal removed the same anonymous call is a 200 again, so 21h is not a blanket 503',
+    anonRestored.status === 200 && Array.isArray(anonRestored.body.data) && anonRestored.body.data.length === activeIds.length,
+    `${anonRestored.status} rows=${anonRestored.body.data?.length}`);
+
+  // Nothing else may ride through the door this opens.
+  const stillGuarded = await Promise.all([
+    ask('GET', '/clubs'),
+    ask('GET', '/clubs/users?q=gly'),
+    ask('GET', '/clubs/10/members'),
+    ask('GET', '/me/club'),
+    ask('POST', '/me/club', { body: { club_id: '10' } }),
+    ask('DELETE', '/me/club'),
+    ask('POST', '/clubs', { body: { name: 'Anonymous Club' } })
+  ]);
+  check('21j. every other club route still refuses an anonymous caller with 401, including POST/DELETE /me/club and POST /clubs',
+    stillGuarded.every((row) => row.status === 401),
+    stillGuarded.map((row) => row.status).join(','));
+
+  // The invariant that keeps this narrow: one operation, mounted only as GET, declaring no inputs.
+  const { PUBLIC_READ_OPS } = require(path.join(ROOT, 'clubs', 'clubAuthorization.js'));
+  const publicRoutes = clubRoutes.filter((row) => PUBLIC_READ_OPS.includes(row.op));
+  check('21k. the anonymous surface is exactly clubOptions, mounted only as GET, and its shape refuses any field',
+    JSON.stringify([...PUBLIC_READ_OPS]) === JSON.stringify(['clubOptions'])
+    && publicRoutes.length === 1 && publicRoutes[0].method === 'GET' && publicRoutes[0].path === '/clubs/options'
+    && clubValidateShape('clubOptions', { query: { limit: 1 }, body: {} })?.body?.error === 'client_identity_refused',
+    `ops=${JSON.stringify(PUBLIC_READ_OPS)} routes=${JSON.stringify(publicRoutes)}`);
+  const memberOptions = await ask('GET', '/clubs/options', { token: 'tok-member10' });
+  check('21l. an authenticated caller still loads the same options (the fix is additive, not a second list)',
+    memberOptions.status === 200 && memberOptions.body?.data?.length === activeIds.length,
+    `${memberOptions.status} expected ${activeIds.length} active clubs`);
+
+  // ── THE THROTTLE, exercised on the REAL relay app (this is the wiring that ships) ─────────
+  // The limiter is not a club invention: it is the relay's existing per-address window
+  // (`invitationRateHit`), injected into the club mount by bridge.js. These arms reset that window
+  // first so the counts below are absolute rather than whatever earlier sections happened to spend.
+  const { PUBLIC_RATE_NAMESPACE } = require(path.join(ROOT, 'clubs', 'clubAuthorization.js'));
+  const MAX = bridge.INVITATION_RATE_MAX;
+  bridge.resetInvitationRateBuckets();
+
+  const burstStatuses = [];
+  for (let i = 0; i < MAX; i++) burstStatuses.push((await ask('GET', '/clubs/options')).status);
+  const dataCallsAtOver = dataCalls.length;
+  const over = await ask('GET', '/clubs/options');
+  const dataCallsForOver = dataCalls.length - dataCallsAtOver;
+  check('21m. the limiter allowance is granted, then EXCEEDED: MAX reads are 200 and read MAX+1 is 429',
+    burstStatuses.every((s) => s === 200) && over.status === 429 && over.body.error === 'too_many_requests',
+    `max=${MAX} statuses=${burstStatuses.join(',')},${over.status} body=${over.text.slice(0, 110)}`);
+  check('21n. the refused read cost the vendor NOTHING: no club data call was issued for the 429',
+    dataCallsForOver === 0 && over.body?.retryAfterSeconds >= 1,
+    `extraDataCalls=${dataCallsForOver} retryAfterSeconds=${over.body?.retryAfterSeconds}`);
+
+  const overRaw = await fetch(`${BASE}/clubs/options`);
+  const retryHeader = overRaw.headers.get('retry-after');
+  await overRaw.text().catch(() => {});
+  check('21o. it carries Retry-After as a HEADER, the way the existing limiter answers, so a client can back off without reading the body',
+    overRaw.status === 429 && Number(retryHeader) >= 1,
+    `status=${overRaw.status} retry-after=${retryHeader}`);
+
+  // Item 7: the key must be the address, not a header the caller controls. The relay sets no
+  // `trust proxy`, so Express reports the socket address and X-Forwarded-For is never consulted —
+  // a rotating forged header must therefore NOT buy a fresh allowance.
+  const spoofed = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await fetch(`${BASE}/clubs/options`, { headers: { 'X-Forwarded-For': `203.0.113.${i + 1}` } });
+    spoofed.push(r.status);
+    await r.text().catch(() => {});
+  }
+  check('21p. spoofing X-Forwarded-For cannot reset the bucket: every rotating-header read is still 429',
+    spoofed.length === 4 && spoofed.every((s) => s === 429), spoofed.join(','));
+
+  // Item 4: the throttle belongs to the public read alone, never to membership or administration.
+  const adminWhileThrottled = await ask('GET', '/clubs', { token: CALLER_TOKEN });
+  const memberWhileThrottled = await ask('GET', '/me/club', { token: 'tok-member10' });
+  const joinWhileThrottled = await ask('POST', '/me/club', { token: 'tok-member10', body: { club_id: '10' } });
+  check('21q. an exhausted public bucket affects no authenticated route: club admin, own club and POST /me/club all answer their normal status',
+    adminWhileThrottled.status === 200 && memberWhileThrottled.status === 200 && joinWhileThrottled.status !== 429,
+    `admin=${adminWhileThrottled.status} myClub=${memberWhileThrottled.status} join=${joinWhileThrottled.status}`);
+
+  // Separate budget, one mechanism: spending the club-options window must not lock the same address
+  // out of invitation validation, which is the flow that runs immediately after it on that form.
+  const inviteValidation = await ask('POST', '/auth/validate-invitation', {
+    body: { code: 'ZNOT-A-REAL-CODE', email: 'visitor@example.invalid' }
+  });
+  check('21r. the public read lives in its OWN bucket: invitation validation for the same address is not throttled by it',
+    inviteValidation.status !== 429, `${inviteValidation.status} ${inviteValidation.text.slice(0, 110)}`);
+
+  // The key shape itself, observed rather than inferred, plus honouring a limiter that says "back off".
+  const keysSeen = [];
+  const spyMount = await serveIsolated({
+    env: READY_ENV, fetchImpl: noOpsFetch,
+    limits: { publicRateHit: (key) => { keysSeen.push(key); return 0; } }
+  });
+  const spyAnswer = await call('GET', '/clubs/options', { base: spyMount.base });
+  await spyMount.close();
+  const spyKey = String(keysSeen[0] ?? '');
+  // 503 here is the PROOF OF PASSAGE, not a failure: the spy allowed the read, so it went on to the
+  // store and hit the deliberately-deaf `noOpsFetch`. A throttle that fired instead would answer 429
+  // and never reach the network at all.
+  check('21s. the read asks the injected limiter under the club-options namespace, never the bare address',
+    spyAnswer.status === 503 && keysSeen.length === 1
+    && spyKey === `${PUBLIC_RATE_NAMESPACE}:127.0.0.1`,
+    `status=${spyAnswer.status} keys=${JSON.stringify(keysSeen)}`);
+  const backoffMount = await serveIsolated({
+    env: READY_ENV, fetchImpl: noOpsFetch, limits: { publicRateHit: () => 42 }
+  });
+  const backoffAnswer = await call('GET', '/clubs/options', { base: backoffMount.base });
+  await backoffMount.close();
+  check('21t. whatever remaining seconds the limiter reports are passed through to the client verbatim',
+    backoffAnswer.status === 429 && backoffAnswer.body.error === 'too_many_requests'
+    && backoffAnswer.body.retryAfterSeconds === 42,
+    `${backoffAnswer.status} ${backoffAnswer.text.slice(0, 120)}`);
+
+  // And the wiring cannot silently ship unthrottled: a mount built without the limiter CLOSES the
+  // public read instead of serving it, and says which thing is missing.
+  const noLimiterMount = await serveIsolated({ env: READY_ENV, fetchImpl: noOpsFetch });
+  const noLimiterAnswer = await call('GET', '/clubs/options', { base: noLimiterMount.base });
+  await noLimiterMount.close();
+  check('21u. a mount built WITHOUT a limiter closes the public read (503 club_public_read_unconfigured) rather than serving it unthrottled',
+    noLimiterAnswer.status === 503 && noLimiterAnswer.body.error === 'club_public_read_unconfigured',
+    `${noLimiterAnswer.status} ${noLimiterAnswer.text.slice(0, 140)}`);
+
+  // Finally: a window that never healed would be an outage, so prove it reopens.
+  bridge.resetInvitationRateBuckets();
+  const healed = await ask('GET', '/clubs/options');
+  check('21v. after the window passes the anonymous read serves 200 again (the limiter heals, it does not blacklist)',
+    healed.status === 200 && healed.body?.data?.length === activeIds.length,
+    `${healed.status} rows=${healed.body?.data?.length}`);
 }
 
 // ── 16. the one-time super-admin bootstrap ───────────────────────────────────
