@@ -2972,6 +2972,114 @@ console.log = realLog;
     && healthOn.systemAi?.channelConfigured === true
     && !JSON.stringify(healthOn.systemAi).includes('system_ai_config'),
     JSON.stringify({ off: healthOff.systemAi, on: healthOn.systemAi }));
+  /* ── SE — THE PROVIDER ENDPOINT ─────────────────────────────────────────────
+   * The live failure this section exists for: both production scopes stored an empty `endpoint`
+   * (`endpointSet:false`), so /ai/chat answered 400 "Alibaba baseUrl is required" and the administrator's
+   * Test answered 502 provider_unreachable for a network that was never attempted. The relay has no
+   * server-side Alibaba default — `OPENAI_BASE_URL` is the only server-owned endpoint it has ever
+   * carried — so the endpoint must come from storage (configuration row, else its credential row), and
+   * a blank one must be NAMED rather than filled in from the request.
+   *
+   * The precedence claim in SE-1 was already true whenever the column held a value, so it is a guard
+   * against a future swap of stored-vs-supplied, not the arm that catches this defect. SE-2 is: under
+   * the exact pre-fix state it reported `status 200, one dispatch, one charge` — the deployment
+   * silently succeeded on an address the browser chose. That is the regression this section pins.
+   */
+  const ADMIN = 'tok-admin';
+  // Allowed by the relay's own host policy and unreachable from this harness (the provider fake answers
+  // only the gate's own `baseUrl` host), which is exactly what SE-6 needs: a genuine network failure
+  // must still be reported as one after the fix.
+  const UNREACHABLE_ALLOWED = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+  const setEp = (scope, configEp, credEp) => {
+    const row = ncb.rows.system_ai_config.find((r) => r.usage_scope === scope);
+    row.endpoint = configEp;
+    if (credEp !== undefined) {
+      const cred = ncb.rows.system_ai_credentials.find((r) => r.id === row.credential_id);
+      if (cred) cred.endpoint = credEp;
+    }
+  };
+  const TESTIT = async (usage = 'gameplay') => {
+    const at = world.providerRequests.length;
+    const pc = world.providerCalls;
+    const r = await fetch(`${B}/ai/system-credentials/test`, {
+      method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${ADMIN}` },
+      body: JSON.stringify({ usage })
+    });
+    const j = await r.json().catch(() => null);
+    return {
+      status: r.status, error: j?.error ?? null, subject: j?.subject ?? null, body: j,
+      sent: world.providerRequests.slice(at), providerCalls: world.providerCalls - pc
+    };
+  };
+
+  seedUse();
+  setAiSource('101', 'system');
+  const steered = await CHAT2({ usage: 'gameplay', extra: { baseUrl: UNREACHABLE_ALLOWED } });
+  check('SE-1 endpoint precedence: a System call uses the STORED endpoint, never the baseUrl the caller sent',
+    steered.status === 200 && steered.sentCount === 1
+    && steered.sent[0]?.url.startsWith(baseUrl)
+    && !steered.sent.some((q) => String(q.url).includes('dashscope-intl')),
+    JSON.stringify({ s: steered.status, err: steered.error, url: steered.sent[0]?.url ?? null }));
+
+  seedUse();
+  setEp('gameplay', '', '');
+  setAiSource('101', 'system');
+  const resBefore = ncb.rows.ai_quota_reservation.length;
+  const noEp = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL), baseUrl } });
+  check('SE-2 a configured scope that stores no endpoint is refused by name on USE, before dispatch AND before any quota reservation',
+    noEp.status === 503 && noEp.error === 'system_ai_endpoint_missing'
+    && noEp.sentCount === 0 && noEp.providerCalls === 0 && noEp.charged === 0
+    && ncb.rows.ai_quota_reservation.length === resBefore,
+    JSON.stringify({ s: noEp.status, err: noEp.error, sent: noEp.sentCount, charged: noEp.charged, reservations: ncb.rows.ai_quota_reservation.length - resBefore }));
+
+  seedUse();
+  setEp('gameplay', '', baseUrl);
+  setAiSource('101', 'system');
+  const credEp = await CHAT2({ usage: 'gameplay' });
+  check('SE-3 a blank configuration endpoint is still served when the referenced credential row carries one',
+    credEp.status === 200 && credEp.sentCount === 1 && credEp.lastAuth === `Bearer ${GK}`
+    && credEp.sent[0]?.url.startsWith(baseUrl),
+    JSON.stringify({ s: credEp.status, err: credEp.error, url: credEp.sent[0]?.url ?? null }));
+
+  seedUse();
+  setEp('gameplay', 'https://attacker.example/v1');
+  setAiSource('101', 'system');
+  const badEp = await CHAT2({ usage: 'gameplay' });
+  check('SE-4 a stored endpoint outside the relay host policy is refused by name and never contacted',
+    badEp.status === 503 && badEp.error === 'system_ai_endpoint_not_allowed' && badEp.sentCount === 0,
+    JSON.stringify({ s: badEp.status, err: badEp.error, sent: badEp.sentCount }));
+
+  // Re-seeded on purpose: SE-4 left a DISALLOWED endpoint in place, and SE-5 measures the BLANK one.
+  // Sharing the fixture would have made this arm answer `..._not_allowed` and pass nothing.
+  seedUse();
+  setEp('gameplay', '', '');
+  setAiSource('101', 'system');
+  const noEpTest = await TESTIT('gameplay');
+  check('SE-5 TEST reports the same missing-endpoint code as USE — not provider_unreachable — and attempts no provider call',
+    noEpTest.status === 503 && noEpTest.error === 'system_ai_endpoint_missing'
+    && noEpTest.providerCalls === 0 && noEpTest.sent.length === 0
+    && noEpTest.subject === 'saved_configuration',
+    JSON.stringify({ s: noEpTest.status, err: noEpTest.error, calls: noEpTest.providerCalls, subject: noEpTest.subject }));
+
+  seedUse();
+  setEp('gameplay', UNREACHABLE_ALLOWED);
+  setAiSource('101', 'system');
+  const unreachableTest = await TESTIT('gameplay');
+  check('SE-6 a permitted but genuinely unreachable endpoint still answers provider_unreachable (the two causes stay distinct)',
+    unreachableTest.status === 502 && unreachableTest.error === 'provider_unreachable',
+    JSON.stringify({ s: unreachableTest.status, err: unreachableTest.error }));
+
+  seedUse();
+  setEp('gameplay', '', '');
+  setAiSource('101', 'user');
+  const personalNoSystemEp = await CHAT2({ usage: 'gameplay', extra: { encryptedApiKey: enc(PERSONAL), baseUrl } });
+  check('SE-7 a personal AI call is untouched by a blank System endpoint: its own key, its own baseUrl, no privileged read',
+    personalNoSystemEp.status === 200 && personalNoSystemEp.sentCount === 1
+    && personalNoSystemEp.lastAuth === `Bearer ${PERSONAL}`
+    && personalNoSystemEp.sent[0]?.url.startsWith(baseUrl)
+    && !personalNoSystemEp.dataTables.includes('system_ai_config'),
+    JSON.stringify({ s: personalNoSystemEp.status, err: personalNoSystemEp.error, url: personalNoSystemEp.sent[0]?.url ?? null, systemReads: personalNoSystemEp.dataTables.filter((t) => String(t).startsWith('system_ai')).length }));
+
   seedUse();
   setAiSource('101', 'system');
   delete process.env.SYSTEM_AI_REQUIRED;

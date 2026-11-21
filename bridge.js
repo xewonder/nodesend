@@ -702,8 +702,12 @@ async function relayAI(req, res, operation) {
         detail: "The configured System AI model differs from the one requested.", requestId
       });
     }
-    // The endpoint is the server's for a System call; a personal call keeps its own config untouched.
-    const effConfig = systemOn ? { ...config, baseUrl: authority.endpoint || config?.baseUrl } : config;
+    /* The endpoint is the server's, with no exception left open. `resolveSystemAiAuthority` refuses a
+       System call whose stored endpoint is blank or disallowed, so `authority.endpoint` is always a
+       decided URL by here — and the fallback this line used to carry (`|| config?.baseUrl`) would have
+       spent the deployment's key on an address the browser picked, which is exactly the substitution
+       the rest of this function exists to prevent. A personal call keeps its own config untouched. */
+    const effConfig = systemOn ? { ...config, baseUrl: authority.endpoint } : config;
     // One key source per call, and for a System call there is exactly one possible answer: the
     // credential the relay resolved itself. `config.encryptedApiKey` and `config.credentialId` are
     // not consulted on that path, so they cannot override it even when a client sends them.
@@ -3610,6 +3614,36 @@ function systemAiUseError(category) {
  */
 const systemAiRequired = () => /^(1|true|yes|on)$/i.test(String(process.env.SYSTEM_AI_REQUIRED ?? "").trim());
 
+/* THE ENDPOINT DECISION, made once so TEST and USE cannot drift apart.
+ *
+ * A System AI call's endpoint comes from storage only — the configuration row, or the credential row
+ * it references. It is NEVER completed from the caller's `config.baseUrl`: a blank column falling back
+ * to the browser would send the deployment's provider key to a URL the browser chose, which is the one
+ * thing the "the endpoint is the server's" rule exists to prevent. A blank endpoint is therefore its
+ * own deployment fault, named, rather than a downstream 400 ("Alibaba baseUrl is required") or a
+ * misleading 502 ("provider_unreachable") for a network that was never attempted.
+ *
+ * OpenAI is excluded because it has no per-deployment endpoint here at all: `providerEndpoint` sends
+ * every OpenAI call to the server-owned OPENAI_BASE_URL, so a blank column costs it nothing.
+ */
+function systemAiEndpointDecision(provider, endpoint) {
+  const value = String(endpoint ?? "").trim();
+  if (String(provider ?? "").toLowerCase() !== "alibaba") return { ok: true, endpoint: value };
+  if (!value) {
+    return {
+      ok: false, status: 503, code: "system_ai_endpoint_missing",
+      detail: "The configured System AI scope stores no endpoint, and none was resolved from its credential row. Nothing was sent to any provider and no credential of the caller's was used. Set the endpoint with PUT /ai/system-config { usage, endpoint }."
+    };
+  }
+  if (!isAllowedAlibabaBaseUrl(value)) {
+    return {
+      ok: false, status: 503, code: "system_ai_endpoint_not_allowed",
+      detail: "The stored System AI endpoint is not an allowed Alibaba base URL for this relay. Nothing was sent to it."
+    };
+  }
+  return { ok: true, endpoint: value };
+}
+
 async function resolveSystemAiAuthority(req, config) {
   const source = await resolveUserAiSource(req, req.bridgeUser?.id);
   if (source?.aiSource !== AI_SOURCE_SYSTEM || source.reason) return { system: false, reason: source?.reason ?? null };
@@ -3657,9 +3691,13 @@ async function resolveSystemAiAuthority(req, config) {
     return { system: true, error: systemAiUseError(resolved.category) };
   }
   if (resolved.enabled !== true) return { system: true, error: { status: 503, code: "system_ai_disabled" } };
+  const endpoint = systemAiEndpointDecision(resolved.provider, resolved.endpoint);
+  if (!endpoint.ok) {
+    return { system: true, error: { status: endpoint.status, code: endpoint.code, detail: endpoint.detail } };
+  }
   return {
     system: true, scope, apiKey: resolved.apiKey,
-    provider: resolved.provider, model: resolved.model, endpoint: resolved.endpoint
+    provider: resolved.provider, model: resolved.model, endpoint: endpoint.endpoint
   };
 }
 
@@ -3924,6 +3962,21 @@ app.post("/ai/system-credentials/test", requireBridgeSession, requireBridgeAdmin
     });
   }
 
+  /* The same decision the playing path makes, so a Test can never prove a route that USE would not
+     take. A blank or disallowed stored endpoint is answered here, BEFORE any provider call: it is a
+     deployment fault with a name, not an unreachable network, and the distinction is the difference
+     between an operator filling a field and an operator chasing a firewall. */
+  const endpointDecision = systemAiEndpointDecision(resolved.provider, resolved.endpoint);
+  if (!endpointDecision.ok) {
+    systemAiTestLedger.set(usage, { ok: false, at: Date.now(), category: endpointDecision.code });
+    safeEvent("system_ai_test_endpoint_unresolved", { usage, code: endpointDecision.code, requestId });
+    return res.status(endpointDecision.status).json({
+      success: false, error: endpointDecision.code, status: endpointDecision.code,
+      detail: endpointDecision.detail, usage,
+      subject: "saved_configuration", connectionTest: systemAiTestStamp(usage), requestId
+    });
+  }
+
   const lifecycle = requestLifecycle(req, res, requestId);
   try {
     const result = await requestProvider({
@@ -3931,7 +3984,7 @@ app.post("/ai/system-credentials/test", requireBridgeSession, requireBridgeAdmin
       // `baseUrl` is the field the provider layer actually reads; `endpoint` is the storage column
       // name. Passing only the latter left the request with no URL and the call failed as
       // provider_unreachable — the two names are not interchangeable and this is now explicit.
-      config: { baseUrl: resolved.endpoint || undefined, endpoint: resolved.endpoint || undefined },
+      config: { baseUrl: endpointDecision.endpoint, endpoint: endpointDecision.endpoint },
       resolvedApiKey: resolved.apiKey,
       path: "/chat/completions",
       body: { model: resolved.model, messages: [{ role: "user", content: "Reply only with OK" }] },
@@ -3961,10 +4014,16 @@ app.post("/ai/system-credentials/test", requireBridgeSession, requireBridgeAdmin
       requestId
     });
   } catch (error) {
-    systemAiTestLedger.set(usage, { ok: false, at: Date.now(), category: "provider_unreachable" });
-    safeEvent("system_ai_test_error", { usage, name: error?.name || "Error", requestId });
-    return res.status(502).json({
-      success: false, error: "provider_unreachable", usage,
+    /* `provider_unreachable` is reserved for a network that was actually attempted. A throw carrying
+       the provider layer's own 400 means the URL was never usable, which the decision above should
+       already have caught — so it is reported separately rather than folded into the network answer
+       and sent the operator looking at firewalls. */
+    const unusableEndpoint = Number(error?.status) === 400;
+    const category = unusableEndpoint ? "system_ai_endpoint_unusable" : "provider_unreachable";
+    systemAiTestLedger.set(usage, { ok: false, at: Date.now(), category });
+    safeEvent("system_ai_test_error", { usage, name: error?.name || "Error", category, requestId });
+    return res.status(unusableEndpoint ? 503 : 502).json({
+      success: false, error: category, status: category, usage,
       subject: "saved_configuration", connectionTest: systemAiTestStamp(usage), requestId
     });
   } finally {
