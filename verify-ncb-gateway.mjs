@@ -340,11 +340,138 @@ check('4j. and B\'s row is unchanged afterwards — the negative test has a posi
   stillThere.status === 200 && stillThere.json?.data?.marker === markerB, `${stillThere.status} ${stillThere.text.slice(0, 120)}`);
 
 // ── 5. allow-lists: the gateway is not a general proxy ──────────────────────
+// Every blocked table must be refused, and refused WITH THE NAME its own feature publishes. The three
+// tournament tables answer `tournament_via_gateway_only` rather than the generic `table_not_allowed`
+// because they did not fail an allow-list — they moved behind the authorized /tournaments routes, and a
+// stale browser bundle has to be able to tell those two facts apart. Asserting one error string for the
+// whole set would have reddened a correct build, and asserting merely "403" would pass a build that
+// leaked the reason away.
+const blockedExpectations = require('./ncb/gateway.js');
+// The blocked set and its refusal name, read FROM THE MODULE UNDER TEST. The literals below exist only so
+// these arms can run against a build that predates the fix and report a FAILURE instead of throwing on a
+// missing export — a gate that crashes on the vulnerable build tells you nothing about what it measures.
+// 5a1 is the arm that pins the real contract: the shipped module must export the same set as data.
+const TOURNAMENT_NAMES_AT_ISSUE = ['tournaments', 'tournament_boards', 'tournament_attempts'];
+const tournamentBlockedSet = blockedExpectations.TOURNAMENT_TABLES ?? TOURNAMENT_NAMES_AT_ISSUE;
+const tournamentRefusalName = blockedExpectations.TOURNAMENT_GATEWAY_REFUSAL ?? 'tournament_via_gateway_only';
+check('5a1. the gateway module exports the blocked tournament set, its refusal name and its membership in NEVER_THROUGH_THE_GATEWAY as data, so this gate cannot stay green while the shipped surface drifts',
+  Array.isArray(blockedExpectations.TOURNAMENT_TABLES)
+    && TOURNAMENT_NAMES_AT_ISSUE.every((t) => blockedExpectations.TOURNAMENT_TABLES.includes(t))
+    && blockedExpectations.TOURNAMENT_TABLES.length === TOURNAMENT_NAMES_AT_ISSUE.length
+    && typeof blockedExpectations.TOURNAMENT_GATEWAY_REFUSAL === 'string'
+    && typeof blockedExpectations.TOURNAMENT_GATEWAY_DETAIL === 'string'
+    && TOURNAMENT_NAMES_AT_ISSUE.every((t) => blockedExpectations.NEVER_THROUGH_THE_GATEWAY.includes(t))
+    && TOURNAMENT_NAMES_AT_ISSUE.every((t) => !blockedExpectations.DEFAULT_TABLES.includes(t))
+    && TOURNAMENT_NAMES_AT_ISSUE.every((t) => blockedExpectations.PLAYER_TABLE_WRITE_POLICY[t] === undefined),
+  JSON.stringify({
+    set: blockedExpectations.TOURNAMENT_TABLES ?? null,
+    refusal: blockedExpectations.TOURNAMENT_GATEWAY_REFUSAL ?? null,
+    stillAllowListed: TOURNAMENT_NAMES_AT_ISSUE.filter((t) => (blockedExpectations.DEFAULT_TABLES ?? []).includes(t))
+  }));
+
 for (const table of ncbGatewayClubTables) {
+  const isTournament = tournamentBlockedSet.includes(table);
   const refusedCall = await call('GET', `/ncb/data/read/${table}`, { token: tokenA });
-  check(`5a. club table ${table} is refused at the gateway (it belongs to the service-account path)`,
-    refusedCall.status === 403 && refusedCall.json?.error === 'table_not_allowed', `${refusedCall.status}`);
+  check(`5a. ${isTournament ? 'tournament' : 'club'} table ${table} is refused at the gateway (it belongs to the service-account path)`,
+    refusedCall.status === 403 && refusedCall.json?.error === (isTournament
+      ? blockedExpectations.TOURNAMENT_GATEWAY_REFUSAL : 'table_not_allowed'),
+    `${refusedCall.status} ${refusedCall.text?.slice(0, 90)}`);
 }
+const tournamentNamed = await call('POST', '/ncb/data/create/tournaments', { token: tokenA, body: { name: 'forged' } });
+check('5a2. a tournament write names the route it moved to, and reaches no upstream call',
+  tournamentNamed.status === 403 && tournamentNamed.json?.error === 'tournament_via_gateway_only'
+    && /\/tournaments/.test(String(tournamentNamed.json?.detail ?? '')),
+  `${tournamentNamed.status} ${tournamentNamed.text?.slice(0, 120)}`);
+// ── 5a3/5a4/5a5: the block measured as UPSTREAM SILENCE, not merely as a 403 ──
+// 5a and 5a2 (above) name the refusal. These arms cover what a status code alone cannot show: that the
+// request was refused BEFORE the relay parsed the caller's handle and BEFORE it asked the storage
+// anything. Every probe below diffs the fake NCB's OWN request log across the call — one upstream entry
+// naming a blocked table is a failure even if the browser was handed a polite 403.
+const blockedUpstream = [];
+for (const table of tournamentBlockedSet) {
+  const shapes = [
+    ['GET', `/ncb/data/read/${table}?limit=1`, 'read/:table'],
+    ['GET', `/ncb/data/read/${table}/1`, 'read/:table/:id'],
+    ['POST', `/ncb/data/create/${table}`, 'create/:table'],
+    ['PUT', `/ncb/data/update/${table}/1`, 'update/:table/:id'],
+    ['DELETE', `/ncb/data/delete/${table}/1`, 'delete/:table/:id'],
+    ['GET', `/ncb/public-data/read/${table}?limit=1`, 'public-data/:table']
+  ];
+  for (const [method, route, label] of shapes) {
+    for (const [tokName, token] of [['session', tokenA], ['anonymous', '']]) {
+      const before = upstreamLog.length;
+      const probe = await call(method, route, { token });
+      const reached = upstreamLog.slice(before).filter((e) => String(e.path).toLowerCase().includes(table));
+      if (!(probe.status === 403 && probe.json?.error === tournamentRefusalName)) {
+        blockedUpstream.push(`${method} ${label} ${tokName} => ${probe.status}/${probe.json?.error}`);
+      } else if (reached.length) {
+        blockedUpstream.push(`${method} ${label} ${tokName} => 403 BUT STORAGE REACHED (${reached[0].method} ${reached[0].path})`);
+      }
+    }
+  }
+}
+check('5a3. all three tournament tables are refused on read, create, update, delete and on the anonymous public route, both WITH a session and with none, by the named reason, and with ZERO upstream request for the table',
+  blockedUpstream.length === 0, blockedUpstream.slice(0, 8).join(' | '));
+
+// The same probes against a table the relay DOES serve, so 5a3 cannot pass by being unfalsifiable: if the
+// instrument could not see upstream traffic at all, an empty `reached` list would mean nothing.
+const controlBefore = upstreamLog.length;
+const controlRead = await call('GET', '/ncb/data/read/user_settings?limit=1', { token: tokenA });
+const controlAdded = upstreamLog.slice(controlBefore);
+check('5a4. positive control on the same probes: an allowed table is served AND does reach upstream, so 5a3\'s silence is a refusal and not a broken instrument',
+  controlRead.status === 200 && controlAdded.length > 0 && controlAdded.some((e) => String(e.path).includes('user_settings')),
+  `${controlRead.status} upstreamEntries=${controlAdded.length}`);
+
+// Blocked by name, not by configuration. `NCB_TABLE_ALLOWLIST` is the deployment's narrowing knob; a value
+// that names these tables must still be refused, or one Coolify field reopens the hole this closes.
+const widened = buildNcbGateway({
+  env: { ...process.env, NCB_TABLE_ALLOWLIST: ['user_settings', ...tournamentBlockedSet].join(',') }
+});
+const widenedApp = express();
+widenedApp.use(express.json());
+widenedApp.use(widened.router);
+const widenedServer = widenedApp.listen(0, '127.0.0.1');
+await new Promise((r) => widenedServer.once('listening', r));
+const widenedLeaks = [];
+for (const table of tournamentBlockedSet) {
+  const res = await fetch(`http://127.0.0.1:${widenedServer.address().port}/ncb/data/read/${table}?limit=1`, {
+    headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${tokenA}` }
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!(res.status === 403 && body?.error === tournamentRefusalName)) widenedLeaks.push(`${table}=${res.status}/${body?.error}`);
+}
+await new Promise((r) => widenedServer.close(r));
+check('5a5. a deployment that names the three tables in NCB_TABLE_ALLOWLIST is still refused on every one of them — the block lives in code, not in an environment variable',
+  widenedLeaks.length === 0, JSON.stringify(widenedLeaks));
+
+// THE PRODUCTION-SHAPED CASE, and the reason this hotfix exists. The harness above mounts the relay with a
+// NARROWED NCB_TABLE_ALLOWLIST, so its answer for these tables is the generic refusal — that is a test
+// fixture, not the deployment. The container sets no allowlist at all, at which point the gateway serves
+// DEFAULT_TABLES, and until this change DEFAULT_TABLES named all three tournament tables with write policy
+// `full`. So this arm starts the gateway the way production does and measures whether STORAGE IS REACHED:
+// one row served here is any signed-in session reading, rewriting or deleting another account's tournaments.
+const prodShaped = buildNcbGateway({ env: { ...process.env, NCB_TABLE_ALLOWLIST: '' } });
+const prodApp = express();
+prodApp.use(express.json());
+prodApp.use(prodShaped.router);
+const prodServer = prodApp.listen(0, '127.0.0.1');
+await new Promise((r) => prodServer.once('listening', r));
+const prodExposure = [];
+for (const table of tournamentBlockedSet) {
+  const before2 = upstreamLog.length;
+  const res = await fetch(`http://127.0.0.1:${prodServer.address().port}/ncb/data/read/${table}?limit=1`, {
+    headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${tokenA}` }
+  });
+  const body = await res.json().catch(() => ({}));
+  const reached = upstreamLog.slice(before2).filter((e) => String(e.path).toLowerCase().includes(table));
+  if (!(res.status === 403 && body?.error === tournamentRefusalName)) {
+    prodExposure.push(`${table}=${res.status}/${body?.error} storage=${reached.length ? 'REACHED ' + reached[0].method + ' ' + reached[0].path : 'not reached'}`);
+  }
+}
+await new Promise((r) => prodServer.close(r));
+check('5a6. with NO NCB_TABLE_ALLOWLIST set — the way the container actually starts — all three tables are refused and reach no storage call, so the deployed exposure is measured rather than assumed',
+  prodExposure.length === 0, prodExposure.join(' | '));
+
 const unknownTable = await call('GET', '/ncb/data/read/some_admin_table', { token: tokenA });
 check('5b. a table outside the allow-list is refused, never forwarded', unknownTable.status === 403, `${unknownTable.status} ${unknownTable.text.slice(0, 90)}`);
 const nastyTable = await call('GET', '/ncb/data/read/..%2F..%2Fetc', { token: tokenA });

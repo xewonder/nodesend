@@ -55,18 +55,38 @@ const DATA_VERBS = { get: 'read', post: 'create', put: 'update', delete: 'delete
 // production, which is the failure this whole gateway was built to end — so the list belongs in code
 // as well as in the deployment environment, and `NCB_TABLE_ALLOWLIST` narrows it rather than being
 // the only place it exists.
+//
+// THE THREE TOURNAMENT TABLES ARE DELIBERATELY NOT HERE. They used to be, with write policy `full`, and
+// that combination is the reason this feature exists: any signed-in session could rewrite any
+// tournament row. They are blocked by name below and served only by `/tournaments/...`.
 const DEFAULT_TABLES = [
   'user_settings', 'llm_preferences', 'recorded_hands', 'community_games', 'user_codes',
   'ai_providers', 'ai_models', 'ai_model_parameters', 'ai_decision_traces', 'ai_usage_events',
   'app_config', 'coach_feedback_flags', 'game_analysis_reports', 'replay_attempts',
-  'system_ai_config',
-  'tournaments', 'tournament_boards', 'tournament_attempts'
+  'system_ai_config'
 ];
 // Club tables are reached through the dedicated Clubs service account with its own authorization
 // checks (clubs/ncbAccountClient.js). Listing them here would put a second, weaker path in front of
 // the authority data, and that path would be scoped by a browser-held handle rather than by R1.
 const AUTHORITY_TABLES = ['system_admins', 'clubs', 'club_memberships',
   'club_board_collections', 'club_collection_boards'];
+// The tournament tables, blocked by name for the same reason the club authority tables are — and this
+// one is a FIX rather than a precaution. These three used to sit in DEFAULT_TABLES with write policy
+// `full`, so every authenticated session could create, rewrite or delete ANY tournament row through
+// `/ncb/data/{create,update,delete}/<table>`. That is why "private" and "club" tournaments had no
+// server-side meaning at all: the category was a field the browser happened to send, not a rule the
+// backend held. They are now served only by `/tournaments/...` (tournaments/), which derives identity
+// from the validated session and reads the row's owner, club, visibility and status FROM STORAGE before
+// deciding anything.
+//
+// READS ARE BLOCKED TOO, NOT MERELY WRITES. NCB row isolation is not a guarantee on this deployment —
+// these tables would be `shared_readwrite` on the vendor side, where any signed-in account can read
+// another account's rows — so leaving the three generically READABLE would keep leaking private rows
+// through the very path this change exists to close. The named refusal below is what an operator sees
+// when a stale client still dials the old route, which is why it is not the generic `table_not_allowed`.
+const TOURNAMENT_TABLES = ['tournaments', 'tournament_boards', 'tournament_attempts'];
+const TOURNAMENT_GATEWAY_REFUSAL = 'tournament_via_gateway_only';
+const TOURNAMENT_GATEWAY_DETAIL = 'tournament rows are served only by the /tournaments routes, which authorize owner, club and visibility server-side; the generic table relay refuses them on every verb';
 // NodeSend's own server-side ledger and per-user encrypted credential store. The browser never reads
 // or writes any of these — no call site exists — and the quota tables are `shared_readwrite` on the
 // vendor side, so they carry NO per-user row isolation: allowing them here would let any signed-in
@@ -97,7 +117,11 @@ const SERVER_ONLY_TABLES = [
 const PLAYER_TABLE_WRITE_POLICY = Object.freeze({
   user_settings: 'full', llm_preferences: 'full', recorded_hands: 'full', community_games: 'full',
   replay_attempts: 'full', game_analysis_reports: 'full',
-  tournaments: 'full', tournament_boards: 'full', tournament_attempts: 'full',
+  // NO TOURNAMENT ENTRY. The three tournament tables used to be `full` here, which meant any
+  // authenticated session could create, update or delete any tournament row through the generic relay —
+  // so the visibility categories existed only in the browser. They are now blocked by name
+  // (TOURNAMENT_TABLES above) and authorized route-by-route in tournaments/. A write policy entry would
+  // be a contradiction: there is no verb this table accepts on this path.
   coach_feedback_flags: 'create', ai_usage_events: 'create', ai_decision_traces: 'create',
   app_config: 'read', ai_providers: 'read', ai_models: 'read', ai_model_parameters: 'read',
   system_ai_config: 'read', user_codes: 'read'
@@ -108,7 +132,7 @@ const PLAYER_TABLE_WRITE_POLICY = Object.freeze({
 // AI traffic at a key of their choosing. Both are administrative actions and belong on a route that
 // authorizes them as such, on the same service-account model Clubs uses — not on a player CRUD path.
 const CREDENTIAL_TABLES = ['system_ai_credentials'];
-const NEVER_THROUGH_THE_GATEWAY = [...AUTHORITY_TABLES, ...SERVER_ONLY_TABLES, ...CREDENTIAL_TABLES];
+const NEVER_THROUGH_THE_GATEWAY = [...AUTHORITY_TABLES, ...TOURNAMENT_TABLES, ...SERVER_ONLY_TABLES, ...CREDENTIAL_TABLES];
 const WRITE_VERBS = ['create', 'update', 'delete'];
 function writePermission(verb, table) {
   if (!WRITE_VERBS.includes(verb)) return { allowed: true, policy: PLAYER_TABLE_WRITE_POLICY[table] || 'read' };
@@ -867,6 +891,18 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     return async (req, res) => {
       const table = String(req.params.table || '');
       const id = String(req.params.id || '');
+      // Named before the generic refusal, and before the credential is read. A caller still dialling the
+      // old tournament path — a stale bundle, or a hand-built request — must learn that these tables
+      // moved behind an authorized route, not that the table "isn't allowed here", which reads like a
+      // deployment variable somebody forgot to set.
+      if (TOURNAMENT_TABLES.includes(table)) {
+        event('ncb_gateway_tournament_table_refused', { table, verb: verbName });
+        return reply(res, 403, {
+          status: 'error', data: null,
+          error: TOURNAMENT_GATEWAY_REFUSAL,
+          detail: TOURNAMENT_GATEWAY_DETAIL
+        });
+      }
       if (!tables.includes(table)) {
         event('ncb_gateway_table_refused', { table, verb: verbName });
         return reply(res, 403, { status: 'error', data: null, error: 'table_not_allowed' });
@@ -980,6 +1016,18 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
 
   router.get('/ncb/public-data/read/:table', async (req, res) => {
     const table = String(req.params.table || '');
+    // The public family answers without a session, so a tournament row reaching it would be a private
+    // tournament published to strangers. It cannot: `PUBLIC_TABLES` is `user_codes` only. The named
+    // refusal is here anyway so that both families answer the SAME way about these tables, and a future
+    // edit that widened the public set cannot quietly make a tournament readable anonymously.
+    if (TOURNAMENT_TABLES.includes(table)) {
+      event('ncb_gateway_public_tournament_table_refused', { table });
+      return reply(res, 403, {
+        status: 'error', data: null,
+        error: TOURNAMENT_GATEWAY_REFUSAL,
+        detail: TOURNAMENT_GATEWAY_DETAIL
+      });
+    }
     if (!PUBLIC_TABLES.includes(table)) {
       event('ncb_gateway_public_table_refused', { table });
       return reply(res, 403, { status: 'error', data: null, error: 'table_not_allowed' });
@@ -1080,6 +1128,9 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
 // tables would pass while the shipped contract drifted.
 module.exports = {
   buildNcbGateway, createCorsResolver, authUpstreamStatus, signUpOutcomeIsAmbiguous, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY,
+  // The tournament narrowing, as data: a gate asserts the blocked set and the refusal NAME the caller
+  // receives, rather than re-typing them and passing while the shipped surface drifts.
+  TOURNAMENT_TABLES, TOURNAMENT_GATEWAY_REFUSAL, TOURNAMENT_GATEWAY_DETAIL, AUTHORITY_TABLES, PLAYER_TABLE_WRITE_POLICY,
   extractUpstreamAuthCode, authErrorFields, AUTH_ERROR_CONTRACT, AUTH_BUCKET_CONTRACT, INVITATION_REFUSAL_CONTRACT,
   FALLBACK_BUCKET, UNKNOWN_CODE_MESSAGE_KEY, CODE_SHAPE
 };

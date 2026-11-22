@@ -727,13 +727,46 @@ const serverOnly = ['ai_quota_usage', 'ai_quota_config', 'ai_quota_user_override
   // exists to prevent, reachable through the route that is deliberately broad.
   'invitation_reservations'];
 const authorityTables = ['system_admins', 'clubs', 'club_memberships', 'club_board_collections', 'club_collection_boards'];
+// The tournament tables moved here on 2026-11-22. They used to be allow-listed with write policy `full`,
+// which is what made "private" and "club" tournaments meaningless: any signed-in session could rewrite
+// any row through the generic relay. They are now served only by the authorized /tournaments routes
+// (tournaments/ in this repo), on the club service account, and blocked here by name.
+const tournamentTables = ['tournaments', 'tournament_boards', 'tournament_attempts'];
 const leakedTables = [];
-for (const t of [...serverOnly, ...authorityTables]) {
+for (const t of [...serverOnly, ...authorityTables, ...tournamentTables]) {
   const r = await (await fetch(`${BASE}/ncb/data/read/${t}?limit=1`, { headers: { Origin: PROD_ORIGINS[0], Authorization: `Bearer ${handleA}` } })).status;
   if (r !== 403) leakedTables.push(`${t}=${r}`);
 }
-check('9a. quota, credential, reservation and club-authority tables are all refused through the player gateway',
+check('9a. quota, credential, reservation, club-authority and tournament tables are all refused through the player gateway',
   leakedTables.length === 0, leakedTables.join(' '));
+// Reads AND every write verb, each answered with the NAMED reason rather than the generic
+// `table_not_allowed`, so a stale bundle learns where the tables went. This is the arm that would go red
+// if the block were loosened to "writes only" — leaving private rows readable by any session.
+const tournamentLeaks = [];
+for (const table of tournamentTables) {
+  const probes = [
+    ['GET', `/ncb/data/read/${table}?limit=1`, undefined],
+    ['POST', `/ncb/data/create/${table}`, { name: 'forged via relay' }],
+    ['PUT', `/ncb/data/update/${table}/1`, { name: 'forged via relay' }],
+    ['DELETE', `/ncb/data/delete/${table}/1`, undefined],
+    ['GET', `/ncb/public-data/read/${table}?limit=1`, undefined]
+  ];
+  for (const [method, route, body] of probes) {
+    for (const token of [handleA, '']) {
+      const res = await fetch(`${BASE}${route}`, {
+        method,
+        headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!(res.status === 403 && payload?.error === 'tournament_via_gateway_only')) {
+        tournamentLeaks.push(`${method} ${route} tok=${token ? 'set' : 'none'} = ${res.status}/${payload?.error}`);
+      }
+    }
+  }
+}
+check('9a3. the three tournament tables are refused on read, create, update, delete and the anonymous public route, each with the named reason',
+  tournamentLeaks.length === 0, tournamentLeaks.slice(0, 6).join(' | '));
 // Read is only the easiest verb. The reservation table must be unreachable in ALL FOUR, because a
 // player-controlled INSERT is a denial of the pool and a player-controlled DELETE is a free re-spend.
 const reservationVerbs = [
@@ -756,13 +789,16 @@ for (const [method, route] of reservationVerbs) {
 }
 check('9a2. invitation_reservations is refused to a signed-in player on read, create, update, delete AND the public route — the arbitration is server-only',
   reservationLeaks.length === 0, reservationLeaks.join(' '));
-// Tables a player's own flow reads or writes. `system_ai_credentials` is deliberately NOT among them:
-// the shipped admin screen reads it, but it holds the system provider key material, and a general
-// player CRUD path is not where that belongs. The refusal is asserted below, so the decision is
+// Tables a player's own flow reads or writes through THIS path. `system_ai_credentials` is deliberately
+// NOT among them: the shipped admin screen reads it, but it holds the system provider key material, and a
+// general player CRUD path is not where that belongs. The refusal is asserted below, so the decision is
 // recorded in evidence rather than left as a comment.
+// The three TOURNAMENT tables are no longer here either — they moved to the blocked set above, because a
+// player's tournament flow now runs on the authorized /tournaments routes and a generic read of these
+// tables would leak private rows (9a3 measures the refusal, and the tournament gate measures the routes).
 const browserTables = ['user_settings', 'llm_preferences', 'recorded_hands', 'community_games', 'ai_providers', 'ai_models',
   'ai_model_parameters', 'ai_decision_traces', 'ai_usage_events', 'app_config', 'coach_feedback_flags',
-  'game_analysis_reports', 'replay_attempts', 'system_ai_config', 'tournaments', 'tournament_boards', 'tournament_attempts'];
+  'game_analysis_reports', 'replay_attempts', 'system_ai_config'];
 const refusedBrowser = [];
 for (const t of browserTables) {
   const r = await (await fetch(`${BASE}/ncb/data/read/${t}?limit=1`, { headers: { Origin: PROD_ORIGINS[0], Authorization: `Bearer ${handleA}` } })).status;
