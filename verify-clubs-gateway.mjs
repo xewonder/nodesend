@@ -2275,6 +2275,277 @@ check('18r. a collections mapping without created_by_user_id is refused at boot 
     `${healed.status} rows=${healed.body?.data?.length}`);
 }
 
+// ── 22. ROSTER NAMES BEYOND THE DIRECTORY WINDOW ─────────────────────────────
+// The defect: `GET /clubs/{clubId}/members` enriched every row from ONE
+// `limit=CLUB_NCB_ROW_LIMIT` read of the directory sorted by user id, so a member whose profile row
+// sat past that window came back with `null` names on a 200 that looked complete — the store
+// computed a `truncated` flag and `directoryLabels()` discarded it, which made "nobody looked at
+// this account" indistinguishable from "this account has no profile".
+//
+// Section 20 narrows the window with CLUB_NCB_ROW_LIMIT, and that is the right knob for a SEARCH
+// arm, but the SAME constant bounds the roster read, so a narrowed window there cannot tell "the
+// member's profile was never looked at" from "the member was never listed". This fixture keeps the
+// shipped window of 500 and holds a directory of 605 rows, so the members' profile rows genuinely
+// are past page 1. Ids are equal-width numerics so that position does not depend on whether the
+// backend sorts the column numerically or lexically.
+{
+  const FILLER_COUNT = 600;
+  const ROSTER_CLUB = '10';
+  const named = (id, nickname, displayName) => ({
+    id: `us${id}`, user_id: id, nickname, nickname_normalized: nickname.toLowerCase(),
+    display_name: displayName,
+    // Private columns the fixture carries because the live directory carries them, and which the
+    // leak arms below search every response body for. `user_settings` is writable by its own account
+    // and readable cross-account by policy, so a name lookup that returns them is an identity dump.
+    avatar_url: `https://avatar.invalid/${id}.png`, ai_source: 'gate-fixture-private-setting'
+  });
+  const directoryRows = () => {
+    const rows = [];
+    for (let i = 100; i < 100 + FILLER_COUNT; i += 1) {
+      rows.push(named(String(i), `filler${i}`, `Filler ${i}`));
+    }
+    // The four members whose profile rows are past the window. 902 and 903 deliberately share a
+    // nickname but hold different display names, so a resolution keyed on anything other than the
+    // account id attributes one person's name to another and shows up red here.
+    rows.push(named('900', 'LateJoiner', 'The Late Member'));
+    // 901 has the duplicate profile rows `user_settings` actually allows (no unique constraint on
+    // the user id), with the NAMELESS row FIRST: a resolver that takes whatever the read happens to
+    // return first reports this member as having no name at all.
+    rows.push({ id: 'us901a', user_id: '901', nickname: '', nickname_normalized: '', display_name: '', avatar_url: null, ai_source: 'system' });
+    rows.push(named('901', 'DupPlayer', 'Duplicate Profile'));
+    rows.push(named('902', 'TwinPlayer', 'Twin A'));
+    rows.push(named('903', 'TwinPlayer', 'Twin B'));
+    return rows;
+  };
+
+  // `blindFilter`, `refuseTargeted`, `refusePages` and `misattribute` each model a backend answer
+  // this relay has actually been measured giving (or, for the last one, the mirror image of the
+  // first): a filtered list read answering 200-with-no-rows while the rows are stored, a read that
+  // refuses outright, and a filter that hands back a row it was not asked for.
+  function makeRosterNcb({ blindFilter = false, refuseTargeted = false, refusePages = false, misattribute = false } = {}) {
+    const tables = {
+      system_admins: [{ id: 'sa-1', user_id: '1' }],
+      clubs: [
+        { id: '10', name: 'Glyfada BC', active: 1 },
+        { id: '11', name: 'Thessaloniki BC', active: 1 }
+      ],
+      club_memberships: [
+        { id: 'r900', user_id: '900', club_id: '10', role: 'club_admin', status: 'approved' },
+        { id: 'r901', user_id: '901', club_id: '10', role: 'member', status: 'approved' },
+        { id: 'r902', user_id: '902', club_id: '10', role: 'member', status: 'approved' },
+        { id: 'r903', user_id: '903', club_id: '10', role: 'member', status: 'approved' },
+        // 904 is a member with NO profile row anywhere: the honest null, which must stay a null
+        // rather than become a dropped row or a 503.
+        { id: 'r904', user_id: '904', club_id: '10', role: 'member', status: 'approved' },
+        { id: 'r3', user_id: '3', club_id: '10', role: 'member', status: 'approved' },
+        // The two callers who must be refused, each reaching its club through a different rule.
+        { id: 'r2', user_id: '2', club_id: '11', role: 'club_admin', status: 'approved' }
+      ],
+      user_settings: directoryRows()
+    };
+    const COLUMNS = {
+      system_admins: ['id', 'user_id'],
+      clubs: ['id', 'name', 'active'],
+      club_memberships: ['id', 'user_id', 'club_id', 'role', 'status'],
+      user_settings: ['id', 'user_id', 'nickname', 'nickname_normalized', 'display_name', 'avatar_url', 'ai_source']
+    };
+    const RESERVED = ['limit', 'page', 'sort', 'order', 'Instance'];
+    const state = { reads: [] };
+
+    const fetchImpl = async (url, init = {}) => {
+      const target = String(url);
+      const { pathname, searchParams } = new URL(target);
+      const bearer = String(init?.headers?.Authorization ?? '').replace(/^Bearer\s+/, '');
+      if (pathname === '/auth/sign-in/email') return json({ token: CLUB_SESSION_TOKEN, user: { id: CLUB_ACCOUNT_ID, email: CLUB_ACCOUNT_EMAIL } });
+      if (pathname === '/auth/get-session') {
+        if (bearer !== CLUB_SESSION_TOKEN) return json({ status: 'error', message: 'invalid session' }, 401);
+        return json({ data: { user: { id: CLUB_ACCOUNT_ID, email: CLUB_ACCOUNT_EMAIL } } });
+      }
+      const [, action, table] = pathname.split('/').filter(Boolean);
+      const userIdFilter = searchParams.get('user_id');
+      state.reads.push({ table, action, method: String(init.method ?? 'GET').toUpperCase(), query: searchParams.toString() });
+      if (bearer !== CLUB_SESSION_TOKEN) return json({ status: 'error', message: 'club data does not move on a caller bearer' }, 403);
+      // A roster read that needed a write is a broken roster read, and the arms below would then be
+      // measuring a mutation. Refusing it in the fixture is what makes "no membership change" real.
+      if (action !== 'read') return json({ status: 'error', message: 'the roster path writes nothing' }, 500);
+      const rows = tables[table] ?? [];
+      if (table === 'user_settings' && userIdFilter !== null) {
+        if (refuseTargeted) return json({ status: 'failed', error: 'read refused' }, 500);
+        if (blindFilter) return json({ status: 'success', data: [] });
+        if (misattribute && userIdFilter === '900') {
+          return json({ status: 'success', data: [rows.find((row) => String(row.user_id) === '902')] });
+        }
+      }
+      if (table === 'user_settings' && searchParams.get('page') !== null && refusePages) {
+        return json({ status: 'failed', error: 'read refused' }, 500);
+      }
+      const filters = {};
+      for (const [key, value] of searchParams.entries()) {
+        if (RESERVED.includes(key)) continue;
+        if (!COLUMNS[table].includes(key)) return json({ status: 'failed', error: `unknown column in filter: ${key}` }, 500);
+        filters[key] = value;
+      }
+      let found = rows.filter((row) => Object.entries(filters).every(([key, value]) => String(row[key] ?? '') === value));
+      const sort = searchParams.get('sort');
+      if (sort !== null) found = found.slice().sort((a, b) => String(a[sort] ?? '').localeCompare(String(b[sort] ?? '')));
+      const limit = Number(searchParams.get('limit'));
+      const size = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : found.length;
+      const page = Number(searchParams.get('page'));
+      const start = Number.isFinite(page) && page > 1 ? (Math.floor(page) - 1) * size : 0;
+      return json({ status: 'success', data: found.slice(start, start + size) });
+    };
+    return { tables, state, fetchImpl };
+  }
+
+  const ROSTER_ENV = { ...READY_ENV, CLUB_NCB_ROW_LIMIT: '500' };
+  const serveRoster = async (knobs) => {
+    const ncb = makeRosterNcb(knobs);
+    const srv = await serveIsolated({ env: ROSTER_ENV, fetchImpl: ncb.fetchImpl });
+    return { ...srv, ncb };
+  };
+  const rosterOf = (res) => new Map(((res.body?.data ?? []).map((row) => [String(row.user_id), row])));
+  const directoryReadsOf = (state, from = 0) => state.reads.slice(from).filter((row) => row.table === 'user_settings' && row.action === 'read');
+
+  const plain = await serveRoster();
+  const beforePlain = plain.ncb.state.reads.length;
+  const roster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: plain.base });
+  const plainReads = directoryReadsOf(plain.ncb.state, beforePlain);
+  const byUser = rosterOf(roster);
+  check('22a. a member whose profile row sits beyond the 500-row directory window is still named (the defect)',
+    roster.status === 200 && byUser.size === 6
+    && byUser.get('900')?.display_name === 'The Late Member'
+    && byUser.get('900')?.nickname === 'LateJoiner',
+    `${roster.status} 900=${JSON.stringify(byUser.get('900'))}`);
+  check('22b. duplicate names belong to their own account: 902 and 903 share a nickname and each keeps its own display name',
+    byUser.get('902')?.display_name === 'Twin A' && byUser.get('903')?.display_name === 'Twin B'
+    && byUser.get('902')?.nickname === 'TwinPlayer' && byUser.get('903')?.nickname === 'TwinPlayer'
+    && byUser.get('902')?.user_id === '902' && byUser.get('903')?.user_id === '903',
+    `902=${JSON.stringify(byUser.get('902'))} 903=${JSON.stringify(byUser.get('903'))}`);
+  check('22c. duplicate profile rows for one account resolve to the row that carries a name, not to whichever came first',
+    byUser.get('901')?.display_name === 'Duplicate Profile' && byUser.get('901')?.nickname === 'DupPlayer',
+    JSON.stringify(byUser.get('901')));
+  check('22d. a member with no profile row anywhere keeps their row, their status and a null name (never a dropped member)',
+    byUser.has('904') && byUser.get('904').display_name === null && byUser.get('904').nickname === null
+    && byUser.get('904').membership_status === 'approved' && byUser.get('904').membership_id === 'r904',
+    JSON.stringify(byUser.get('904')));
+  check('22e. resolution is by account id and costs one window read plus one bounded read per un-named member, with no directory paging',
+    plainReads.length === 7 && plainReads[0].query.includes('limit=500') && !plainReads[0].query.includes('page=')
+    && plainReads.slice(1).every((row) => /(^|&)user_id=/.test(row.query) && /(^|&)limit=2(&|$)/.test(row.query))
+    && plainReads.every((row) => row.method === 'GET'),
+    `reads=${plainReads.length} ${JSON.stringify(plainReads.map((row) => row.query))}`);
+  check('22f. enrichment returns the two name fields and nothing else — no avatar, no ai_source, no normalized nickname, no credential',
+    [...new Set((roster.body?.data ?? []).flatMap((row) => Object.keys(row)))].sort().join(',')
+      === 'club_role,display_name,membership_id,membership_status,nickname,user_id'
+    && !/gate-fixture-private-setting|avatar\.invalid|nickname_normalized|filler100/i.test(roster.text),
+    `keys=${JSON.stringify([...new Set((roster.body?.data ?? []).flatMap((row) => Object.keys(row)))])}`);
+  // Both directions of "only the roster's own accounts": the ANSWER can carry nobody else (which is
+  // structurally true while the rows are what is returned, so it would catch a future roster built
+  // FROM the labels instead of FROM the memberships), and the LOOKUPS never asked for anybody else,
+  // which is the half a response-only assertion cannot see.
+  const targetedFilterIds = plainReads
+    .map((row) => new URLSearchParams(row.query).get('user_id'))
+    .filter((id) => id !== null);
+  check('22g. nobody outside the authorized roster is enriched or asked about: the answer holds only roster ids, and so does every targeted directory lookup (item 6)',
+    (roster.body?.data ?? []).every((row) => ['900', '901', '902', '903', '904', '3'].includes(String(row.user_id)))
+    && !/Filler |filler[0-9]/.test(roster.text)
+    && targetedFilterIds.length === 6 && targetedFilterIds.every((id) => ['900', '901', '902', '903', '904', '3'].includes(id)),
+    `ids=${JSON.stringify((roster.body?.data ?? []).map((row) => row.user_id))} looked_up=${JSON.stringify(targetedFilterIds)}`);
+  check('22h. the widened read performs no write at all, reaches only system_admins + the roster + the directory, and leaves every membership row byte-for-byte unchanged (items 1, 9, 10)',
+    plain.ncb.state.reads.slice(beforePlain).every((row) => row.action === 'read')
+    && [...new Set(plain.ncb.state.reads.slice(beforePlain).map((row) => row.table))].sort().join(',')
+      === 'club_memberships,system_admins,user_settings'
+    && JSON.stringify(plain.ncb.tables.club_memberships.map((row) => `${row.id}:${row.user_id}:${row.club_id}:${row.role}:${row.status}`))
+      === JSON.stringify(['r900:900:10:club_admin:approved', 'r901:901:10:member:approved', 'r902:902:10:member:approved',
+        'r903:903:10:member:approved', 'r904:904:10:member:approved', 'r3:3:10:member:approved', 'r2:2:11:club_admin:approved']),
+    JSON.stringify(plain.ncb.state.reads.slice(beforePlain).map((row) => `${row.method} ${row.table}`)));
+  await plain.close();
+
+  // The equality filter is not trusted on the strength of existing code: the three arms below each
+  // break the filter in a measured way and require the roster to come to the same honest answer.
+  const blind = await serveRoster({ blindFilter: true });
+  const beforeBlind = blind.ncb.state.reads.length;
+  const blindRoster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: blind.base });
+  const blindReads = directoryReadsOf(blind.ncb.state, beforeBlind);
+  const blindUsers = rosterOf(blindRoster);
+  check('22i. a BLIND equality filter (200 with no rows while the rows are stored) still yields the names, via the filter-free pages',
+    blindRoster.status === 200 && blindUsers.get('900')?.display_name === 'The Late Member'
+    && blindUsers.get('903')?.display_name === 'Twin B' && blindUsers.get('901')?.display_name === 'Duplicate Profile',
+    `${blindRoster.status} 900=${JSON.stringify(blindUsers.get('900'))}`);
+  // Read as PARAMETERS, never as a substring: `sort=user_id` carries the very text a substring probe
+  // would be looking for, and the directory read is sorted by that column on every page.
+  const blindPaged = blindReads
+    .map((row) => new URLSearchParams(row.query))
+    .filter((params) => params.get('page') !== null);
+  check('22j. and the read that supplied them carried no user_id FILTER (only the sort names that column), so 22i cannot be credited to the filter it just broke',
+    blindPaged.length === 1 && blindPaged[0].get('user_id') === null && blindPaged[0].get('page') === '2'
+    && blindPaged[0].get('limit') === '500' && blindReads.length <= 1 + 6 + 2,
+    `reads=${blindReads.length} paged=${JSON.stringify(blindPaged.map((p) => p.toString()))} all=${JSON.stringify(blindReads.map((row) => row.query))}`);
+  await blind.close();
+
+  const refused = await serveRoster({ refuseTargeted: true });
+  const refusedRoster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: refused.base });
+  const refusedUsers = rosterOf(refusedRoster);
+  check('22k. a REFUSED targeted read is not reported as a fact about a person: the roster still answers 200 and paging names it',
+    refusedRoster.status === 200 && refusedUsers.size === 6
+    && refusedUsers.get('902')?.display_name === 'Twin A',
+    `${refusedRoster.status} ${refusedRoster.text.slice(0, 140)}`);
+  await refused.close();
+
+  const dark = await serveRoster({ refuseTargeted: true, refusePages: true });
+  const darkRoster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: dark.base });
+  const darkUsers = rosterOf(darkRoster);
+  check('22l. when the extra lookups are ALL unreachable the roster is still the roster: 200, every member, null names only',
+    darkRoster.status === 200 && darkUsers.size === 6
+    && ['900', '901', '902', '903', '904', '3'].every((id) => darkUsers.has(id) && darkUsers.get(id).display_name === null)
+    && darkUsers.get('900').club_role === 'club_admin' && darkUsers.get('900').membership_status === 'approved',
+    `${darkRoster.status} ${darkRoster.text.slice(0, 160)}`);
+  await dark.close();
+
+  const foreign = await serveRoster({ misattribute: true });
+  const foreignRoster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: foreign.base });
+  const foreignUsers = rosterOf(foreignRoster);
+  // The mirror image of the blind filter: a read that answers with a row it was not asked for. Each
+  // answer is re-checked against the id it was asked for, or one member would be shown as another.
+  check('22m. a directory answer naming a DIFFERENT account is never attributed: 900 is not presented as 902',
+    foreignUsers.get('902')?.display_name === 'Twin A'
+    && foreignUsers.get('903')?.display_name === 'Twin B'
+    && (foreignUsers.get('900')?.display_name ?? null) !== 'Twin B'
+    && (foreignUsers.get('900')?.nickname ?? null) !== 'TwinPlayer',
+    `900=${JSON.stringify(foreignUsers.get('900'))}`);
+  await foreign.close();
+
+  // Authorization and the response contract must survive the widening untouched. The comparison is
+  // against the SAME storage served by a deployment that declared no directory at all: the only
+  // legal difference between the two answers is the presence of the two name fields.
+  const fiveTable = JSON.parse(JSON.stringify(SCHEMA_OBJECT));
+  delete fiveTable.tables.users;
+  delete fiveTable.columns.users;
+  const noDir = await serveIsolated({
+    env: { ...ROSTER_ENV, CLUB_NCB_SCHEMA_JSON: JSON.stringify(fiveTable) },
+    fetchImpl: makeRosterNcb().fetchImpl
+  });
+  const noDirRoster = await ask('GET', `/clubs/${ROSTER_CLUB}/members`, { token: CALLER_TOKEN, base: noDir.base });
+  const stripNames = (rows) => (rows ?? []).map(({ display_name, nickname, ...rest }) => rest);
+  check('22n. membership, role, status and the stable ids are byte-identical to the same roster read with no directory (items 1, 10)',
+    noDirRoster.status === 200
+    && JSON.stringify(stripNames(roster.body?.data)) === JSON.stringify(stripNames(noDirRoster.body?.data)),
+    `with=${JSON.stringify(stripNames(roster.body?.data))?.slice(0, 160)} without=${JSON.stringify(stripNames(noDirRoster.body?.data))?.slice(0, 160)}`);
+  await noDir.close();
+
+  const denied = await serveRoster();
+  const beforeDenied = denied.ncb.state.reads.length;
+  const crossAdmin = await ask('GET', '/clubs/10/members', { token: 'tok-admin10', base: denied.base });
+  const plainMember = await ask('GET', '/clubs/10/members', { token: 'tok-member10', base: denied.base });
+  const anonMember = await call('GET', '/clubs/10/members', { base: denied.base });
+  const deniedReads = directoryReadsOf(denied.ncb.state, beforeDenied);
+  check('22o. the widened read grants nothing it did not have: another club\'s admin, an ordinary member and an anonymous caller are all refused, and a refusal costs no directory read',
+    crossAdmin.status === 403 && crossAdmin.body.error === 'not_a_club_admin'
+    && plainMember.status === 403 && plainMember.body.error === 'not_a_club_admin'
+    && anonMember.status === 401 && deniedReads.length === 0,
+    `${crossAdmin.status}/${plainMember.status}/${anonMember.status} reads=${deniedReads.length}`);
+  await denied.close();
+}
+
 // ── 16. the one-time super-admin bootstrap ───────────────────────────────────
 // The bootstrap is the only code path in NodeSend that WRITES system_admins, i.e. the only place a
 // Super Admin can come from at all. It is tested against the real store and the real club account

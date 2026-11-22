@@ -76,6 +76,28 @@ function rowsOf(body) {
 // must not be turned into a clean `already_in_club` answer.
 const DUPLICATE_KEY = /duplicate|unique|constraint|already exists/i;
 
+/*
+ * THE COST MODEL OF RESOLVING A ROSTER'S NAMES PAST THE FIRST DIRECTORY WINDOW.
+ *
+ * Two primitives reach a directory row that the first window did not name, and which one is cheap
+ * depends on how many ids are missing:
+ *   * a targeted equality read — narrow (it asks only for rows this caller is already entitled to,
+ *     never for the directory at large) and O(missing), but its answer is only as trustworthy as
+ *     the filter;
+ *   * the filter-free paginated scan — O(directory), but it depends on nothing but `page`/`limit`,
+ *     which is the grammar measured against the live proxy on 2026-11-18 rather than inferred.
+ *
+ * TARGETED_LOOKUP_MAX_IDS is the switch between them, and the scan is ALSO what runs when the
+ * targeted reads come back empty for every id: a filtered list read answering 200-with-no-rows while
+ * the rows are stored is a measured behaviour of this backend (2026-11-20, on a marker column that
+ * demonstrably held rows), so zero hits does not prove those accounts have no profile.
+ */
+const TARGETED_LOOKUP_MAX_IDS = 20;
+const TARGETED_LOOKUP_CONCURRENCY = 5;
+// Pages beyond the first, for a directory this relay is willing to page through for one roster.
+// Exhausting the table ends the loop early, so this is a runaway guard, not the expected cost.
+const DIRECTORY_SCAN_PAGE_BUDGET = 10;
+
 /**
  * @param {object} options
  * @param {object} options.client   a configured ncbAccountClient
@@ -226,7 +248,8 @@ function createClubNcbStore({ client, schema }) {
   const directoryTable = schema.directory ? schema.directory.table : '';
 
   /**
-   * One bounded scan of the directory table, shared by search and by member-name enrichment.
+   * One bounded page of the directory table. `scanDirectory()` (page 1) is what account search
+   * reads; member-name enrichment pages forward from it when page 1 does not cover the roster.
    *
    * WHY A SCAN AT ALL: the live backend offers no partial-match operator — `?search=`, `?q=` and
    * `?like=` each answer HTTP 500 `Unknown column 'search' in 'where clause'` and a wildcard value
@@ -240,11 +263,18 @@ function createClubNcbStore({ client, schema }) {
    * nobody in BridgeMind holds that name — the same class of lie the club list was fixed for, aimed
    * at real people instead of at rows.
    */
-  async function scanDirectory() {
+  async function directoryWindow({ page = 1 } = {}) {
     if (!schema.directory) return { unconfigured: true };
-    const found = await rowsOrRefusal(directoryTable, `limit=${schema.rowLimit}&sort=${D.userId}&order=asc`);
+    // `page` is sent only when the caller needs something the first page cannot hold, so an
+    // unpaged read stays byte-identical to the read this deployment has always made.
+    const query = `limit=${schema.rowLimit}${page > 1 ? `&page=${page}` : ''}&sort=${D.userId}&order=asc`;
+    const found = await rowsOrRefusal(directoryTable, query);
     if (found.refusal) return { refusal: found.refusal, detail: found.detail };
     return { rows: found.rows, truncated: found.rows.length >= schema.rowLimit };
+  }
+
+  function scanDirectory() {
+    return directoryWindow();
   }
 
   function directoryLabel(row) {
@@ -302,14 +332,121 @@ function createClubNcbStore({ client, schema }) {
     };
   }
 
-  async function directoryLabels() {
-    if (!schema.directory) return { labels: null };
-    const scan = await scanDirectory();
-    if (scan.refusal) return { error: scan.refusal, detail: scan.detail };
-    const labels = new Map();
-    for (const row of scan.rows) {
+  /**
+   * Records, per account id, the directory row that names it — of the ids still outstanding and no
+   * others. Rows for people this roster does not contain are walked past, never collected.
+   *
+   * The first row for an id wins, because `user_settings` has no unique constraint on the user id
+   * and a second row is storage noise rather than a second person. The one exception is a row that
+   * carries no name text at all: it must not mask a later row that does, which is what the same
+   * account looks like after a half-finished profile write.
+   */
+  function collectLabels(into, rows, outstanding) {
+    for (const row of rows) {
       const label = directoryLabel(row);
-      if (label.user_id !== '' && !labels.has(label.user_id)) labels.set(label.user_id, label);
+      if (label.user_id === '' || !outstanding.has(label.user_id)) continue;
+      const held = into.get(label.user_id);
+      if (held && (held.nickname !== '' || held.display_name !== '')) continue;
+      into.set(label.user_id, label);
+    }
+  }
+
+  /**
+   * One bounded read per account id, for ids the first directory window did not name.
+   *
+   * The ids come from the authorized roster rows and nowhere else, so this narrows directory access
+   * rather than widening it: it asks for the people this caller has already been allowed to list.
+   * `limit=2`, not 1, because `user_settings` carries no unique constraint on the user id (the app
+   * deletes its own leftover rows) — a second row is then visible to the caller instead of
+   * invisible, and a row holding no name text must not mask one that does.
+   *
+   * Each answer is re-checked against the id it was asked for. That is the half of "do not trust the
+   * filter" that runs the other way: were this backend to IGNORE a filter it does not understand and
+   * hand back rows it was not asked for, an unchecked read would attribute a stranger's name to a
+   * club member.
+   *
+   * `refused` counts reads that could not be made. A refusal is not a fact about a person, and it
+   * never becomes one here.
+   */
+  async function targetedDirectoryLabels(ids) {
+    const labels = new Map();
+    let hits = 0;
+    let refused = 0;
+    const outstanding = new Set(ids);
+    for (let i = 0; i < ids.length; i += TARGETED_LOOKUP_CONCURRENCY) {
+      const answers = await Promise.all(ids.slice(i, i + TARGETED_LOOKUP_CONCURRENCY).map(async (userId) => {
+        const found = await rowsOrRefusal(directoryTable, `${D.userId}=${encodeURIComponent(userId)}&limit=2`);
+        return { userId, found };
+      }));
+      for (const { userId, found } of answers) {
+        if (found.refusal) {
+          refused += 1;
+          continue;
+        }
+        const mine = found.rows.map(directoryLabel).filter((label) => label.user_id === userId);
+        if (mine.length === 0) continue;
+        hits += 1;
+        labels.set(userId, mine.find((label) => label.nickname !== '' || label.display_name !== '') ?? mine[0]);
+        outstanding.delete(userId);
+      }
+    }
+    return { labels, hits, refused, outstanding };
+  }
+
+  /**
+   * The display labels for the account ids an AUTHORIZED roster already names.
+   *
+   * WHY IT IS NOT ONE WINDOW READ ANYMORE. `GET /clubs/{clubId}/members` used to enrich every row
+   * from a single `limit=CLUB_NCB_ROW_LIMIT` read of the directory sorted by user id, and the members
+   * past that window came back as `null` names on a 200 that looked complete — `scanDirectory()`
+   * computed a `truncated` flag and `directoryLabels()` discarded it, so an account the relay never
+   * looked at was indistinguishable from an account with no profile. On a directory of more than
+   * `CLUB_NCB_ROW_LIMIT` rows that silently understated the roster for exactly the members whose ids
+   * sort late.
+   *
+   * The window read stays first: one call covers every member of any deployment whose directory fits
+   * in it, and that is the common case whose cost must not change. What changes is that a FULL
+   * window is now read as incomplete rather than as the directory, and the ids it missed are
+   * resolved by id (small residual) or by paging forward (large one, or a residual a blind equality
+   * filter cannot be trusted to have answered).
+   *
+   * A name that still cannot be resolved stays `null` on a row that is still returned: the
+   * membership is the authority, and this is decoration. Only the FIRST read failing is a refusal
+   * (`{ error }`), which is the roster's own rule — an unreadable directory has never been allowed
+   * to read as "nobody is a member".
+   */
+  async function directoryLabelsFor(userIds = []) {
+    const labels = new Map();
+    const wanted = [...new Set(userIds.map(eq).filter((id) => id !== ''))].sort();
+    if (!schema.directory || wanted.length === 0) return { labels };
+
+    const first = await directoryWindow();
+    if (first.refusal) return { error: first.refusal, detail: first.detail };
+    collectLabels(labels, first.rows, new Set(wanted));
+    // A window that did not fill up IS the whole table, so an id it did not name provably has no
+    // directory row. This is the only branch entitled to answer without looking again.
+    if (!first.truncated) return { labels };
+
+    let outstanding = new Set(wanted.filter((id) => !labels.has(id)));
+    if (outstanding.size <= TARGETED_LOOKUP_MAX_IDS) {
+      const targeted = await targetedDirectoryLabels([...outstanding]);
+      for (const [id, label] of targeted.labels) labels.set(id, label);
+      outstanding = targeted.outstanding;
+      if (outstanding.size === 0) return { labels };
+      // Any one hit proves the equality filter reaches this table, so the ids it still says nothing
+      // about are ids with no row. Zero hits over a non-empty residual proves nothing.
+      if (targeted.hits > 0 && targeted.refused === 0) return { labels };
+    }
+
+    for (let page = 2; outstanding.size > 0 && page <= 1 + DIRECTORY_SCAN_PAGE_BUDGET; page += 1) {
+      const next = await directoryWindow({ page });
+      // Names are decoration: a page this relay cannot read leaves those members unnamed on a
+      // roster it can still answer, and says so in the store's failure list rather than in the
+      // status code. The window read above is the one whose failure is a refusal.
+      if (next.refusal) break;
+      collectLabels(labels, next.rows, outstanding);
+      for (const id of [...outstanding]) if (labels.has(id)) outstanding.delete(id);
+      if (next.rows.length < schema.rowLimit) break;
     }
     return { labels };
   }
@@ -400,12 +537,13 @@ function createClubNcbStore({ client, schema }) {
     }));
     if (rows.length === 0 || !schema.directory) return rows;
     // Names are decoration on a row whose authority is the membership itself, so an unresolved name
-    // is `null` and not a missing member. The directory read is one scan, not one per member: a
-    // roster is the list an admin acts on, and a 500-member club must not cost 500 REST calls.
-    const directory = await directoryLabels();
+    // is `null` and not a missing member. Resolution is driven by the ids THIS roster holds and
+    // starts from one window read, because a roster is the list an admin acts on and a 500-member
+    // club must not cost 500 REST calls. Only the members that window could not name cost more.
+    const directory = await directoryLabelsFor(rows.map((row) => row.user_id));
     if (directory.error) return { error: directory.error, detail: directory.detail };
     for (const row of rows) {
-      const label = directory.labels?.get(row.user_id);
+      const label = directory.labels.get(row.user_id);
       row.display_name = label?.display_name || null;
       row.nickname = label?.nickname || null;
     }
