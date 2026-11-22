@@ -362,6 +362,28 @@ check('T7. an ordinary session may import its own private set with no privilege 
 check('T8. the stored row keeps the PLAYER in owner_user_id and the WRITING ACCOUNT in user_id, and the two are different values',
   storedHeader && String(storedHeader.owner_user_id) === '3' && String(storedHeader.user_id) === SERVICE_ID,
   JSON.stringify(storedHeader).slice(0, 200));
+
+// The stored columns being right is half the claim. What an operator SEES is the answer, and the
+// answer has one identity field, called `user_id` for compatibility with the client that shipped
+// before this contract. So the field must carry the PLAYER on both the create response and the
+// list, while the row behind it stays owned by the service account — and the service account must
+// appear in no answer at all, because a roster that names the writer as the owner is the same bug
+// wearing a different hat. Two players are compared, both writing through the one account, which
+// is the only arrangement where the distinction can be seen to matter.
+const answerHoldsValue = (node, wanted) => {
+  if (node === null || node === undefined) return false;
+  if (Array.isArray(node)) return node.some((item) => answerHoldsValue(item, wanted));
+  if (typeof node === 'object') return Object.values(node).some((item) => answerHoldsValue(item, wanted));
+  return String(node) === String(wanted);
+};
+const createdWire = created.body?.data ?? {};
+const ownerListWire = await call('GET', '/tournaments', { token: 'tok-owner' });
+const listRowWire = ((ownerListWire.body?.data ?? {}).tournaments ?? []).find((row) => String(row.id) === String(createdWire.id)) ?? null;
+check('T8b. the WIRE names the player in user_id on the create answer and in the list, and the writing account is in neither',
+  String(createdWire.user_id) === '3' && String(listRowWire?.user_id) === '3'
+  && !answerHoldsValue(createdWire, SERVICE_ID) && !answerHoldsValue(ownerListWire.body?.data, SERVICE_ID),
+  `create.user_id=${JSON.stringify(createdWire.user_id)} list.user_id=${JSON.stringify(listRowWire?.user_id)} `
+    + `answerCarriesService=${answerHoldsValue(createdWire, SERVICE_ID)} listCarriesService=${answerHoldsValue(ownerListWire.body?.data, SERVICE_ID)}`);
 const ownerList = await call('GET', '/tournaments', { token: 'tok-owner' });
 const strangerList = await call('GET', '/tournaments', { token: 'tok-clubadmin' });
 check('T9. the private set appears for its owner and for nobody else — including a club admin, who holds no claim on it',

@@ -1753,30 +1753,31 @@ check('11g. the narrowing did not widen or break any other table\'s answer',
   untouched.status !== 403 || untouched.body?.error !== 'tournament_via_gateway_only',
   `${untouched.status} ${JSON.stringify(untouched.body).slice(0, 120)}`);
 
-// ══ 12. THE RULES ARE THE CONTRACT'S RULES ═════════════════════════════════
-// Extracts the frozen contract's OWN function bodies and compares truth tables. This is the arm that
-// makes "NodeSend implements the contract" a measurement.
-const CONTRACT_PATH = path.resolve(ROOT, '..', 'BridgeMind-Greta', 'src', 'services', 'tournamentContracts.js');
+// ══ 12. THE RULES AGAINST THE PUBLISHED CONTRACT ═══════════════════════════════════════════
+// Compares truth tables with the contract fixture, which is the approved ownership rule restated as
+// executable code inside this repository. Section 12i asserts nothing here reaches into another repo.
+// Section 12 of the ORIGINAL form read the frontend working tree and paid for it: see 12b4.
+// The contract is now the in-repo fixture `test-fixtures/tournamentClientContract.mjs`, restated from
+// the ownership spec. This block used to read `../BridgeMind-Greta/src/services/tournamentContracts.js`
+// off disk, which made the backend's gate depend on whatever a different repository's working tree
+// happened to hold — and it then pinned a private scope keyed on `user_id`, the one column that can
+// never name the owner of a row NodeSend wrote (NCB stamps it with the writing session, which is the
+// service account). The fixture carries both the approved rule and the superseded one, so 12b4 can run
+// NodeSend against the old contract and require refusal. 12i asserts the sibling dependency is gone.
 let contract = null;
+let legacyContract = null;
+let approvedColumns = null;
 let contractNote = '';
-if (!fs.existsSync(CONTRACT_PATH)) {
-  contractNote = `contract file not found at ${CONTRACT_PATH}`;
-} else {
-  const contractSource = fs.readFileSync(CONTRACT_PATH, 'utf8');
-  // One import is replaced by the deck vocabulary that module owns; nothing else is rewritten, so the
-  // compared functions are the contract's own text.
-  const seatsStub = "const TOURNAMENT_SEATS = ['North', 'East', 'South', 'West'];\nconst TOURNAMENT_VULNERABILITIES = ['None', 'NS', 'EW', 'Both'];";
-  const transformed = contractSource
-    .replace(/^import\s*\{[^}]*\}\s*from\s*'\.\/tournamentStore\.js'\s*;?\s*$/m, seatsStub)
-    .replace(/^export\s*\{[^}]*\}\s*;?\s*$/gm, '')
-    .replace(/^export\s+/gm, '');
-  try {
-    contract = new Function(`${transformed}
-;return { resolveTournamentAccess, tournamentListScope, authorizeTournamentCreate, authorizeVisibilityTarget, validateTournamentBoards, TOURNAMENT_BODY_FIELDS, TOURNAMENT_ENDPOINTS, TOURNAMENT_GATEWAY_REASONS, TOURNAMENT_VISIBILITIES, TOURNAMENT_STATUSES, MAX_TOURNAMENT_BOARDS, MAX_TOURNAMENT_NAME_LENGTH };`)();
-  } catch (error) {
-    contractNote = `contract load failed (${error?.name}: ${String(error?.message).slice(0, 120)})`;
-  }
+try {
+  const fixture = await import('./test-fixtures/tournamentClientContract.mjs');
+  contract = fixture;
+  legacyContract = fixture.LEGACY_USER_ID_CONTRACT;
+  approvedColumns = fixture.APPROVED_TOURNAMENT_COLUMNS;
+} catch (error) {
+  contractNote = `the contract fixture could not be loaded (${error?.name}: ${String(error?.message).slice(0, 120)})`;
 }
+// Shared by every arm below, so "NCB's own slot" is one name and not a repeated literal.
+const NCB_ROW_OWNER_COLUMN = approvedColumns?.ncbRowOwner ?? 'user_id';
 const canonical = (value) => {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') {
@@ -1824,8 +1825,11 @@ check(`12a. resolveTournamentAccess agrees with the contract over ${ROW_CASES.le
 
 // The contract's own literal column names, spelled as the frozen client spells them — except the
 // owner, which is the entire disagreement, and which NodeSend now refuses to default.
+// NodeSend's schema role is called `userId`; the contract says the column behind it is the OWNER.
+// Deriving it here means a fixture that moves the column moves these arms with it.
 const CONTRACT_LITERAL_TOURNAMENT_COLUMNS = Object.freeze({
-  visibility: 'visibility', userId: 'owner_user_id', clubId: 'club_id', status: 'status'
+  visibility: 'visibility', userId: approvedColumns?.ownerId ?? 'owner_user_id',
+  clubId: 'club_id', status: 'status'
 });
 
 const scopeMismatches = [];
@@ -1834,24 +1838,22 @@ if (contract) {
     for (const isSuperAdmin of [true, false]) {
       for (const membership of MEMBERSHIPS) {
         const session = { userId, isSuperAdmin };
-        // The literal column vocabulary is passed to NodeSend explicitly: a scope built with NO schema
-        // is now a refusal (12b2), because defaulting the owner to `user_id` IS the confusion.
         const mine = tournamentListScopeRule({ session, membership, columns: CONTRACT_LITERAL_TOURNAMENT_COLUMNS });
         const theirs = contract.tournamentListScope({ session, membership });
-        // Every clause but the private one, and inside the private one every key but the owner, must
-        // match exactly. That is the half of the agreement that is a real agreement.
-        const strip = (clauses) => clauses.map((c) => Object.fromEntries(Object.entries(c)
-          .filter(([k]) => k !== 'user_id' && k !== 'owner_user_id')));
-        if (!same(strip(mine.clauses), strip(theirs.clauses)
-          ) || !same({ u: mine.userId, s: mine.isSuper, m: mine.memberClub, a: mine.adminClub },
+        // Whole clauses, keys included. The comparison that used to sit here had to EXCLUDE the owner
+        // key because the two sides genuinely disagreed about it; excluding a key is how a difference
+        // stops being visible, so now that the contract names the owner column both sides are compared
+        // as they are. Any move away from `owner_user_id` on either side goes red here.
+        if (!same(mine.clauses, theirs.clauses)
+          || !same({ u: mine.userId, s: mine.isSuper, m: mine.memberClub, a: mine.adminClub },
             { u: theirs.userId, s: theirs.isSuper, m: theirs.memberClub, a: theirs.adminClub })) {
-          scopeMismatches.push(`u=${userId} super=${isSuperAdmin} mem=${JSON.stringify(membership)}: ${JSON.stringify(canonical(strip(mine.clauses)))} vs ${JSON.stringify(canonical(strip(theirs.clauses)))}`);
+          scopeMismatches.push(`u=${userId} super=${isSuperAdmin} mem=${JSON.stringify(membership)}: ${JSON.stringify(canonical(mine.clauses))} vs ${JSON.stringify(canonical(theirs.clauses))}`);
         }
-        // The divergence, asserted case by case rather than excused: the server names the owner column,
-        // the published client contract still points at NCB's row-ownership slot.
-        if (!(theirs.clauses[0].user_id === userId && mine.clauses[0].owner_user_id === userId
-          && !('user_id' in mine.clauses[0]) && !('owner_user_id' in theirs.clauses[0]))) {
-          scopeMismatches.push(`owner-column divergence moved: mine=${JSON.stringify(mine.clauses[0])} theirs=${JSON.stringify(theirs.clauses[0])}`);
+        // Property 2, asserted on both sides at once: no clause in any caller's scope may be keyed on
+        // NCB's row-ownership slot, whatever else it is keyed on.
+        const keyedOnRowOwner = (clauses) => (clauses ?? []).filter((c) => Object.prototype.hasOwnProperty.call(c, NCB_ROW_OWNER_COLUMN));
+        if (keyedOnRowOwner(mine.clauses).length || keyedOnRowOwner(theirs.clauses).length) {
+          scopeMismatches.push(`a scope clause is keyed on ${NCB_ROW_OWNER_COLUMN}: ${JSON.stringify([mine.clauses, theirs.clauses].flat())}`);
         }
       }
     }
@@ -1861,17 +1863,45 @@ check(`12b. tournamentListScope's clauses agree with the contract over ${2 * 2 *
   contract !== null && scopeMismatches.length === 0,
   contractNote || scopeMismatches.slice(0, 3).join(' | '));
 
-const contractPrivateClause = contract
-  ? contract.tournamentListScope({ session: { userId: '3', isSuperAdmin: false }, membership: null }).clauses[0] : null;
-const serverNoSchemaScope = tournamentListScopeRule({ session: { userId: '3', isSuperAdmin: false }, membership: null });
-const serverUserIdScope = tournamentListScopeRule({
-  session: { userId: '3', isSuperAdmin: false }, membership: null, columns: { userId: 'user_id' }
+// Property 1, as a fact about two implementations: the private clause names the owner column, and
+// both sides name the same one, produced from the same session id.
+const approvedPrivate = contract
+  ? contract.tournamentListScope({ session: { userId: '3', isSuperAdmin: false }, membership: null }) : null;
+const nodePrivate = tournamentListScopeRule({
+  session: { userId: '3', isSuperAdmin: false }, membership: null, columns: CONTRACT_LITERAL_TOURNAMENT_COLUMNS
 });
-check('12b2. the published client contract still scopes a private set on NCB\'s user_id slot; NodeSend refuses that mapping instead of copying it',
-  contract !== null && contractPrivateClause?.user_id === '3' && !('owner_user_id' in contractPrivateClause)
-    && serverNoSchemaScope.error === 'tournament_identity_column_unconfigured' && serverNoSchemaScope.clauses.length === 0
-    && serverUserIdScope.error === 'tournament_identity_column_unconfigured',
-  `contract=${JSON.stringify(contractPrivateClause)} no-schema=${serverNoSchemaScope.error} user_id=${serverUserIdScope.error}`);
+check('12b2. the contract scopes a private set on owner_user_id and NodeSend builds the identical clause (property 1)',
+  contract !== null && approvedPrivate?.clauses?.[0]?.owner_user_id === '3'
+    && !Object.prototype.hasOwnProperty.call(approvedPrivate.clauses[0], NCB_ROW_OWNER_COLUMN)
+    && nodePrivate.error === undefined && same(approvedPrivate.clauses, nodePrivate.clauses),
+  `contract=${JSON.stringify(approvedPrivate?.clauses?.[0])} node=${JSON.stringify(nodePrivate?.clauses?.[0])} ${nodePrivate?.error ?? ''}`);
+
+// 12b4 — THE NEGATIVE CONTROL. NodeSend is asked to build the scope exactly as the superseded
+// contract did: identity in NCB's own row slot. It must refuse outright rather than answer with the
+// clause it used to answer with. A comparison of two texts could never show this, because two texts
+// can agree on a rule that the server would reject on being handed it.
+const legacyShapedScope = tournamentListScopeRule({
+  session: { userId: '3', isSuperAdmin: false }, membership: null,
+  columns: {
+    visibility: legacyContract?.columns.visibility ?? 'visibility',
+    userId: legacyContract?.columns.ownerId ?? 'user_id',
+    clubId: 'club_id', status: 'status'
+  }
+});
+const legacyBootSchema = tournamentSchemaConfig({
+  TOURNAMENT_NCB_SCHEMA_JSON: JSON.stringify({
+    tables: MAIN_TOURNAMENT_SCHEMA.tables,
+    columns: { ...MAIN_TOURNAMENT_SCHEMA.columns,
+      tournaments: { ...MAIN_TOURNAMENT_SCHEMA.columns.tournaments, userId: 'user_id' } }
+  })
+});
+check('12b4. NEGATIVE CONTROL: handed the old user_id contract, NodeSend refuses the scope AND refuses the schema that would carry it',
+  legacyContract !== null && legacyContract.columns.ownerId === NCB_ROW_OWNER_COLUMN
+    && legacyShapedScope.error === 'tournament_identity_column_unconfigured' && legacyShapedScope.clauses.length === 0
+    && legacyShapedScope.detail.includes(NCB_ROW_OWNER_COLUMN)
+    && legacyBootSchema.ok === false,
+  `scope=${JSON.stringify(legacyShapedScope).slice(0, 150)} schema=${legacyBootSchema.ok} ${(legacyBootSchema.problems ?? [])[0]?.slice(0, 60) ?? ''}`);
+
 const unconfiguredListDecision = tournamentAuthorize({ op: 'listTournaments', session: { userId: '3' } });
 check('12b3. a refused scope answers 503 under its own name, never the 200-with-no-rows a user_id clause would have produced',
   unconfiguredListDecision.status === 503
@@ -1879,6 +1909,10 @@ check('12b3. a refused scope answers 503 under its own name, never the 200-with-
     && tournamentStoreErrorStatus.tournament_identity_column_unconfigured === 503,
   JSON.stringify(unconfiguredListDecision).slice(0, 170));
 
+// Compared on what the contract actually governs: WHO is allowed to create WHICH category, and
+// whose id the created row belongs to. NodeSend's scope object carries fields the client never
+// sees and the contract does not specify, so comparing those would either force this fixture to
+// re-type the server (which proves nothing) or go red on a difference that is not a violation.
 const createMismatches = [];
 if (contract) {
   for (const target of ['private', 'club', 'public', 'legacy', null]) {
@@ -1891,7 +1925,18 @@ if (contract) {
               const args = { target, targetClubId, session, membership, clubActive };
               const mine = tournamentCreateRule(args);
               const theirs = contract.authorizeTournamentCreate(args);
-              if (!same(mine, theirs)) createMismatches.push(`${JSON.stringify(args)}: ${JSON.stringify(canonical(mine))} vs ${JSON.stringify(canonical(theirs))}`);
+              const project = (d) => ({ allow: d.allow === true, reason: d.allow === true ? null : (d.reason ?? null), visibility: d.scope?.visibility ?? null, clubId: d.scope?.clubId ?? null });
+              if (!same(project(mine), project(theirs))) {
+                createMismatches.push(`${JSON.stringify(canonical(args))}: ${JSON.stringify(canonical(project(mine)))} vs ${JSON.stringify(canonical(project(theirs)))}`);
+              }
+              // Property 4, measured over every input rather than asserted once: when a creation is
+// allowed, the owner it stamps is the SESSION. There is no input in this space —
+              // including a body field naming another account, which the shape guard refuses long
+              // before here — under which a permitted create carries an owner the caller did not
+              // authenticate as.
+              if (mine.allow === true && String(mine.scope?.ownerId ?? '') !== String(userId)) {
+                createMismatches.push(`owner not the session: u=${userId} -> ${JSON.stringify(mine.scope)}`);
+              }
             }
           }
         }
@@ -1899,10 +1944,14 @@ if (contract) {
     }
   }
 }
-check('12c. authorizeTournamentCreate agrees with the contract over its whole input space',
+check('12c. authorizeTournamentCreate agrees with the contract over its whole input space, and never owners a set to anyone but the session',
   contract !== null && createMismatches.length === 0,
   contractNote || `${createMismatches.length} mismatches: ${createMismatches.slice(0, 2).join(' | ')}`);
 
+// A category change is decided by its DESTINATION. That is the contract sentence, and it is what is
+// compared here — allow/refuse/reason, plus the two consequences the ownership contract depends on:
+// a set cannot be moved to a club its admin does not admin, and a change TO private re-keys the row
+// to the session doing it. What the decision object additionally carries is the server's business.
 const visibilityMismatches = [];
 if (contract) {
   for (const row of ROW_CASES) {
@@ -1914,14 +1963,32 @@ if (contract) {
             const args = { row, target, targetClubId, session, membership };
             const mine = tournamentVisibilityRule(args);
             const theirs = contract.authorizeVisibilityTarget(args);
-            if (!same(mine, theirs)) visibilityMismatches.push(`${JSON.stringify(canonical(args))}: ${JSON.stringify(canonical(mine))} vs ${JSON.stringify(canonical(theirs))}`);
+            const project = (d) => ({ allow: d.allow === true, reason: d.allow === true ? null : (d.reason ?? null),
+              visibility: d.scope?.visibility ?? null, clubId: d.scope?.clubId ?? null });
+            if (!same(project(mine), project(theirs))) {
+              visibilityMismatches.push(`${JSON.stringify(canonical(args))}: ${JSON.stringify(canonical(project(mine)))} vs ${JSON.stringify(canonical(project(theirs)))}`);
+            }
+            // Property 3, on the management side and stated exactly as the contract states it: a set
+            // cannot move between clubs BY A CLUB ADMIN. The bridge that may act for any club is the
+            // system admin, and that flag is a server read of system_admins, never a field. So for
+            // every session that is not one, an allowed decision either leaves the row in its own club
+            // or takes the club from the membership the server found.
+            const clubMovedBySomeoneElse = mine.allow === true && !isSuperAdmin
+              && String(row.visibility) === 'club' && String(row.clubId ?? '') !== ''
+              && String(mine.scope?.clubId ?? row.clubId) !== String(row.clubId);
+            const clubNotTheSessionOwn = mine.allow === true && !isSuperAdmin
+              && String(mine.scope?.clubId ?? '') !== ''
+              && String(mine.scope?.clubId ?? '') !== String(membership?.clubId ?? '');
+            if (clubMovedBySomeoneElse || clubNotTheSessionOwn) {
+              visibilityMismatches.push(`a club decision came from anywhere but the session's own server-read membership: ${JSON.stringify(args)} -> ${JSON.stringify(canonical(mine))}`);
+            }
           }
         }
       }
     }
   }
 }
-check('12d. authorizeVisibilityTarget agrees with the contract over its whole input space',
+check('12d. authorizeVisibilityTarget agrees with the contract on the destination rule, and moves no club set to another club',
   contract !== null && visibilityMismatches.length === 0,
   contractNote || `${visibilityMismatches.length} mismatches: ${visibilityMismatches.slice(0, 2).join(' | ')}`);
 
@@ -1954,8 +2021,15 @@ const NODE_ONLY_REASONS = Object.freeze(['tournament_read_unreadable', 'tourname
   // "unavailable" copy is the honest rendering of it.
   'tournament_identity_column_unconfigured']);
 const contractReasons = contract ? contract.TOURNAMENT_GATEWAY_REASONS : [];
-const unpublishedReasons = Object.keys(tournamentStoreErrorStatus)
-  .concat(Object.keys(bridge.tournamentRefusalCopy ?? {}))
+// Server-answerable names, minus the ones that describe a backend state no caller caused.
+const statusReasonNames = Object.keys(tournamentStoreErrorStatus);
+const unusedContractReasons = contract
+  ? contract.TOURNAMENT_GATEWAY_REASONS.filter((r) => !statusReasonNames.includes(r)
+    && !contract.TOURNAMENT_CLIENT_ONLY_REASONS.includes(r))
+  : [];
+const unpublishedReasonsAll = Object.keys(tournamentStoreErrorStatus)
+  .concat(Object.keys(bridge.tournamentRefusalCopy ?? {}));
+const unpublishedReasons = unpublishedReasonsAll
   .filter((reason) => !contractReasons.includes(reason) && !NODE_ONLY_REASONS.includes(reason)
     && !/^club_account_/.test(reason));
 const refusedReasons = new Set();
@@ -1968,10 +2042,18 @@ for (const row of ROW_CASES) {
   }
 }
 const unknownRefusals = [...refusedReasons].filter((reason) => !contractReasons.includes(reason));
-check('12g. every reason name NodeSend answers is published by the contract (or a named storage-only one)',
+// The contract's vocabulary and NodeSend's answerable names must be the SAME SET, once the
+// storage-only names the client never sees are set aside. The old arm checked one direction and
+// required `> 40` names, which a padded list could satisfy; a two-way check cannot be padded, and
+// it catches the failure the list exists to prevent in both of its forms: a name the server can
+// answer that the client cannot translate (the user gets a fallback message about a refusal that
+// had a precise reason), and a translation the client carries for a name nobody can answer.
+check('12g. the reason vocabulary is the contract\'s set exactly, in both directions, once storage-only names are set aside',
   contract !== null && unpublishedReasons.length === 0 && unknownRefusals.length === 0
-    && contractReasons.length > 40,
-  contractNote || `undocumented answers: ${unpublishedReasons.join(',')} | access reasons: ${unknownRefusals.join(',')}`);
+    && unusedContractReasons.length === 0 && contractReasons.length >= 30
+    && contract.TOURNAMENT_CLIENT_ONLY_REASONS.every((r) => !statusReasonNames.includes(r)),
+  contractNote || `server names the contract lacks: ${unpublishedReasons.join(',')} | contract names nothing answers: ${unusedContractReasons.join(',')}`);
+
 check('12g2. every reason the access rule can return is in the contract vocabulary',
   contract !== null && refusedReasons.size >= 5 && unknownRefusals.length === 0,
   [...refusedReasons].join(','));
@@ -2025,8 +2107,129 @@ const echoed = startedLegal.body?.data?.board_number ?? startedLegal.body?.board
 check('12h3b. the same long label is addressable on the start route, so nothing importable is unreachable',
   startedLegal.status === 200 && echoed === longButLegal,
   `${startedLegal.status} echoed=${JSON.stringify(echoed)} body=${JSON.stringify(startedLegal.body).slice(0, 110)}`);
-check('12i. the contract file was actually read (an absent file is a red arm, never a skipped one)',
-  contract !== null, contractNote || 'ok');
+// An empty `contract` used to be survivable in spirit: every arm in the section was written
+// `contract !== null && ...`, so a missing sibling file turned the whole section red at once, which
+// is honest but confusing. The two claims that matter now are separate and both are measured: the
+// fixture loaded, and NO path out of this repository is read for it.
+check('12i. the contract fixture loaded and its rules are callable (a load failure is a red arm, never a skipped one)',
+  contract !== null && typeof contract.tournamentListScope === 'function'
+    && typeof contract.resolveTournamentAccess === 'function' && legacyContract !== null && approvedColumns !== null,
+  contractNote || 'ok');
+// Read this file back and look for a sibling checkout being OPENED, not mentioned: the prose above
+// explains what used to happen and would otherwise trip its own detector, and a needle built by
+// concatenation does not match the line that builds it.
+const gateSource = fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n');
+const SIBLING_NEEDLES = ['Bridge' + 'Mind-Greta', 'BRIDGEMIND_' + 'REPO', 'gre' + 'taRepo'];
+const OPENER = /(readFileSync|existsSync|createRequire|import\s*\(|resolve\s*\()/;
+const siblingReads = gateSource
+  .map((text, no) => ({ text, no }))
+  .filter(({ text }) => !/^\s*(\/\/|\*|\/)\s/.test(text) && OPENER.test(text)
+    && SIBLING_NEEDLES.some((needle) => text.includes(needle)));
+check('12i2. this gate opens nothing outside its own repository — the contract dependency is a fixture, not a checkout',
+  siblingReads.length === 0,
+  siblingReads.map((r) => `line ${r.no + 1}: ${r.text.trim().slice(0, 100)}`).join(' | '));
+
+// ── the ownership contract, over HTTP, on rows where the NCB slot is deliberately identical ──
+// Properties 3-6 are not settled by a rule table: they are about what the storage layer writes and
+// what the wire carries. Every row below is created by the relay through the service account, so the
+// vendor ownership column holds the same id on all of them while the application columns hold the
+// people. That is the state in which a user_id-keyed identity rule is silent rather than loud, so
+// these arms assert the two columns are DIFFERENT values, not merely that a name came back.
+{
+  resetTournamentTables();
+  // The list envelope carries the sets under data.tournaments. Read the ids out of whatever
+  // answered; never default to the ids that were asked for, or an arm could not be wrong.
+  const listIdsOf = (res) => (((res.body?.data ?? {}).tournaments ?? res.body?.data ?? [])
+    .map((row) => String(row.id)));
+
+  const forgedOwner = await call('POST', '/tournaments', { token: 'tok-member10',
+    body: { name: 'Forged', visibility: 'private', owner_user_id: '4', user_id: '4', boards: [legalBoard(1)] } });
+  const forgedQuery = await call('GET', '/tournaments?owner_user_id=4', { token: 'tok-member10' });
+  const forgedRole = await call('POST', '/tournaments', { token: 'tok-member10',
+    body: { name: 'Role Player', visibility: 'public', is_super_admin: true, role: 'administrator', boards: [legalBoard(1)] } });
+  const nothingForged = rowsOf('tournaments').filter((row) => ['Forged', 'Role Player'].includes(String(row.name)));
+
+  check('12j. property 4 and 5: an owner, a player or an admin flag sent by the client is refused by name, and no row is written under it',
+    forgedOwner.status === 400 && forgedOwner.body?.error === 'client_identity_refused'
+      && forgedQuery.status === 400 && forgedQuery.body?.error === 'client_identity_refused'
+      && forgedRole.status === 400 && forgedRole.body?.error === 'client_identity_refused'
+      && nothingForged.length === 0,
+    `owner=${forgedOwner.status}/${forgedOwner.body?.error} query=${forgedQuery.status}/${forgedQuery.body?.error} role=${forgedRole.status}/${forgedRole.body?.error} stored=${nothingForged.length}`);
+
+  const aCreate = await call('POST', '/tournaments', { token: 'tok-member10',
+    body: { name: 'A Private', visibility: 'private', boards: [legalBoard(1), legalBoard(2)] } });
+  const bCreate = await call('POST', '/tournaments', { token: 'tok-member11',
+    body: { name: 'B Private', visibility: 'private', boards: [legalBoard(1)] } });
+  const aId = String(aCreate.body?.data?.id ?? aCreate.body?.id ?? '');
+  const bId = String(bCreate.body?.data?.id ?? bCreate.body?.id ?? '');
+  const pair = rowsOf('tournaments').filter((row) => [aId, bId].includes(String(row.id)));
+
+  check('12k. property 3 precondition: two private sets, two different owners, ONE identical vendor row owner',
+    aCreate.status === 200 && bCreate.status === 200 && pair.length === 2
+      && pair.map((r) => String(r.owner_user_id)).sort().join(',') === '3,4'
+      && new Set(pair.map((r) => String(r.user_id))).size === 1
+      && pair.every((r) => String(r.user_id) === CLUB_ACCOUNT_ID),
+    JSON.stringify(pair.map((r) => ({ id: r.id, owner: r.owner_user_id, vendorOwner: r.user_id }))).slice(0, 180));
+
+  const aList = await call('GET', '/tournaments', { token: 'tok-member10' });
+  const bList = await call('GET', '/tournaments', { token: 'tok-member11' });
+  const aSees = listIdsOf(aList);
+  const bSees = listIdsOf(bList);
+  check('12k2. property 3: A sees their own private set and not Bs, B sees theirs and not As, on rows the vendor owns identically',
+    aList.status === 200 && bList.status === 200 && aSees.includes(aId) && !aSees.includes(bId)
+      && bSees.includes(bId) && !bSees.includes(aId),
+    `A sees ${JSON.stringify(aSees)} (own ${aId}) | B sees ${JSON.stringify(bSees)} (own ${bId})`);
+
+  // The superseded rule, run over the very rows above. Keyed on the vendor slot it can only answer
+  // for both players at once or for neither, which is the concrete form of the bug 12b4 refuses.
+  const legacyScoped = ['3', '4', CLUB_ACCOUNT_ID].map((who) => ({ who,
+    matched: pair.filter((row) => String(row.user_id) === who).map((row) => String(row.id)) }));
+  check('12k3. and the old user_id clause is not a stylistic difference: on these rows it matches nobody who asked and everybody who did not',
+    legacyScoped.find((r) => r.who === '3').matched.length === 0
+      && legacyScoped.find((r) => r.who === '4').matched.length === 0
+      && legacyScoped.find((r) => r.who === CLUB_ACCOUNT_ID).matched.length === 2,
+    JSON.stringify(legacyScoped));
+
+  // …and the projection, which is the half the storage columns cannot show. A response may carry the
+  // field the client has always called `user_id` ONLY because the relay puts the application owner in
+  // it; the account that actually owns the stored row must appear nowhere in the answer. Asserted on
+  // the list and on the single read, because they are shaped by two different functions and either
+  // one drifting would put the service account on the screen as the owner of a player set.
+  const aReadOwn = await call('GET', `/tournaments/${aId}`, { token: 'tok-member10' });
+  const aListRow = (aList.body?.data?.tournaments ?? []).find((row) => String(row.id) === aId) ?? null;
+  const bListRow = ((await call('GET', '/tournaments', { token: 'tok-member11' })).body?.data?.tournaments ?? [])
+    .find((row) => String(row.id) === bId) ?? null;
+  // A value search over the answer, not a substring over its serialisation: a bare `includes` on
+  // '99' would be satisfied or broken by an unrelated id, and neither result would mean anything.
+  const carriesValue = (node, wanted) => {
+    if (node === null || node === undefined) return false;
+    if (Array.isArray(node)) return node.some((item) => carriesValue(item, wanted));
+    if (typeof node === 'object') return Object.values(node).some((item) => carriesValue(item, wanted));
+    return String(node) === String(wanted);
+  };
+  check('12k4. property 1 and 3 on the wire: every tournament response names the OWNER in user_id, and the service account appears in no answer at all',
+    aListRow?.user_id === '3' && bListRow?.user_id === '4'
+      && aReadOwn.status === 200 && String(aReadOwn.body?.data?.user_id) === '3'
+      && !carriesValue(aList.body?.data, CLUB_ACCOUNT_ID)
+      && !carriesValue(aReadOwn.body?.data, CLUB_ACCOUNT_ID)
+      && !carriesValue(bList.body?.data, CLUB_ACCOUNT_ID),
+    `A=${JSON.stringify(aListRow?.user_id)} B=${JSON.stringify(bListRow?.user_id)} read=${JSON.stringify(aReadOwn.body?.data?.user_id)} `
+      + `onTheWire=${JSON.stringify([aListRow, bListRow, aReadOwn.body?.data].map((r) => r?.user_id))}`);
+
+  // Property 6, on the write and on the read. The attempt belongs to the player in the player
+  // column; the wire's legacy user_id field carries that player because the relay projected it
+  // there, and not the account whose stored row it is.
+  const recorded = await call('POST', `/tournaments/${bId}/attempts`, { token: 'tok-member11',
+    body: { board_number: '1', original_seat: 'North', recorded_hand_id: 'rh-12l-4' } });
+  const attemptRow = rowsOf('tournament_attempts').find((row) => String(row.recorded_hand_id) === 'rh-12l-4');
+  const aReadB = await call('GET', `/tournaments/${bId}/attempts`, { token: 'tok-member10' });
+  check('12l. property 6: an attempt is attributed by player_user_id, its wire user_id is that player and never the row owner, and another player cannot read it',
+    recorded.status === 200 && !!attemptRow
+      && String(attemptRow.player_user_id) === '4' && String(attemptRow.user_id) === CLUB_ACCOUNT_ID
+      && String(recorded.body?.data?.user_id ?? recorded.body?.user_id ?? '') === '4'
+      && aReadB.status === 403,
+    `stored=${JSON.stringify(attemptRow ?? null).slice(0, 150)} wire=${JSON.stringify(recorded.body?.data ?? recorded.body).slice(0, 90)} otherPlayer=${aReadB.status}`);
+}
 
 // ══ 13. ONE MEMBERSHIP RULE, ONE ENVELOPE, NO LEAKS ════════════════════════
 const tournamentDir = path.join(ROOT, 'tournaments');
