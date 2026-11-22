@@ -77,9 +77,13 @@ process.env.CLUB_NCB_SCHEMA_JSON = JSON.stringify({
     boards: 'club_collection_boards'
   },
   columns: {
-    systemAdmins: { userId: 'user_id' },
+    // The LIVE identity columns, per the owner's NCB MCP schema verification of 2026-11-22.
+    // `user_id` is deliberately NOT among them: on this vendor it is the row-ownership slot NCB
+    // stamps from the WRITING session, and the mock stamps it with the service account's id, so a
+    // store that read it as the person's identity gets the answer it would get in production.
+    systemAdmins: { userId: 'admin_user_id' },
     clubs: { id: 'id', name: 'name', status: 'active' },
-    memberships: { id: 'id', userId: 'user_id', clubId: 'club_id', role: 'role', status: 'status' },
+    memberships: { id: 'id', userId: 'member_user_id', clubId: 'club_id', role: 'role', status: 'status' },
     collections: { id: 'id', clubId: 'club_id', name: 'title', status: 'publication_status', createdBy: 'created_by_user_id' },
     boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json' }
   },
@@ -128,7 +132,9 @@ const express = require('express');
 // whole read with HTTP 500. That is what makes this harness able to catch a store that invents a filter
 // (`?offset=`, `?search=`) instead of silently returning nothing.
 const REGISTRY = {
-  system_admins: { columns: ['id', 'user_id'], rows: [{ id: 'sa1', user_id: '1' }], uniques: [] },
+  // `admin_user_id` is the grant. The ownership column is stamped on the way out, never stored here,
+  // which is the live shape: nullable, and holding whoever wrote the row.
+  system_admins: { columns: ['id', 'admin_user_id', 'user_id'], rows: [{ id: 'sa1', admin_user_id: '1' }], uniques: [] },
   clubs: {
     columns: ['id', 'name', 'active'],
     rows: [
@@ -139,20 +145,20 @@ const REGISTRY = {
     uniques: []
   },
   club_memberships: {
-    columns: ['id', 'user_id', 'club_id', 'role', 'status'],
+    columns: ['id', 'member_user_id', 'club_id', 'role', 'status', 'user_id'],
     rows: [
-      { id: 'm2', user_id: '2', club_id: '10', role: 'club_admin', status: 'approved' },
-      { id: 'm3', user_id: '3', club_id: '10', role: 'member', status: 'approved' },
-      { id: 'm4', user_id: '4', club_id: '11', role: 'member', status: 'approved' },
-      { id: 'm7', user_id: '7', club_id: '11', role: 'club_admin', status: 'approved' },
+      { id: 'm2', member_user_id: '2', club_id: '10', role: 'club_admin', status: 'approved' },
+      { id: 'm3', member_user_id: '3', club_id: '10', role: 'member', status: 'approved' },
+      { id: 'm4', member_user_id: '4', club_id: '11', role: 'member', status: 'approved' },
+      { id: 'm7', member_user_id: '7', club_id: '11', role: 'club_admin', status: 'approved' },
       // A pending request for club 10 by the SAME person who owns private set `p3`'s neighbour. If a
       // pending row ever counted, the club-10 arms below change answer for this id — and it is checked
       // directly in 5i.
-      { id: 'm8', user_id: '20', club_id: '10', role: 'club_admin', status: 'pending' },
+      { id: 'm8', member_user_id: '20', club_id: '10', role: 'club_admin', status: 'pending' },
       // Approved, but of the INACTIVE club 12: the state that must behave exactly like no club.
-      { id: 'm9', user_id: '24', club_id: '12', role: 'member', status: 'approved' }
+      { id: 'm9', member_user_id: '24', club_id: '12', role: 'member', status: 'approved' }
     ],
-    uniques: [{ fields: ['user_id'], name: 'user_id' }]
+    uniques: [{ fields: ['member_user_id'], name: 'member_user_id' }]
   },
   club_board_collections: { columns: ['id', 'club_id', 'title', 'publication_status', 'created_by_user_id'], rows: [], uniques: [] },
   club_collection_boards: { columns: ['id', 'collection_id', 'board_number', 'dealer', 'vulnerability', 'hands_json'], rows: [], uniques: [] },
@@ -283,7 +289,7 @@ REGISTRY.tournament_attempts.rows.push(
 const realFetch = globalThis.fetch;
 const dataCalls = [];
 let rowSequence = 500;
-const mock = {
+const mock = { ownershipWrites: [],
   // Set by an arm, cleared by that same arm. Each knob models ONE documented NCB behaviour, and the
   // arms that depend on it assert the knob actually fired — a green measured against a stub that never
   // ran is not a green.
@@ -386,7 +392,12 @@ globalThis.fetch = async (url, init = {}) => {
         const size = Math.floor(limit);
         found = found.slice((Math.floor(page) - 1) * size, (Math.floor(page) - 1) * size + size);
       }
-      return json({ status: 'success', data: found.map((row) => ({ ...row })) });
+      // NCB's row-ownership stamp, applied on the way out rather than stored in the fixtures, so every
+      // row demonstrably carries an owner that is NOT the person the row is about: NodeSend writes with
+      // the dedicated service account, so under private RLS `user_id` is that account on every row it
+      // made. A store that read identity out of that column would match nothing, and the arms naming a
+      // particular player's answer would go red instead of nodding along.
+      return json({ status: 'success', data: found.map((row) => ({ user_id: CLUB_ACCOUNT_ID, ...row })) });
     }
 
     if (action === 'create') {
@@ -396,7 +407,9 @@ globalThis.fetch = async (url, init = {}) => {
       }
       const clash = uniqueViolation(entry, body);
       if (clash) return ncbError(clash, 400);
-      const row = { id: String(++rowSequence), ...body };
+      const { user_id: claimedOwner, ...stored } = body;
+      if (claimedOwner !== undefined) mock.ownershipWrites.push({ table, claimed: String(claimedOwner) });
+      const row = { id: String(++rowSequence), ...stored, user_id: CLUB_ACCOUNT_ID };
       entry.rows.push(row);
       return json({ status: 'success', data: { ...row } });
     }
@@ -481,6 +494,7 @@ function resetTournamentTables() {
   mock.failBoardCreate = null;
   mock.refuseRead = null;
   mock.ignoreFilters = null;
+  mock.ownershipWrites.length = 0;
   mock.emptyReadTables = null;
   mock.dropDelete = null;
 }
@@ -699,7 +713,7 @@ for (const [label, schema, expect] of [
   ['2l. a club table declared here is REFUSED, not ignored', {
     ...MAIN_TOURNAMENT_SCHEMA,
     tables: { ...MAIN_TOURNAMENT_SCHEMA.tables, memberships: 'club_memberships' },
-    columns: { ...MAIN_TOURNAMENT_SCHEMA.columns, memberships: { userId: 'user_id', clubId: 'club_id', role: 'role', status: 'status' } }
+    columns: { ...MAIN_TOURNAMENT_SCHEMA.columns, memberships: { userId: 'member_user_id', clubId: 'club_id', role: 'role', status: 'status' } }
   }, 'not one of the agreed three tournament table roles'],
   ['2m. an unknown column key is refused rather than left looking supported', {
     tables: MAIN_TOURNAMENT_SCHEMA.tables,
@@ -1121,7 +1135,7 @@ function clubCallSeen(fragment) {
   return dataCalls.some((entry) => entry.pathname.startsWith('/data/') && entry.search.includes(fragment));
 }
 mock.refuseRead = {
-  table: 'club_memberships', fragment: 'user_id=3',
+  table: 'club_memberships', fragment: 'member_user_id=3',
   status: 500, body: { status: 'failed', error: 'membership read refused' }
 };
 const membershipDown = await call('GET', '/tournaments/c10p', { token: 'tok-member10' });
@@ -1151,7 +1165,7 @@ check('7b. an unreadable club record never grants access — the caller is answe
 mock.refuseRead = null;
 
 mock.refuseRead = {
-  table: 'system_admins', fragment: 'user_id=3',
+  table: 'system_admins', fragment: 'admin_user_id=3',
   status: 500, body: { status: 'failed', error: 'admin read refused' }
 };
 const adminDown = await call('GET', '/tournaments/c10p', { token: 'tok-member10' });
@@ -1566,9 +1580,18 @@ check('9d. an attempt records the SESSION id into the player column, and the boa
   `${mineAttempt.status} ${JSON.stringify(attemptRow)}`);
 // The ownership separation, measured on the row rather than asserted in prose: the application player is
 // recorded in its OWN column, and nothing the caller could send has landed in NCB's row-ownership slot.
-check('9d2. the attempt row keeps the application player out of NCB\'s user_id slot',
-  attemptRow ? (attemptRow.user_id === undefined || attemptRow.user_id === null || attemptRow.user_id === '') : false,
+// The real production property, which the old predicate could not express: NCB ALWAYS stamps the
+// ownership slot from the writing session, so what must hold is that the slot never carries the
+// player and never comes from the request. Proving `user_id` was merely absent would only have
+// proved the mock leaves it alone; proving it carries the service account WHILE the application
+// column carries the player is what proves the two are never conflated.
+check('9d2. the attempt row keeps the application player out of NCB\'s user_id slot, which holds the writing service account',
+  !!attemptRow && attemptRow.user_id === CLUB_ACCOUNT_ID
+    && String(attemptRow[TOURNAMENT_COLUMNS.attempts.userId]) === '3'
+    && attemptRow.user_id !== attemptRow[TOURNAMENT_COLUMNS.attempts.userId],
   JSON.stringify(attemptRow).slice(0, 160));
+check('9d3. no store call ever sent NCB\'s ownership column in a body, so the stamp is the vendor\'s and not ours',
+  mock.ownershipWrites.length === 0, JSON.stringify(mock.ownershipWrites.slice(0, 3)));
 const myAttempts = await call('GET', '/tournaments/pubp/attempts', { token: 'tok-member10' });
 const otherAttempts = await call('GET', '/tournaments/pubp/attempts', { token: 'tok-member11' });
 check('9e. the attempts list is self-scoped on a set BOTH can read: each sees only their own rows',
@@ -1799,16 +1822,37 @@ check(`12a. resolveTournamentAccess agrees with the contract over ${ROW_CASES.le
   contract !== null && accessMismatches.length === 0,
   contractNote || accessMismatches.slice(0, 3).join(' | '));
 
+// The contract's own literal column names, spelled as the frozen client spells them — except the
+// owner, which is the entire disagreement, and which NodeSend now refuses to default.
+const CONTRACT_LITERAL_TOURNAMENT_COLUMNS = Object.freeze({
+  visibility: 'visibility', userId: 'owner_user_id', clubId: 'club_id', status: 'status'
+});
+
 const scopeMismatches = [];
 if (contract) {
   for (const userId of ['3', '5']) {
     for (const isSuperAdmin of [true, false]) {
       for (const membership of MEMBERSHIPS) {
         const session = { userId, isSuperAdmin };
-        // columns=null is the contract's literal vocabulary; 12h below covers the resolved-name path.
-        const mine = tournamentListScopeRule({ session, membership });
+        // The literal column vocabulary is passed to NodeSend explicitly: a scope built with NO schema
+        // is now a refusal (12b2), because defaulting the owner to `user_id` IS the confusion.
+        const mine = tournamentListScopeRule({ session, membership, columns: CONTRACT_LITERAL_TOURNAMENT_COLUMNS });
         const theirs = contract.tournamentListScope({ session, membership });
-        if (!same(mine, theirs)) scopeMismatches.push(`u=${userId} super=${isSuperAdmin} mem=${JSON.stringify(membership)}: ${JSON.stringify(canonical(mine))} vs ${JSON.stringify(canonical(theirs))}`);
+        // Every clause but the private one, and inside the private one every key but the owner, must
+        // match exactly. That is the half of the agreement that is a real agreement.
+        const strip = (clauses) => clauses.map((c) => Object.fromEntries(Object.entries(c)
+          .filter(([k]) => k !== 'user_id' && k !== 'owner_user_id')));
+        if (!same(strip(mine.clauses), strip(theirs.clauses)
+          ) || !same({ u: mine.userId, s: mine.isSuper, m: mine.memberClub, a: mine.adminClub },
+            { u: theirs.userId, s: theirs.isSuper, m: theirs.memberClub, a: theirs.adminClub })) {
+          scopeMismatches.push(`u=${userId} super=${isSuperAdmin} mem=${JSON.stringify(membership)}: ${JSON.stringify(canonical(strip(mine.clauses)))} vs ${JSON.stringify(canonical(strip(theirs.clauses)))}`);
+        }
+        // The divergence, asserted case by case rather than excused: the server names the owner column,
+        // the published client contract still points at NCB's row-ownership slot.
+        if (!(theirs.clauses[0].user_id === userId && mine.clauses[0].owner_user_id === userId
+          && !('user_id' in mine.clauses[0]) && !('owner_user_id' in theirs.clauses[0]))) {
+          scopeMismatches.push(`owner-column divergence moved: mine=${JSON.stringify(mine.clauses[0])} theirs=${JSON.stringify(theirs.clauses[0])}`);
+        }
       }
     }
   }
@@ -1816,6 +1860,24 @@ if (contract) {
 check(`12b. tournamentListScope's clauses agree with the contract over ${2 * 2 * MEMBERSHIPS.length} cases`,
   contract !== null && scopeMismatches.length === 0,
   contractNote || scopeMismatches.slice(0, 3).join(' | '));
+
+const contractPrivateClause = contract
+  ? contract.tournamentListScope({ session: { userId: '3', isSuperAdmin: false }, membership: null }).clauses[0] : null;
+const serverNoSchemaScope = tournamentListScopeRule({ session: { userId: '3', isSuperAdmin: false }, membership: null });
+const serverUserIdScope = tournamentListScopeRule({
+  session: { userId: '3', isSuperAdmin: false }, membership: null, columns: { userId: 'user_id' }
+});
+check('12b2. the published client contract still scopes a private set on NCB\'s user_id slot; NodeSend refuses that mapping instead of copying it',
+  contract !== null && contractPrivateClause?.user_id === '3' && !('owner_user_id' in contractPrivateClause)
+    && serverNoSchemaScope.error === 'tournament_identity_column_unconfigured' && serverNoSchemaScope.clauses.length === 0
+    && serverUserIdScope.error === 'tournament_identity_column_unconfigured',
+  `contract=${JSON.stringify(contractPrivateClause)} no-schema=${serverNoSchemaScope.error} user_id=${serverUserIdScope.error}`);
+const unconfiguredListDecision = tournamentAuthorize({ op: 'listTournaments', session: { userId: '3' } });
+check('12b3. a refused scope answers 503 under its own name, never the 200-with-no-rows a user_id clause would have produced',
+  unconfiguredListDecision.status === 503
+    && unconfiguredListDecision.body.error === 'tournament_identity_column_unconfigured'
+    && tournamentStoreErrorStatus.tournament_identity_column_unconfigured === 503,
+  JSON.stringify(unconfiguredListDecision).slice(0, 170));
 
 const createMismatches = [];
 if (contract) {
@@ -1886,7 +1948,11 @@ check('12f. the positive field allow-list is the contract\'s, per operation',
 //    keeps (`club_read_unreadable`, `club_directory_unconfigured`): they describe a backend state, never a
 //    caller mistake, so they are deliberately not part of the client's switch.
 const NODE_ONLY_REASONS = Object.freeze(['tournament_read_unreadable', 'tournament_store_unavailable',
-  'club_store_unavailable', 'club_account_request_failed']);
+  'club_store_unavailable', 'club_account_request_failed',
+  // A deployment that never named the column holding the application owner. The browser needs no
+  // translation for it: it is a server state, not something the caller did, and the generic
+  // "unavailable" copy is the honest rendering of it.
+  'tournament_identity_column_unconfigured']);
 const contractReasons = contract ? contract.TOURNAMENT_GATEWAY_REASONS : [];
 const unpublishedReasons = Object.keys(tournamentStoreErrorStatus)
   .concat(Object.keys(bridge.tournamentRefusalCopy ?? {}))
@@ -2208,7 +2274,8 @@ check('15s. another club\'s admin cannot rename this club\'s set (and the row sa
 // status the published vocabulary expects.
 const pureArms = [
   ['15t. an empty session id is 401, not a permission answer', { op: 'readTournament', session: { userId: '' }, row: { visibility: 'private', status: 'published', ownerId: '', clubId: '' } }, 401, 'authentication_required'],
-  ['15u. list has no permission to refuse (scope, not gate)', { op: 'listTournaments', session: { userId: '5' } }, 0, null],
+  ['15u. list has no permission to refuse (scope, not gate)', { op: 'listTournaments', session: { userId: '5' }, columns: CONTRACT_LITERAL_TOURNAMENT_COLUMNS }, 0, null],
+  ['15u2. list with no owner column named is a 503 under its own name, not an empty scope', { op: 'listTournaments', session: { userId: '5' } }, 503, 'tournament_identity_column_unconfigured'],
   ['15v. a create aimed at public by an ordinary session is 403', { op: 'createTournament', session: { userId: '5' }, targetVisibility: 'public' }, 403, 'super_admin_required'],
   ['15w. a create with a malformed category is 400, not 403', { op: 'createTournament', session: { userId: '5' }, targetVisibility: 'weird' }, 400, 'invalid_visibility'],
   ['15x. an unknown operation is 400, never allowed by default', { op: 'deleteEverything', session: { userId: '5' } }, 400, 'unknown_operation'],

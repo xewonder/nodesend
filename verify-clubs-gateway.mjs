@@ -53,6 +53,10 @@ const SESSIONS = {
   'tok-removed': { id: '22', role: 'user' },
   'tok-pending-admin': { id: '23', role: 'user' },
   'tok-inactive-club': { id: '24', role: 'user' },
+  // The dedicated club account's own id, as a caller. Section 23 uses it for the property that
+  // matters most and is easiest to break: NCB's row-ownership column holding this id on every row
+  // NodeSend wrote must confer NOTHING, because it is not an identity column.
+  'tok-service-account': { id: '99', role: 'user' },
   // The account a Super Admin appoints mid-run in arm 2Rk. It has NO row until that appointment
   // creates one, which is the point: the appointee must be able to administer straight away.
   'tok-appointed': { id: '30', role: 'user' }
@@ -93,6 +97,16 @@ process.env.CLUB_NCB_SCHEMA_JSON = JSON.stringify({
 });
 delete process.env.AI_QUOTA_RESERVATION_TABLE;
 delete process.env.NODESEND_PRIVATE_KEY_B64;
+// THE FIXTURES BELOW ARE THE LEGACY SPELLING. They carry the account's identity in `user_id` — the
+// shape a row has when the player's own session wrote it, which is true of every fixture here and
+// was true of production rows written before NodeSend owned the write path. `clubs/clubSchema.js`
+// now REFUSES that mapping by default, because on a row NodeSend itself wrote, that column is the
+// SERVICE ACCOUNT and the person is answered as nobody (the 2026-11-19/21 super-admin incident).
+// So this gate declares the same opt-out a legacy deployment must declare, and section 23 measures
+// both sides of it: the live spelling working with no flag at all (23b, 23d, 23e), the legacy
+// spelling refused without it (23a, 23f), and the flag honoured where a deployment truly needs it
+// (23c, and every arm above this line).
+process.env.CLUB_NCB_ALLOW_USER_ID_IDENTITY = '1';
 
 const bridge = require(path.join(ROOT, 'bridge.js'));
 const { app, buildClubMount, clubRoutes, clubAuthorize, clubValidateShape, clubValidateInput,
@@ -1117,7 +1131,11 @@ const startWindow = dataCalls.slice(callsBeforeStart);
 check('8i. board-start performed zero writes (positive control: it did perform reads)',
   startWindow.length > 0 && startWindow.every((row) => row.method === 'GET'),
   `${startWindow.filter((row) => row.method !== 'GET').length} write(s) of ${startWindow.length} calls`);
-const liveSchema = clubSchemaConfig({ CLUB_NCB_SCHEMA_JSON: process.env.CLUB_NCB_SCHEMA_JSON });
+// The escape is this file's declared legacy spelling (see the note above the env block); section 23
+// measures the live spelling, and the refusal when the flag is absent.
+const liveSchema = clubSchemaConfig({
+  CLUB_NCB_SCHEMA_JSON: process.env.CLUB_NCB_SCHEMA_JSON, CLUB_NCB_ALLOW_USER_ID_IDENTITY: '1'
+});
 check('8j. board-start touched no table outside the agreed five, and the live schema IS those five',
   startWindow.length > 0 && startWindow.every((row) => AGREED.includes(tableOf(row)))
   && liveSchema.ok === true && Object.keys(liveSchema.schema.tables).length === 5
@@ -1311,16 +1329,32 @@ const emptyBucket = () => ({ direct: [], nested: [] });
 function mountedClubPaths() {
   const club = collectRoutes(bridge.clubMount.router.stack ?? [], 0, emptyBucket());
   const gateway = collectRoutes(bridge.ncbMount.router.stack ?? [], 0, emptyBucket());
+  // Tournaments is a THIRD named router. It is excluded by ROUTER IDENTITY, exactly as the gateway
+  // is, and its surface is asserted against its own declared list in 10j — so excluding it cannot
+  // become a way for an undeclared route to disappear into a bucket nobody reads.
+  const tournament = bridge.tournamentMount?.router
+    ? collectRoutes(bridge.tournamentMount.router.stack ?? [], 0, emptyBucket()) : null;
   const unaccounted = [];
   for (const layer of app._router.stack) {
     if (layer.name !== 'router' || !layer.handle?.stack) continue;
-    if (layer.handle === bridge.clubMount.router || layer.handle === bridge.ncbMount.router) continue;
+    if (layer.handle === bridge.clubMount.router || layer.handle === bridge.ncbMount.router
+      || (bridge.tournamentMount && layer.handle === bridge.tournamentMount.router)) continue;
     const extra = collectRoutes(layer.handle.stack, 0, emptyBucket());
     unaccounted.push(...extra.direct, ...extra.nested);
   }
-  return { direct: club.direct, nested: club.nested, gateway: gateway.direct, unaccounted };
+  return {
+    direct: club.direct, nested: club.nested, gateway: gateway.direct, unaccounted,
+    tournament: tournament?.direct ?? null,
+    tournamentDrift: tournament ? [
+      ...(bridge.tournamentRoutes ?? []).map((r) => `${r.method} ${r.path}`)
+        .filter((r) => !tournament.direct.includes(r)),
+      ...tournament.direct.filter((r) => !(bridge.tournamentRoutes ?? [])
+        .map((x) => `${x.method} ${x.path}`).includes(r))
+    ] : null
+  };
 }
-const { direct: mounted, nested: mountedNested, gateway: mountedGateway, unaccounted: unaccountedRoutes } = mountedClubPaths();
+const { direct: mounted, nested: mountedNested, gateway: mountedGateway, unaccounted: unaccountedRoutes,
+  tournament: mountedTournament, tournamentDrift } = mountedClubPaths();
 const declared = clubRoutes.map((route) => `${route.method} ${route.path}`);
 const notMounted = declared.filter((route) => !mounted.includes(route));
 const undeclared = mounted.filter((route) => !declared.includes(route));
@@ -1378,11 +1412,17 @@ check('10i. /health.clubs.routes counts the contract routes plus the one server-
 // lives. Excluding it silently would defeat the purpose of 10b; naming it means a third router — or a
 // gateway that grew a route outside its own gate — still reddens an arm here. The count is asserted
 // against the gateway's own health claim, which verify-ncb-gateway.mjs ties to the mounted stack.
-check('10j. the only mounted routers are the club mount and the player gateway, and the gateway is exactly its declared /ncb surface',
+// The tournament router is asserted on its own count AND on drift against its declared list, which
+// is what makes naming it here narrower than the blind exclusion it replaces: a tournament route
+// mounted without being declared (or declared without being mounted) still reddens this arm.
+check('10j. the mounted routers are exactly the club mount, the player gateway and the tournament mount, and each is its declared surface',
   unaccountedRoutes.length === 0
   && mountedGateway.length === bridge.ncbMount.health().routes
-  && mountedGateway.every((route) => route.includes(' /ncb')),
-  `unaccounted=[${unaccountedRoutes.join(', ')}] gateway=${mountedGateway.length}/${bridge.ncbMount.health().routes}`);
+  && mountedGateway.every((route) => route.includes(' /ncb'))
+  && mountedTournament !== null && tournamentDrift.length === 0
+  && mountedTournament.length === bridge.tournamentRoutes.length
+  && mountedTournament.every((route) => route.includes(' /tournaments')),
+  `unaccounted=[${unaccountedRoutes.join(', ')}] gateway=${mountedGateway.length}/${bridge.ncbMount.health().routes} tournament=${mountedTournament === null ? 'absent' : mountedTournament.length}/${bridge.tournamentRoutes?.length ?? 0} drift=${(tournamentDrift ?? []).join('|')}`);
 
 // ── pure authority decision, without any I/O at all ─────────────────────────
 const pureDenials = [
@@ -1491,7 +1531,10 @@ const READY_ENV = {
   NCB_PROXY_BASE: 'https://ncb.test.invalid', NCB_INSTANCE: '55954_bridgemind',
   CLUB_NCB_EMAIL: CLUB_ACCOUNT_EMAIL, CLUB_NCB_PASSWORD: CLUB_PASSWORD,
   CLUB_NCB_EXPECTED_USER_ID: CLUB_ACCOUNT_ID,
-  CLUB_NCB_SCHEMA_JSON: process.env.CLUB_NCB_SCHEMA_JSON
+  CLUB_NCB_SCHEMA_JSON: process.env.CLUB_NCB_SCHEMA_JSON,
+  // Isolated mounts here reuse the legacy fixture spelling above, so they carry the same declared
+  // opt-out a legacy deployment would. Section 23 strips it where that is the point.
+  CLUB_NCB_ALLOW_USER_ID_IDENTITY: '1'
 };
 const noOpsFetch = async () => new Response(JSON.stringify({ status: 'error', message: 'no network expected' }), { status: 500 });
 
@@ -1760,11 +1803,14 @@ check('18p. a half-declared flag mapping is refused (the missing half would writ
   halfValues.ok === false && halfValues.problems.some((p) => /values\.clubs\.status\.inactive/.test(p)),
   JSON.stringify(halfValues.problems).slice(0, 170));
 
+// The escape is this file's legacy fixture spelling (see the note at the top); this arm is about the
+// club-status codec, and a refused schema would measure nothing at all.
 const textValues = clubSchemaConfig({
   CLUB_NCB_SCHEMA_JSON: JSON.stringify({
     tables: SCHEMA_OBJECT.tables,
     columns: { ...SCHEMA_OBJECT.columns, clubs: { id: 'id', name: 'name', status: 'status' } }
-  })
+  }),
+  CLUB_NCB_ALLOW_USER_ID_IDENTITY: '1'
 });
 check('18q. a text-flagged club column still validates, so the adapter is not numeric-only',
   textValues.ok === true && textValues.schema.clubStatus.encode('active') === 'active',
@@ -2086,6 +2132,104 @@ check('18r. a collections mapping without created_by_user_id is refused at boot 
     narrowSearch.status === 200 && narrowSearch.body?.data?.truncated === true,
     `${narrowSearch.status} ${narrowSearch.text.slice(0, 160)}`);
   await narrowScan.close();
+}
+
+// ── 23. IDENTITY IS NOT NCB's ROW OWNER ────────────────────────────────────────────────────────
+// The verified live schema keeps the account in its OWN column and keeps `user_id` for NCB's
+// row-ownership stamp: `system_admins.admin_user_id` (NOT NULL, primary key) and
+// `club_memberships.member_user_id` (NOT NULL, unique), each row also carrying the nullable
+// `user_id` of whoever wrote it. NodeSend writes both tables with its service account, so on every
+// row IT made, `user_id` is that account — a schema that reads the person out of it therefore does
+// not fail, it answers zero rows about a real administrator and resolves every member to one
+// account. These arms measure the refusal of that spelling, the acceptance of the live one, and,
+// over real HTTP with the two columns holding deliberately different values, that ownership confers
+// no authority in either direction.
+{
+  const liveSchema = JSON.parse(JSON.stringify(SCHEMA_OBJECT));
+  liveSchema.tables.systemAdmins = 'system_admins_live';
+  liveSchema.tables.memberships = 'club_memberships_live';
+  liveSchema.columns.systemAdmins = { userId: 'admin_user_id' };
+  liveSchema.columns.memberships = {
+    id: 'id', userId: 'member_user_id', clubId: 'club_id', role: 'role', status: 'status'
+  };
+  // Deliberately NOT equal to the identity: every live-shaped row below is owned by the club
+  // service account, exactly as production's are, because the service account wrote them.
+  tables.system_admins_live = [{ id: 'sal1', admin_user_id: '1', user_id: CLUB_ACCOUNT_ID }];
+  tables.club_memberships_live = [
+    { id: 'ml3', member_user_id: '3', club_id: '10', role: 'member', status: 'approved', user_id: CLUB_ACCOUNT_ID },
+    { id: 'ml2', member_user_id: '2', club_id: '10', role: 'club_admin', status: 'approved', user_id: CLUB_ACCOUNT_ID }
+  ];
+  TABLE_COLUMNS.system_admins_live = ['id', 'admin_user_id', 'user_id'];
+  TABLE_COLUMNS.club_memberships_live = ['id', 'member_user_id', 'club_id', 'role', 'status', 'user_id'];
+
+  const noEscape = Object.fromEntries(Object.entries(READY_ENV)
+    .filter(([key]) => key !== 'CLUB_NCB_ALLOW_USER_ID_IDENTITY'));
+  const legacyEnv = { ...noEscape, CLUB_NCB_SCHEMA_JSON: process.env.CLUB_NCB_SCHEMA_JSON };
+  const refusedLegacy = clubSchemaConfig(legacyEnv);
+  check('23a. the legacy spelling (identity in NCB\'s user_id) is refused at boot, naming the live identity column for both authority roles',
+    refusedLegacy.ok === false
+      && refusedLegacy.problems.some((p) => /columns\.systemAdmins\.userId/.test(p) && /admin_user_id/.test(p))
+      && refusedLegacy.problems.some((p) => /columns\.memberships\.userId/.test(p) && /member_user_id/.test(p)),
+    JSON.stringify(refusedLegacy.problems).slice(0, 220));
+
+  const liveAccepted = clubSchemaConfig({ ...noEscape, CLUB_NCB_SCHEMA_JSON: JSON.stringify(liveSchema) });
+  const directoryKeepsUserId = clubSchemaConfig({
+    ...noEscape,
+    CLUB_NCB_SCHEMA_JSON: JSON.stringify({
+      ...liveSchema,
+      columns: { ...liveSchema.columns, users: { ...SCHEMA_OBJECT.columns.users, userId: 'user_id' } }
+    })
+  });
+  check('23b. the live spelling is accepted with no opt-out at all, and the guard stays role-scoped: the profile directory legitimately keeps user_id',
+    liveAccepted.ok === true && directoryKeepsUserId.ok === true
+      && liveAccepted.schema.columns.systemAdmins.userId === 'admin_user_id'
+      && liveAccepted.schema.columns.memberships.userId === 'member_user_id',
+    JSON.stringify({ live: liveAccepted.problems, dir: directoryKeepsUserId.problems }).slice(0, 200));
+
+  const escaped = clubSchemaConfig({ ...READY_ENV, CLUB_NCB_SCHEMA_JSON: legacyEnv.CLUB_NCB_SCHEMA_JSON });
+  check('23c. CLUB_NCB_ALLOW_USER_ID_IDENTITY=1 is honoured for a deployment whose legacy rows really do carry the account there',
+    escaped.ok === true && escaped.schema.columns.memberships.userId === 'user_id',
+    JSON.stringify(escaped.problems).slice(0, 180));
+
+  // The whole point of refusing rather than defaulting: measured through the real router, over
+  // storage whose ownership column says something different from the identity column.
+  const liveSrv = await serveIsolated({
+    env: { ...noEscape, CLUB_NCB_SCHEMA_JSON: JSON.stringify(liveSchema) },
+    fetchImpl: (url, init) => globalThis.fetch(url, init)
+  });
+  const liveAdminList = await ask('GET', '/clubs?limit=10', { token: CALLER_TOKEN, base: liveSrv.base });
+  const ownerAsCaller = await ask('GET', '/clubs?limit=10', { token: 'tok-service-account', base: liveSrv.base });
+  const ownerOwnClub = await ask('GET', '/me/club', { token: 'tok-service-account', base: liveSrv.base });
+  const memberSeesItsClub = await ask('GET', '/me/club', { token: 'tok-member10', base: liveSrv.base });
+  const liveRoster = await ask('GET', '/clubs/10/members', { token: CALLER_TOKEN, base: liveSrv.base });
+  const rosterIds = (liveRoster.body?.data ?? []).map((row) => String(row.user_id)).sort();
+  check('23d. over HTTP the identity column decides: the admin resolves through admin_user_id while the service account that OWNS every row is nobody',
+    liveSrv.mount.configured === true
+      && liveAdminList.status === 200 && Array.isArray(liveAdminList.body.data)
+      && liveAdminList.body.data.length === tables.clubs.length && liveAdminList.body.data.length > 0
+      && ownerAsCaller.status === 403 && ownerAsCaller.body.error === 'super_admin_required'
+      && ownerOwnClub.status === 200 && ownerOwnClub.body.data === null,
+    `configured=${liveSrv.mount.configured} admin=${liveAdminList.status} owner=${ownerAsCaller.status}/${ownerAsCaller.body.error} ownClub=${ownerOwnClub.status}:${JSON.stringify(ownerOwnClub.body?.data)}`);
+  check('23e. and a member is found by member_user_id: its own club resolves, and the roster reports the PEOPLE, never the writing account',
+    memberSeesItsClub.status === 200 && memberSeesItsClub.body?.data?.club_id === '10'
+      && liveRoster.status === 200 && rosterIds.join(',') === '2,3'
+      && !rosterIds.includes(CLUB_ACCOUNT_ID),
+    `me=${JSON.stringify(memberSeesItsClub.body?.data)} roster=${JSON.stringify(rosterIds)}`);
+  await liveSrv.close();
+
+  // The refusal must be LOUD and must fail closed: a mount that cannot map its authority columns
+  // answers 503 with the reason named, never the 403 that would tell a real administrator they are
+  // not one, and never an empty club list that reads as an unused feature.
+  const legacySrv = await serveIsolated({ env: legacyEnv, fetchImpl: (url, init) => globalThis.fetch(url, init) });
+  const legacyAnswer = await ask('GET', '/clubs', { token: CALLER_TOKEN, base: legacySrv.base });
+  const legacyMemberAnswer = await ask('GET', '/me/club', { token: 'tok-member10', base: legacySrv.base });
+  check('23f. a deployment configured with the legacy spelling boots refusing: 503 club_store_unavailable with the schema reason, never a 403 about the person',
+    legacySrv.mount.configured === false && legacySrv.mount.reason === 'club_schema_unconfigured'
+      && /user_id/.test(legacySrv.mount.detail ?? '') && /admin_user_id|member_user_id/.test(legacySrv.mount.detail ?? '')
+      && legacyAnswer.status === 503 && legacyAnswer.body.error === 'club_store_unavailable'
+      && legacyMemberAnswer.status === 503,
+    `${legacySrv.mount.reason} | ${legacyAnswer.status}/${legacyAnswer.body.error} | detail=${String(legacySrv.mount.detail).slice(0, 90)}`);
+  await legacySrv.close();
 }
 
 // ── 21. THE ANONYMOUS CLUB-OPTIONS READ — public in name, and bounded in fact ──────────────────

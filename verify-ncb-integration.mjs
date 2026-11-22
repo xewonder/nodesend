@@ -277,14 +277,17 @@ rows.push(
   { id: 942, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null },
   { id: 941, table: 'user_codes', user_id: 'club-svc-1', code: 'FLOW-TEN-1', used: 0, registered_user_id: null }
 );
-// The club authority data, as the service-account path sees it. These rows belong to no player:
+// The club authority data, as the service-account path sees it. Each row now names the ACCOUNT in its
+// own column and the WRITING service account in `user_id`, which is the live arrangement: the two are
+// different columns holding different values, and no rule may read one as the other.
+// (was:) These rows belong to no player:
 // `clubs/ncbAccountClient.js` reads them as the dedicated club account, which is exactly the model
 // the club feature runs on, so the fake makes that account privileged over the authority tables and
 // leaves every player session scoped to its own rows.
 rows.push(
-  { id: 901, table: 'system_admins', user_id: 'user-aaaa' },
+  { id: 901, table: 'system_admins', admin_user_id: 'user-aaaa', user_id: 'club-svc-1' },
   { id: 10, table: 'clubs', user_id: 'club-svc-1', name: 'Glyfada BC', active: 1 },
-  { id: 902, table: 'club_memberships', user_id: 'user-aaaa', club_id: '10', role: 'admin', status: 'approved' },
+  { id: 902, table: 'club_memberships', member_user_id: 'user-aaaa', club_id: '10', role: 'admin', status: 'approved', user_id: 'club-svc-1' },
   // The global quota configuration row, spelled exactly as the quota ledger reads it (the same
   // columns verify-session-quota.mjs seeds): it belongs to no player, which is why a per-user filter
   // over it would read as "no configuration" and 503 a call that was perfectly payable.
@@ -312,9 +315,12 @@ const CLUB_SCHEMA = JSON.stringify({
     users: 'user_settings'
   },
   columns: {
-    systemAdmins: { userId: 'user_id' },
+    // The live identity columns, per the owner's NCB MCP verification of 2026-11-22. `clubs/clubSchema.js`
+    // refuses the old spelling — identity in `user_id`, which is NCB's row-ownership slot — so this
+    // gate has to model the deployment as it actually is, not as the first draft of the doc said.
+    systemAdmins: { userId: 'admin_user_id' },
     clubs: { id: 'id', name: 'name', status: 'active' },
-    memberships: { id: 'id', userId: 'user_id', clubId: 'club_id', role: 'role', status: 'status' },
+    memberships: { id: 'id', userId: 'member_user_id', clubId: 'club_id', role: 'role', status: 'status' },
     collections: { id: 'id', clubId: 'club_id', name: 'title', status: 'publication_status', createdBy: 'created_by_user_id' },
     boards: { id: 'id', collectionId: 'collection_id', boardNumber: 'board_number', dealer: 'dealer', vulnerability: 'vulnerability', handsJson: 'hands_json' },
     users: { userId: 'user_id', nickname: 'nickname', displayName: 'display_name', nicknameNormalized: 'nickname_normalized' }

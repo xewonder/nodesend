@@ -239,20 +239,42 @@ function resolveTournamentAccess({ row = null, session = null, membership = null
   return { read: true, manage: false, play: true, reason: null, asPublic: true };
 }
 
-/*
- * The LIST scope, as data the route applies. The caller never chooses it: `visibility=public` in a query
+/**
+ * The list scope, as data the route applies. The caller never chooses it: `visibility=public` in a query
  * is a filter INSIDE the allowed set. Each clause is a conjunction of real column names, which the store
  * turns into NCB equality filters, so a public list cannot carry a private row even if one filter were
  * ignored — the row is re-checked against its own clause on the way out.
+ *
+ * THE OWNER COLUMN IS NOT DEFAULTED, and `user_id` in particular is never a fallback. On this vendor
+ * `user_id` is the row-ownership slot NCB stamps from the WRITING session, and NodeSend writes every
+ * tournament row with its dedicated service account, so a private clause built on `user_id` asks
+ * "which tournaments does the service account own" about the one column that can answer it: it matches
+ * either nothing or everything, and the caller is told "you have no tournaments" — a wrong answer that
+ * looks like a fact about the player. `tournaments/tournamentSchema.js` refuses that mapping in CONFIG
+ * at boot; this is the same rule enforced where the clause is actually built, so no call site can
+ * reach it by forgetting to thread the schema through. A missing owner column is a deployment fault
+ * and answers 503, which is the truth; an empty list would not be.
  */
+const NCB_ROW_OWNER_COLUMN = 'user_id';
+
 function tournamentListScope({ session = null, membership = null, columns = null } = {}) {
   const userId = session?.userId == null ? '' : String(session.userId);
   const isSuper = session?.isSuperAdmin === true;
   const memberClub = membership?.clubId == null ? '' : String(membership.clubId);
   const adminClub = memberClub !== '' && membership?.role === 'club_admin' ? memberClub : '';
+  const ownerColumn = columns?.userId == null ? '' : String(columns.userId).trim();
+  if (ownerColumn === '' || ownerColumn === NCB_ROW_OWNER_COLUMN) {
+    return {
+      userId, isSuper, memberClub, adminClub, clauses: [],
+      error: 'tournament_identity_column_unconfigured',
+      detail: ownerColumn === NCB_ROW_OWNER_COLUMN
+        ? `columns.tournaments.userId resolves to "${NCB_ROW_OWNER_COLUMN}", which is NCB's row-ownership slot and not the application owner.`
+        : 'columns.tournaments.userId was not supplied, so the private-tournament scope cannot name the owner column.'
+    };
+  }
   const col = {
     visibility: columns?.visibility ?? 'visibility',
-    userId: columns?.userId ?? 'user_id',
+    userId: ownerColumn,
     clubId: columns?.clubId ?? 'club_id',
     status: columns?.status ?? 'status'
   };
@@ -404,11 +426,17 @@ function authorizeTournamentOperation({
   const identity = { userId: String(session.userId), isSuperAdmin: storeSuperAdmin === true };
 
   switch (op) {
-    case 'listTournaments':
+    case 'listTournaments': {
       // Any session may list; WHAT it may see is the scope, never a query parameter. `columns` carries the
       // deployment's real column names into the clauses, so the store filters on columns that exist
-      // rather than on the vocabulary this feature speaks.
-      return { allow: true, scope: tournamentListScope({ session: identity, membership, columns }) };
+      // rather than on the vocabulary this feature speaks. A scope that could not be built at all is a
+      // deployment fault and answers 503 — never the 200-with-no-rows a wrong owner column would give,
+      // because that answer is a false statement about the player's own tournaments.
+      const scope = tournamentListScope({ session: identity, membership, columns });
+      return scope.error
+        ? { status: 503, body: { error: scope.error, detail: scope.detail } }
+        : { allow: true, scope };
+    }
 
     case 'createTournament': {
       const decision = authorizeTournamentCreate({
@@ -764,6 +792,9 @@ const TOURNAMENT_STORE_ERROR_STATUS = Object.freeze({
   // something other than a row set. As a 200 with `data: []` it is indistinguishable from an empty
   // table, which is how a successfully imported tournament would appear to have vanished.
   tournament_read_unreadable: 503, tournament_store_unavailable: 503,
+  // Not a fact about a player's tournaments: the deployment never named the column that holds the
+  // application owner, so no honest scope could be built. 503 and never an empty list.
+  tournament_identity_column_unconfigured: 503,
   unauthorized: 401
 });
 

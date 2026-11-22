@@ -10,18 +10,30 @@
  *   tournament_boards   the deals of one tournament, addressed by board number
  *   tournament_attempts which board a given account has played, as the id of the recorded hand
  *
- * THE ASSUMED SHAPE — this is the migration ask, stated once, here. Column NAMES are not assumed,
- * only the columns' existence and their constraints:
+ * THE LIVE SCHEMA AND THE MIGRATION ASK, stated once, here, against the owner's NCB MCP schema
+ * verification of 2026-11-22 on instance 55954_bridgemind. THE THREE TABLES EXIST and are under the
+ * default `private` RLS policy; what is missing is the columns this contract needs, and they are
+ * named per table below. Nothing in this relay adds a column: `ADD COLUMN` works on this vendor
+ * without recreating a table (measured 2026-11-17), but it is the owner's operation through NCB
+ * MCP, not NodeSend's.
  *
- *   tournaments        id, user_id, club_id, name, visibility, status, board_count, source_label,
- *                      dedupe_key, created_at, updated_at
- *                      ** UNIQUE(dedupe_key) **            ← duplicate-import protection
- *   tournament_boards  id, tournament_id, board_number, dealer, vulnerability, hands_json,
- *                      tags_json, created_at
- *                      ** UNIQUE(tournament_id, board_number) — ONE COMPOSITE KEY **
- *   tournament_attempts id, tournament_id, board_number, recorded_hand_id, original_seat, user_id,
- *                      created_at
- *                      ** UNIQUE(recorded_hand_id) **       ← one attempt row per recorded hand
+ *   tournaments        PRESENT: id, club_id, name, visibility, status, board_count, source_label,
+ *                      created_at, updated_at, and `user_id` — which is NCB's row-ownership slot,
+ *                      NOT the application owner (see THE OWNERSHIP SEPARATION below).
+ *                      MISSING: owner_user_id, dedupe_key.
+ *                      WANTED: UNIQUE(dedupe_key) — duplicate-import protection.
+ *   tournament_boards  PRESENT: id, tournament_id, board_number, and the required PBN columns
+ *                      (dealer, vulnerability, hands_json; tags_json where kept).
+ *                      WANTED: UNIQUE(tournament_id, board_number) — ONE COMPOSITE KEY.
+ *   tournament_attempts PRESENT: id, tournament_id, board_number, recorded_hand_id, original_seat,
+ *                      created_at, and `user_id` (ownership again).
+ *                      MISSING: player_user_id.
+ *                      WANTED: UNIQUE(recorded_hand_id) — one attempt row per recorded hand.
+ *
+ * UNTIL THOSE COLUMNS EXIST, no valid TOURNAMENT_NCB_SCHEMA_JSON can be written for this contract,
+ * which is the intended outcome: the mount builds no store and every /tournaments route answers 503.
+ * A schema that named `user_id` as the owner would be accepted by NCB and would answer
+ * authoritatively WRONG things, so it is refused at boot below instead.
  *
  * WHY THE BOARD UNIQUE IS COMPOSITE, and why it is written in capitals. The live
  * `club_collection_boards` table carries TWO single-column uniques — one on `collection_id`, one on
@@ -45,8 +57,9 @@
  * dependency, so it stays optional and the store never sends it when the deployment omits it.
  *
  * NodeSend deliberately owns NO default table names — the same rule `clubs/clubSchema.js` states. The
- * tables do not exist yet: they are provisioned by the owner through NCB after this implementation is
- * reviewed. A default would be a guess, and a guessed name does not fail loudly: it writes real rows
+ * tables exist but the columns this contract requires do not yet: they are provisioned by the owner
+ * through NCB after this implementation is reviewed. A default would be a guess, and a guessed name
+ * does not fail loudly: it writes real rows
  * into whatever table happens to answer, reads them back and reports success. So an unconfigured or
  * partially configured schema returns `ok: false`, `buildTournamentMount` builds no store, and every
  * `/tournaments` route answers 503 after authentication and body validation. Nothing degrades into an

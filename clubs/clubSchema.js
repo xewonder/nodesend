@@ -269,6 +269,33 @@ function readClubSchemaConfig(env = {}, deps = {}) {
     columns[role] = resolved;
   }
 
+  /* IDENTITY IS NOT NCB's ROW OWNER, and on these two roles the difference is authorization, not
+     cosmetics. `user_id` is the slot NCB stamps from the session that WROTE the row; NodeSend writes
+     every `system_admins` grant and every self-service `club_memberships` row with its dedicated
+     service account, so a schema that reads the PERSON out of `user_id`:
+       · answers "zero rows" about a real BridgeMind Admin — the read SUCCEEDS, so nothing fails, and
+         the admin is told they are not one (the 2026-11-19/21 super-admin incident);
+       · resolves every player's membership to the service account, which is one row deciding that
+         everybody belongs to the same club.
+     The live columns are `system_admins.admin_user_id` (NOT NULL, primary key) and
+     `club_memberships.member_user_id` (NOT NULL, unique), per the owner's NCB MCP schema verification
+     of 2026-11-22 on instance 55954_bridgemind.
+     A deployment holding LEGACY rows whose ownership column really does carry the player — rows written
+     before NodeSend owned the write path — opts out explicitly and owns that decision. Silence is not
+     an option here: this is refused at boot, which answers 503 with the reason named, rather than
+     serving an authorization decision derived from the wrong column. */
+  const NCB_ROW_OWNER_COLUMN = 'user_id';
+  const allowUserIdIdentity = ['1', 'true', 'yes'].includes(eq(env.CLUB_NCB_ALLOW_USER_ID_IDENTITY).toLowerCase());
+  if (!allowUserIdIdentity) {
+    for (const role of ['systemAdmins', 'memberships']) {
+      if (columns[role]?.userId === NCB_ROW_OWNER_COLUMN) {
+        problems.push(`columns.${role}.userId is "${NCB_ROW_OWNER_COLUMN}", which is NCB's row-ownership slot, not the account this row is about. `
+          + `NodeSend writes these rows with its service account, so that mapping makes a real ${role === 'systemAdmins' ? 'BridgeMind Admin' : 'member'} read as nobody. `
+          + `Point it at the identity column (${role === 'systemAdmins' ? 'admin_user_id' : 'member_user_id'}); if this deployment's legacy rows genuinely hold the account in "${NCB_ROW_OWNER_COLUMN}", set CLUB_NCB_ALLOW_USER_ID_IDENTITY=1 to say so.`);
+      }
+    }
+  }
+
   // An unknown column key is refused, not ignored. `sourcePbn` is the case this exists for: the
   // column does not exist in NCB, and a leftover config entry that was silently dropped would sit
   // there looking like a supported feature until someone wondered why the source was never stored.
