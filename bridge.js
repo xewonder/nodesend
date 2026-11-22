@@ -60,6 +60,11 @@ const crypto = require("crypto");
 // account client and the storage adapter can be read and tested without wading through the relay.
 // bridge.js contributes one thing this file cannot: its own session resolver.
 const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs");
+// Tournaments is the same shape of feature on the same account: its routes, authority rules and storage
+// adapter live in `tournaments/`, and its club-membership and super-admin facts come from the club store
+// rather than from a second rule. What it needs from this file is the session resolver and the club
+// mount's already-built account client, so one credential pool serves both features.
+const { buildTournamentMount, describeTournamentStoreState, tournamentHealth } = require("./tournaments");
 const { buildNcbGateway, createCorsResolver, INVITATION_REFUSAL_CONTRACT } = require("./ncb/gateway");
 const { createInvitationClaim } = require("./ncb/invitationClaim");
 const { createInvitationReservations } = require("./ncb/invitationReservations");
@@ -2926,6 +2931,11 @@ app.get("/health", (req, res) => res.json({
   // `configured:true, sessionActive:false` means a sign-in is not currently held (a live fact).
   // No credential, email, table name or row ever appears here.
   clubs: clubHealth(clubMount),
+  // Tournaments reports the same three facts apart from Clubs, plus one that is specific to it:
+  // `membershipBridge` names WHERE the club and super-admin facts come from, so an operator can see that
+  // this feature has no second membership rule to configure. Still no credential, email, table name or
+  // row content.
+  tournaments: tournamentHealth(tournamentMount),
   /* Which USE rule this process enforces, and whether it has a privileged channel to enforce it with.
      Two booleans and no name, no table and no host: `required` is the half of the row-level-security
      migration that lives in this container, and an operator proving a deploy needs to SEE it land
@@ -3556,6 +3566,35 @@ const clubMount = buildClubMount({
     return { ok: true, id: resolved.userId, role: resolved.role };
   }
 });
+/* ── TOURNAMENTS ──────────────────────────────────────────────────────────────
+ * Mounted UNCONDITIONALLY for the reason `clubs/index.js` states: an unconfigured deployment that
+ * answers 404 reads as "NodeSend has no tournament feature", so these routes are always present and
+ * answer a named 503 until the account, the club schema and the tournament schema are all supplied.
+ *
+ * What this closes is the defect the routes exist to fix. The three tournament tables used to be in the
+ * player gateway's allow-list with write policy `full` (`ncb/gateway.js`), so any signed-in session could
+ * create, rewrite or delete ANY tournament row through the generic table relay — which is why `private`
+ * and `club` had no server-side meaning. Those tables are now blocked by name there and reachable only
+ * through `/tournaments/...`, where identity comes from the validated session and the row's owner, club,
+ * visibility and status are read from storage before any decision.
+ *
+ * `clubMount.account` is handed over so both features share ONE dedicated-account client — one sign-in
+ * pool, one session, one cooldown — rather than each holding the same credential twice. The club and
+ * super-admin facts come from the club STORE, which `tournaments/index.js` constructs over that client;
+ * nothing in `tournaments/` names a club table.
+ */
+const tournamentMount = buildTournamentMount({
+  env: process.env,
+  clubAccount: clubMount.account || null,
+  // The same adapter shape the club mount is given, and for the same reason: this module never reads a
+  // bearer itself, so there is exactly one way any tournament route can learn who is calling, and a
+  // session authority that could not be reached stays a 503 rather than becoming a "not signed in".
+  authenticate: async (req) => {
+    const resolved = await resolveSessionUser(req);
+    if (!resolved.ok) return { ok: false, status: resolved.status, code: resolved.code };
+    return { ok: true, id: resolved.userId, role: resolved.role };
+  }
+});
 /* THE USE AUTHORITY — who decides which credential a chat is billed against.
  *
  * The caller's RECORDED aiSource, read from `user_settings` through the same resolver the quota path
@@ -3702,6 +3741,9 @@ async function resolveSystemAiAuthority(req, config) {
 }
 
 app.use(clubMount.router);
+// Registered next to the club mount and for the same reason: these are the only routes that may touch a
+// tournament row, and the generic table relay refuses those three tables by name.
+app.use(tournamentMount.router);
 
 /* THE SYSTEM AI AUTHORITY.
  *
@@ -4215,6 +4257,9 @@ if (require.main === module) {
       // Printed at boot because "club storage is inert" must be visible to whoever starts the
       // container, not discovered by a player being told they have no club.
       clubs: describeClubStoreState(),
+      // Same reasoning as Clubs: a tournament feature that cannot store anything is invisible from the
+      // outside unless the container says so when it starts.
+      tournaments: describeTournamentStoreState(),
       // Which transport the container came up on, said out loud: a deployment that means to be
       // native and forgot the variable looks identical to a working one from the outside, and the
       // first symptom is players being told to sign in forever.
@@ -4327,6 +4372,24 @@ module.exports = {
   clubSchemaConfig: require("./clubs/clubSchema.js").readClubSchemaConfig,
   createClubNcbStore: require("./clubs/clubNcbStore.js").createClubNcbStore,
   createNcbAccountClient: require("./clubs/ncbAccountClient.js").createNcbAccountClient,
+  // Tournaments: exported as the LIVE instance and the SHIPPED rules for the same reason Clubs is. The
+  // gate must exercise the router these routes actually serve, the authority decision the relay actually
+  // makes, and the schema reader the mount actually consults — not a copy that could drift from either
+  // repo. `tournamentMount` is what `app.use` registered.
+  buildTournamentMount, describeTournamentStoreState, tournamentHealth, tournamentMount,
+  tournamentAuthorize: require("./tournaments/tournamentAuthorization.js").authorizeTournamentOperation,
+  tournamentAccessRule: require("./tournaments/tournamentAuthorization.js").resolveTournamentAccess,
+  tournamentListScopeRule: require("./tournaments/tournamentAuthorization.js").tournamentListScope,
+  tournamentCreateRule: require("./tournaments/tournamentAuthorization.js").authorizeTournamentCreate,
+  tournamentVisibilityRule: require("./tournaments/tournamentAuthorization.js").authorizeVisibilityTarget,
+  tournamentValidateShape: require("./tournaments/tournamentAuthorization.js").validateTournamentRequestShape,
+  tournamentValidateInput: require("./tournaments/tournamentAuthorization.js").validateTournamentInput,
+  tournamentBodyFields: require("./tournaments/tournamentAuthorization.js").TOURNAMENT_BODY_FIELDS,
+  tournamentRoutes: require("./tournaments/tournamentAuthorization.js").TOURNAMENT_ROUTES,
+  tournamentStoreErrorStatus: require("./tournaments/tournamentAuthorization.js").TOURNAMENT_STORE_ERROR_STATUS,
+  tournamentRefusalCopy: require("./tournaments/tournamentAuthorization.js").TOURNAMENT_REFUSAL_COPY,
+  tournamentSchemaConfig: require("./tournaments/tournamentSchema.js").readTournamentSchemaConfig,
+  createTournamentNcbStore: require("./tournaments/tournamentNcbStore.js").createTournamentNcbStore,
   // The player gateway: the live mount these routes serve, the builder the gate reboots with a
   // different environment, and the two primitives whose rules the gate has to be tested against
   // rather than re-implemented. Exported for the same reason every other predicate here is — the

@@ -16,6 +16,10 @@ COPY clubs/ ./clubs/
 # length of a container restart, and then crash-loops on `Cannot find module`. Adding a directory to
 # a Node image is not a runtime change — nothing in the gateway is consulted unless bridge.js loads it.
 COPY ncb/ ./ncb/
+# Tournaments follows the identical rule and would have the identical failure mode without it:
+# bridge.js requires ./tournaments at boot, so an image missing this directory builds green, answers a
+# health check for the length of a container restart, and then crash-loops on `Cannot find module`.
+COPY tournaments/ ./tournaments/
 
 ENV PORT=3001
 
