@@ -71,44 +71,162 @@ function rowsOf(body) {
 const DUPLICATE_KEY = /duplicate|unique|constraint|already exists/i;
 
 /*
- * A bounded, single-line, PAYLOAD-BLIND digest of an upstream error, for two reasons that are easy to
- * confuse. One is usefulness: a 422 that says "0/32 reported success" tells the importer that something
- * happened and tells support NOTHING about what, and every vendor reason this call could have learned
- * (`Data too long for column 'hands_json'`, `Field 'created_at' doesn't have a default value`, a denied
- * INSERT) was being collected into `failed[]` and thrown away. The other is safety: NCB sometimes quotes
- * the submitted value back inside its own error prose, and a 52-card deal must not become an API response
- * body — the caller's own cards are the one thing this relay has no business re-serving. So long quoted
- * runs, arrays and objects are collapsed BEFORE the digest is truncated, and the result is capped. The
- * account client already redacted credentials out of `detail`; this handles the card data, which is not
- * a credential and is still somebody's deal.
+ * THE UPSTREAM DIAGNOSTIC — CATEGORY-FIRST, NOT PROSE-FIRST.
+ *
+ * Why a 422 needs it at all: the first real PBN import answered "0/32 board write(s) reported success"
+ * and nothing else, because `run()` had already learned WHY from the vendor and the loop threw the list
+ * away. The reason name says whether to fix the data, the schema or the grant — three different actions,
+ * and the count distinguishes none of them.
+ *
+ * Why it is not simply that reason passed through: re-serving unrestricted vendor prose makes this relay
+ * a copy of whatever the vendor echoes, and NCB does quote submitted values back inside its own error
+ * text. So the shape here is: recognise a database error CATEGORY, render it from this store's own
+ * literals, lift at most one charset-validated identifier out of the sentence, and gate the result.
  */
-const UPSTREAM_DIGEST_MAX = 180;
-// Now that an upstream sentence reaches an API response body, it is scrubbed HERE as well as upstream.
-// The account client redacts the credentials it holds, which is not the same as redacting whatever a
-// vendor happens to quote back, and "the caller already sanitized it" is not an invariant worth
-// inheriting in a path that ends in a response.
-const SECRETISH = /\b(authorization|bearer|token|secret|password|passwd|api[_-]?key|access[_-]?key|cookie|session)\b\s*[:=]\s*"?[^\s",;]+/gi;
-const BEARERISH = /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
-const EMAILISH = /[\w.+-]+@[\w-]+\.[\w-]+(?:\.[\w-]+)*/g;
+const UPSTREAM_IDENT_CHARS = /^[A-Za-z0-9_]{1,64}$/;
+const UPSTREAM_CANONICAL_MAX = 96;
+const UPSTREAM_PROSE_MAX = 120;
+
+// Recognised database rejections, in priority order: the specific shape first, its generic fallback next.
+// `render` receives the RegExpMatchArray and returns text the store composed itself — never upstream
+// prose — plus at most one identifier that has already passed a strict charset.
+const UPSTREAM_CATEGORIES = Object.freeze([
+  { id: 'value_too_long', test: /data too long for column\s*['"`]?(?<col>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `Data too long for column '${m.groups.col}'` },
+  { id: 'value_too_long', test: /data too long/i, render: () => 'Data too long for column' },
+  { id: 'column_no_default', test: /field\s+['"`]?(?<col>[A-Za-z0-9_]{1,64})['"]?\s+doesn['`]t have a default value/i,
+    render: (m) => `Column cannot be null: '${m.groups.col}' has no default value` },
+  { id: 'column_no_default', test: /cannot be null|no default value/i, render: () => 'Column cannot be null' },
+  { id: 'unknown_column', test: /unknown column\s*['"`]?(?<col>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `Unknown column '${m.groups.col}'` },
+  { id: 'unknown_table', test: /table\s+['"`]?(?<tbl>[A-Za-z0-9_]{1,64})['"]?\s+doesn['`]t exist/i,
+    render: (m) => `Table '${m.groups.tbl}' does not exist` },
+  { id: 'permission_denied', test: /insert command denied to user\s+\S+\s+for table\s+['"`]?(?<tbl>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `INSERT permission denied for table '${m.groups.tbl}'` },
+  { id: 'permission_denied', test: /permission denied(?: for table)?\s*['"`]?(?:(?<tbl>[A-Za-z0-9_]{1,64}))?/i,
+    render: (m) => (m.groups.tbl ? `INSERT permission denied for table '${m.groups.tbl}'` : 'INSERT permission denied') },
+  { id: 'permission_denied', test: /access denied|not authorized to|owner denied|insufficient (?:privilege|permission)/i,
+    render: () => 'INSERT permission denied' },
+  // The MySQL spelling puts the colliding VALUE between the two phrases — `'77-12'` — and that value is
+  // row data, so it is skipped over rather than captured: only the key NAME is lifted, because the key
+  // name is what tells an operator which unique the migration is missing.
+  { id: 'duplicate_entry', test: /duplicate entry\s*(?:'[^']{1,64}'\s*)?for key\s*['"`]?(?<key>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `Duplicate entry for key '${m.groups.key}'` },
+  { id: 'duplicate_entry', test: /duplicate entry/i, render: () => 'Duplicate entry' },
+  { id: 'foreign_key', test: /foreign key constraint fails(?:\s+(?:constraint|on)\s+`?(?<con>[A-Za-z0-9_]{1,64})`?)?/i,
+    render: (m) => (m.groups.con ? `Foreign key constraint fails on '${m.groups.con}'` : 'Foreign key constraint fails') },
+  { id: 'check_constraint', test: /check constraint.*failed|violates check constraint/i, render: () => 'Check constraint failed' },
+  { id: 'value_out_of_range', test: /out of range|value too large for column|integer display width/i,
+    render: () => 'Value out of range for column' }
+]);
+
+/*
+ * THE LEAK GATE. Deliberately blunt and deliberately conservative: the question asked of any candidate
+ * fragment is "could this still be somebody's deal, credential, host or encoded payload?", and if the
+ * answer is maybe, the prose is dropped and only the reason name is kept. Redaction alone was the first
+ * design and it is not enough — the three shapes that defeated it (a space-separated deal with no JSON
+ * punctuation around it, a base64 blob, a query value with no label in front of it) are precisely the
+ * ones no scrubber can be trusted to enumerate, because the vendor's prose is not a format this relay
+ * controls. So the gate is the guarantee and the redaction is only an attempt to keep something useful
+ * to show. Thresholds are set so ordinary diagnostic text survives: a row number, a column name and
+ * `club_account_request_failed` are not suspicious, and arms D16/D17 assert both halves of that.
+ */
+const CARD_TOKEN = /\b[2-9TJQKA][SHCD]\b/g;          // uppercase PBN tokens; prose rarely holds six
+const CARD_RUN = /(?:[2-9TJQKA][SHCD]){4}/;           // 2S3S4S5S — no separators at all
+const B64_CLASSIC = /[A-Za-z0-9+/]{24,}={0,2}/;       // no _ or -, so reason names are untouched
+const OPAQUE_MIXED = /[A-Za-z0-9_-]{24,}/g;
+const HEX_RUN = /\b[0-9a-fA-F]{16,}\b/;
+const JWT_SHAPE = /\beyJ[A-Za-z0-9_-]{8,}/;
+const KEY_SHAPE = /\bsk-[A-Za-z0-9_-]{8,}/;
+const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
+const HOSTISH = /\b[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+\.[a-z]{2,6}\b/i;
+// A LABELED secret is flagged at ANY length. Without this rule the shortest thing the gate reacts to is a
+// 24-character run, so `token=abc123` inside an unrecognised sentence would be judged clean and the only
+// thing standing between it and a response body would be the redaction pass — which is an attempt, not a
+// guarantee. Mutation testing proved no arm could tell whether that pass had run at all.
+// Non-global on purpose: a /g regex used with .test() carries lastIndex between calls.
+const LABELED_SECRET = /\b(authorization|bearer|token|secret|password|passwd|api[_-]?key|access[_-]?key|cookie|session|credential|private[_-]?key)\s*[:=]\s*\S/i;
+
+function opaqueMixedRuns(text) {
+  // 24+ characters with six digits AND both cases is random, not a name. `club_account_request_failed`
+  // (25 chars, lowercase, no digits) and `tournament_boards` must pass: the second is the whole point.
+  return (text.match(OPAQUE_MIXED) || []).some((run) => {
+    const digits = (run.match(/\d/g) || []).length;
+    return digits >= 6 && /[a-z]/.test(run) && /[A-Z]/.test(run);
+  });
+}
+
+function containsSensitiveShape(text) {
+  const s = String(text ?? '');
+  if (s === '') return false;
+  if ((s.match(CARD_TOKEN) || []).length >= 6) return true;
+  if (CARD_RUN.test(s)) return true;
+  if (B64_CLASSIC.test(s)) return true;
+  if (opaqueMixedRuns(s)) return true;
+  if (HEX_RUN.test(s)) return true;
+  if (JWT_SHAPE.test(s)) return true;
+  if (KEY_SHAPE.test(s)) return true;
+  if (IPV4.test(s)) return true;
+  if (HOSTISH.test(s)) return true;
+  if (LABELED_SECRET.test(s)) return true;
+  if (s.includes('@') || s.includes('://')) return true;   // any email or connection-string residue
+  return false;
+}
+
+// Redactions run BEFORE the gate, so useful text gets a fair chance of surviving it.
+const SECRET_PAIR = /\b(authorization|bearer|token|secret|password|passwd|api[_-]?key|access[_-]?key|cookie|session|instance)\b\s*[:=]\s*"?[^\s",;]+/gi;
+const BEARER_FORM = /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 // Deliberately not `Bearer …`: gate arm 13h flags ANY response body containing the literal "Bearer " as
 // a leaked credential, and a scrub marker must not be able to trip the detector it is supposed to satisfy.
-const SCRUB_MARK = '[bearer-redacted]';
-function digestUpstream(value) {
-  const flat = String(value ?? '').replace(/\s+/g, ' ').trim();
+const SCRUB_MARK = '[redacted]';
+
+function redactUpstreamProse(raw) {
+  const flat = String(raw ?? '').replace(/\s+/g, ' ').trim();
   if (flat === '') return '';
-  const payloadBlind = flat
-    .replace(/\{[^{}]{20,}\}/g, '{…}')
-    .replace(/\[[^\[\]]{20,}\]/g, '[…]')
-    .replace(/"(?:[^"\\]|\\.){20,}"/g, '"…"')
-    // ORDER LOAD-BEARING: `Authorization: Bearer <token>` would otherwise be half-eaten by the pair rule
-    // below, which consumes the word "Bearer" as the value and leaves the token itself standing there
-    // unlabelled and unscrubbed. Asserted by R23 of verify-tournament-import-failure.mjs.
-    .replace(BEARERISH, SCRUB_MARK)
-    .replace(SECRETISH, '$1=…')
-    .replace(EMAILISH, '[address]');
-  return payloadBlind.length > UPSTREAM_DIGEST_MAX
-    ? `${payloadBlind.slice(0, UPSTREAM_DIGEST_MAX - 1)}…`
-    : payloadBlind;
+  return flat
+    .replace(/\{[^{}]{16,}\}/g, '{…}')
+    .replace(/\[[^\[\]]{16,}\]/g, '[…]')
+    .replace(/"(?:[^"\\]|\\.){16,}"/g, '"…"')
+    // ORDER LOAD-BEARING: the bearer form must go first, or the pair rule below consumes the word
+    // "Bearer" as the value and leaves the token itself standing there unlabelled and unscrubbed.
+    .replace(BEARER_FORM, SCRUB_MARK)
+    .replace(SECRET_PAIR, '$1=…')
+    // Any scheme URL and any query parameter, named or bare, is a connection string as far as a response
+    // body is concerned: the host is internal and the value is somebody's key.
+    .replace(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`]*/g, '[url]')
+    .replace(/[A-Za-z0-9_.-]{6,}=(?:%3D)?[^\s&,;"'`]*/g, '[param]')
+    .replace(/[A-Za-z0-9._+-]{4,}@[A-Za-z0-9.-]+/g, '[address]');
+}
+
+/** Recognise a database rejection. Returns `{ id, text }` or null when nothing matches. */
+function classifyUpstream(raw) {
+  const s = String(raw ?? '');
+  for (const entry of UPSTREAM_CATEGORIES) {
+    const m = s.match(entry.test);
+    if (!m) continue;
+    const rendered = String(entry.render(m) || '');
+    if (rendered === '') continue;
+    // An identifier is only quoted when it is a bare word this store would accept as a column name.
+    const ids = rendered.match(/[A-Za-z0-9_]{1,64}/g) || [];
+    if (!ids.every((id) => UPSTREAM_IDENT_CHARS.test(id))) continue;
+    const text = rendered.slice(0, UPSTREAM_CANONICAL_MAX);
+    if (containsSensitiveShape(text)) return { id: entry.id, text: '' };
+    return { id: entry.id, text };
+  }
+  return null;
+}
+
+/**
+ * The one safe fragment of an upstream refusal, fit for a response body.
+ * A recognised category wins; failing that, sanitized prose is OFFERED TO THE GATE and dropped if it is
+ * refused. The bare reason name is always available, which is why an unknown error still beats silence.
+ */
+function safeUpstreamFragment(raw) {
+  const found = classifyUpstream(raw);
+  if (found) return found.text === '' ? found.id : `${found.id}(${found.text})`;
+  const cleaned = redactUpstreamProse(raw);
+  if (cleaned === '' || containsSensitiveShape(cleaned)) return 'unrecognised';
+  return `unrecognised(${cleaned.slice(0, UPSTREAM_PROSE_MAX)})`;
 }
 
 /**
@@ -121,7 +239,7 @@ function summariseUpstreamRefusals(failed) {
     const reason = eq(item?.reason) === '' ? 'upstream_refused' : eq(item.reason);
     const entry = byReason.get(reason) || { reason, count: 0, detail: '' };
     entry.count += 1;
-    if (entry.detail === '') entry.detail = digestUpstream(item?.detail);
+    if (entry.detail === '') entry.detail = safeUpstreamFragment(item?.detail);
     byReason.set(reason, entry);
   }
   return [...byReason.values()];
@@ -129,7 +247,7 @@ function summariseUpstreamRefusals(failed) {
 
 function describeUpstream(summary) {
   return summary
-    .map((entry) => `${entry.reason}${entry.count > 1 ? ` x${entry.count}` : ''}${entry.detail ? ` "${entry.detail}"` : ''}`)
+    .map((entry) => `${entry.reason}${entry.count > 1 ? ` x${entry.count}` : ''}${entry.detail ? ` ${entry.detail}` : ''}`)
     .join('; ');
 }
 
@@ -827,4 +945,15 @@ function createTournamentNcbStore({ client, schema, clubBridge }) {
   };
 }
 
-module.exports = { createTournamentNcbStore, rowsOf, DUPLICATE_KEY };
+module.exports = {
+  createTournamentNcbStore,
+  rowsOf,
+  DUPLICATE_KEY,
+  // Exported for the gate on the same footing as `rowsOf` and `DUPLICATE_KEY`: the arms must exercise
+  // THE RULE THE STORE ACTUALLY USES, not a copy of it that can drift. `containsSensitiveShape` is the
+  // gate, so a test that only checks rendered output could pass while the gate itself rot.
+  safeUpstreamFragment,
+  classifyUpstream,
+  containsSensitiveShape,
+  UPSTREAM_CATEGORIES
+};

@@ -109,6 +109,7 @@ const VENDOR = {
   insertGrantDenied: new Set(),    // tables the service account may not insert into
   refuseBoardNumbers: new Set(),   // per-row refusal, the only way to get a PARTIAL landing left
   plantedProse: '',                // vendor prose carrying a secret the account client was never given
+  rawProse: null,                  // an ARBITRARY upstream error sentence, for the disclosure matrix
   acceptButDoNotStore: false,      // 2xx that writes nothing (the documented NCB behaviour)
   echoSubmittedValue: false,       // an error body that quotes the value back
   createResponseShape: 'id'        // 'id' | 'no-id' | 'bare'
@@ -185,6 +186,12 @@ globalThis.fetch = async (url, init = {}) => {
   if (action === 'create') {
     if (VENDOR.insertGrantDenied.has(table)) {
       return json({ status: 'error', message: `permission denied for table ${table}` }, 403);
+    }
+    // THE DISCLOSURE MATRIX HOOK. Whatever sentence a vendor might answer with, verbatim — this is how
+    // the arms below put a complete deal, a JWT, an internal host or a connection string in front of the
+    // store and then check what came out of the HTTP response.
+    if (VENDOR.rawProse !== null && table === 'tournament_boards') {
+      return json({ status: 'failed', error: VENDOR.rawProse }, 500);
     }
     // A per-row refusal. Needed because a LEGAL deal is always 299 characters, so a width rule refuses
     // every board or none — and "every board or none" cannot produce the partial landing that the
@@ -265,7 +272,7 @@ const boards = (count) => Array.from({ length: count }, (_, i) => board(i + 1));
 const resetVendor = () => {
   Object.assign(VENDOR, {
     handsJsonColumnChars: 4096, requiredNoDefault: null, acceptButDoNotStore: false,
-    echoSubmittedValue: false, createResponseShape: 'id', plantedProse: ''
+    echoSubmittedValue: false, createResponseShape: 'id', plantedProse: '', rawProse: null
   });
   VENDOR.insertGrantDenied = new Set();
   VENDOR.refuseBoardNumbers = new Set();
@@ -364,8 +371,11 @@ check('R12. a denied INSERT grant is reported as a permission refusal, not a dat
 resetVendor();
 VENDOR.requiredNoDefault = 'created_at';
 const noDefault = await importWith(4);
-check('R13. a NOT NULL column without a default is named, which no name-only mock can see',
-  noDefault.status === 422 && /Field 'created_at' doesn't have a default value/.test(text(noDefault)),
+// The CATEGORY and the column survive; the vendor's verbatim sentence no longer does, because the
+// diagnostic is rendered from the store's own literals now (see safeUpstreamFragment). Asserting the
+// raw MySQL prose here would assert the pre-hardening behaviour this commit exists to remove.
+check('R13. a NOT NULL column without a default is categorised and its column named',
+  noDefault.status === 422 && /column_no_default/.test(text(noDefault)) && /created_at/.test(text(noDefault)),
   text(noDefault).slice(0, 300));
 
 // ── refused vs accepted-but-unrecognized: the distinction the mission asks for ────────────────────
@@ -440,6 +450,154 @@ check('R23. the store scrubs a secret the account client never held, because pro
 check('R23b. and the reason still survives its own scrubbing (it is not a redaction black hole)',
   plantedText.includes('upstream=club_account_request_failed') && plantedText.includes('x2'),
   plantedText.slice(0, 320));
+
+// ── HARDENING: the disclosure matrix (audit findings 1, 2 and 3) ─────────────────────────────────
+// Each case is the VERBATIM sentence a vendor might answer with, driven end-to-end through the HTTP
+// response — not through a unit call — because the claim under test is "nothing of this leaves the
+// process", and only the wire can show that. The forbidden list per case is the sensitive substring the
+// case is designed to smuggle.
+const storeRules = require(path.join(ROOT, 'tournaments/tournamentNcbStore.js'));
+const DEAL_JSON = JSON.stringify(deal(0));
+const DEAL_FLAT = DECK.join(' ');
+const DEAL_CSV = DECK.map((c) => `"${c}"`).join(',');
+const DEAL_COMPACT = DECK.join('');
+const B64_DEAL = Buffer.from(DEAL_JSON).toString('base64');
+const B64URL_DEAL = Buffer.from(DEAL_JSON).toString('base64url');
+const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6eyJzdWIiOiI5OSJ9.abcDEF123';
+
+const DISCLOSURE_CASES = [
+  // Every `secret` is a needle that WOULD appear verbatim in the response if the vendor sentence were
+  // emitted unchanged (after the sanitizer's own whitespace collapse). A needle that could never appear
+  // even in the broken build is a decoration, not a test.
+  { name: 'deal as quoted JSON', prose: `Data too long for column 'hands_json' at row 1 value '${DEAL_JSON}'`, secret: [DEAL_JSON.slice(0, 20), '"2S","3S"'] },
+  { name: 'deal unquoted, single spaces', prose: `Data too long for column 'hands_json' value: ${DEAL_FLAT}`, secret: ['2S 3S 4S 5S', DEAL_FLAT.slice(0, 40)] },
+  { name: 'deal unquoted, irregular spacing', prose: `value: ${DECK.join('   ')} rejected`, secret: ['2S 3S 4S 5S'] },
+  { name: 'deal as quoted comma list', prose: `rejected cards ${DEAL_CSV}`, secret: ['"2S","3S"'] },
+  { name: 'deal concatenated', prose: `hands ${DEAL_COMPACT} invalid`, secret: [DEAL_COMPACT.slice(0, 24), '2S3S4S5S'] },
+  { name: 'deal as base64', prose: `invalid hands_json ${B64_DEAL}`, secret: [B64_DEAL.slice(0, 24)] },
+  { name: 'deal as base64url', prose: `invalid hands_json ${B64URL_DEAL}`, secret: [B64URL_DEAL.slice(0, 24)] },
+  { name: 'bearer JWT in prose', prose: `upstream rejected Authorization: Bearer ${JWT}`, secret: [JWT, 'eyJhbGci'] },
+  { name: 'sk-prefixed api key', prose: `failed api_key: sk-liveABCDEFGHIJKLMNOP1234`, secret: ['sk-liveABCDEFGHIJKLMNOP1234'] },
+  { name: 'connection string', prose: `psql postgres://svc:hunter2@db.internal:5432/ncb failed`, secret: ['hunter2', 'db.internal', 'postgres://'] },
+  { name: 'internal hostname', prose: `host ncb-proxy.us-east-2.lambda.amazonaws.com refused`, secret: ['lambda.amazonaws.com', 'us-east-2'] },
+  { name: 'ipv4 of the vendor', prose: `connect to 10.0.0.5:3306 timed out`, secret: ['10.0.0.5'] },
+  { name: 'service account address', prose: `grant denied for svc-account@bridgemind.invalid`, secret: ['svc-account@bridgemind.invalid'] },
+  { name: 'bare unnamed query value', prose: `bad url https://vendor.internal/api?abcdef0123456789&type=insert`, secret: ['abcdef0123456789', 'vendor.internal'] },
+  { name: 'whole stored row echoed', prose: `row {id: 4412, tournament_id: 77, board_number: 12, hands_json: ${DEAL_JSON}} rejected`, secret: [DEAL_JSON.slice(0, 20), '"2S","3S"'] },
+  // Too short for every length-based rule: only the labeled-secret rule sees these, and the prose is
+  // unrecognised, so no category saves it either. This is the case the first test set could not see.
+  { name: 'short labeled secret', prose: `write refused token=abc123 while inserting board 1`, secret: ['abc123'] },
+  { name: 'password value, short', prose: `login failed for password=hunter2 status=failed`, secret: ['hunter2'] }
+];
+
+const detailLengths = [];
+for (const [index, c] of DISCLOSURE_CASES.entries()) {
+  resetVendor();
+  VENDOR.rawProse = c.prose;
+  const r = await importWith(2);
+  const bodyText = text(r);
+  const detail = String(r.body?.detail ?? '');
+  detailLengths.push(detail.length);
+  const survivors = c.secret.filter((needle) => bodyText.includes(needle));
+  check(`D${index + 1}. ${c.name} cannot reach the response body`,
+    r.status === 422 && r.body?.error === 'import_incomplete'
+      && survivors.length === 0
+      && bodyText.includes('upstream=club_account_request_failed')
+      && storeRules.containsSensitiveShape(detail) === false
+      && Array.isArray(r.body?.failedBoardNumbers) && r.body.failedBoardNumbers.length === 2,
+    `survivors=${JSON.stringify(survivors)} ${bodyText.slice(0, 220)}`);
+}
+
+check('D16. the gate itself fires on a planted leak (otherwise every D arm above is a dead detector)',
+  storeRules.containsSensitiveShape(DEAL_FLAT) === true
+    && storeRules.containsSensitiveShape(DEAL_JSON) === true
+    && storeRules.containsSensitiveShape(DEAL_COMPACT) === true
+    && storeRules.containsSensitiveShape(B64_DEAL) === true
+    && storeRules.containsSensitiveShape(JWT) === true
+    && storeRules.containsSensitiveShape('a@b.internal') === true
+    && storeRules.containsSensitiveShape('http://x.internal/y') === true
+    && storeRules.containsSensitiveShape('10.0.0.5') === true
+    // The two shapes no length rule can see: a labeled secret with a short value.
+    && storeRules.containsSensitiveShape('token=abc123') === true
+    && storeRules.containsSensitiveShape('password=hunter2') === true,
+  'gate failed to flag a planted shape');
+check('D17. and the gate does NOT fire on the ordinary diagnostic vocabulary',
+  storeRules.containsSensitiveShape("club_account_request_failed x32 value_too_long(Data too long for column 'hands_json')") === false
+    && storeRules.containsSensitiveShape('tournament_boards') === false
+    && storeRules.containsSensitiveShape("Duplicate entry for key 'uk_tournament_board'") === false,
+  'gate over-fires and would blank the diagnostic');
+
+// The point of the hotfix survives the hardening: these are the answers an operator needs to act.
+const CATEGORY_EXPECTATIONS = [
+  [`Data too long for column 'hands_json' at row 1`, 'value_too_long', "Data too long for column 'hands_json'"],
+  [`Field 'created_at' doesn't have a default value`, 'column_no_default', "Column cannot be null: 'created_at'"],
+  [`Column 'board_number' cannot be null`, 'column_no_default', 'Column cannot be null'],
+  [`permission denied for table tournament_boards`, 'permission_denied', "INSERT permission denied for table 'tournament_boards'"],
+  [`Unknown column 'tags_json' in 'field list'`, 'unknown_column', "Unknown column 'tags_json'"],
+  [`Duplicate entry '77-12' for key 'uk_tournament_board'`, 'duplicate_entry', "Duplicate entry for key 'uk_tournament_board'"],
+  [`a foreign key constraint fails`, 'foreign_key', 'Foreign key constraint fails']
+];
+const categoryMisses = CATEGORY_EXPECTATIONS
+  .map(([raw, id, phrase]) => {
+    const got = storeRules.safeUpstreamFragment(raw);
+    return got.includes(id) && got.includes(phrase) ? null : `${id} -> ${got}`;
+  })
+  .filter(Boolean);
+check('D18. every safe database category the hotfix exists to surface still reaches the answer',
+  categoryMisses.length === 0, categoryMisses.join(' | '));
+check('D18b. and the colliding VALUE inside a duplicate message is never quoted back',
+  !storeRules.safeUpstreamFragment(`Duplicate entry '77-12' for key 'uk_tournament_board'`).includes('77-12'),
+  storeRules.safeUpstreamFragment(`Duplicate entry '77-12' for key 'uk_tournament_board'`));
+check('D19. an unknown but harmless sentence keeps its prose (the store is not censoring everything)',
+  storeRules.safeUpstreamFragment('read timeout after 12000ms').includes('read timeout'),
+  storeRules.safeUpstreamFragment('read timeout after 12000ms'));
+
+// A captured identifier is the ONE piece of vendor text this store re-emits inside its own sentence, so
+// it is the one place a hostile or merely weird upstream string can be re-served as if it were ours.
+const HOSTILE_IDENTS = [
+  "Data too long for column '<img src=x>' at row 1",
+  "Data too long for column 'hands_json; DROP TABLE tournaments;--' at row 1",
+  "Unknown column 'https://x.internal/y' in 'field list'",
+  "Unknown column 'a b c d e f g h' in 'where clause'",
+  "permission denied for table tournament_boards; GRANT ALL ON *.* TO 'evil'@'%'",
+  "Duplicate entry 'x' for key '<script>alert(1)</script>'",
+  "Unknown column 'user_id' in 'field list'",
+  `Data too long for column '${'A'.repeat(300)}' at row 1`
+];
+const hostileEscapes = HOSTILE_IDENTS
+  .map((raw) => {
+    const got = storeRules.safeUpstreamFragment(raw);
+    // The canonical sentence may contain letters, digits, underscore, spaces, apostrophes, parentheses,
+    // hyphens and the ellipsis. Nothing else — no angle bracket, no semicolon, no scheme, no address.
+    return (/[<>;]|:\/\/|@/.test(got) || got.length > 140) ? `${got.slice(0, 120)}` : null;
+  })
+  .filter(Boolean);
+check('D21. a hostile or malformed identifier is never re-emitted inside the canonical sentence',
+  hostileEscapes.length === 0, hostileEscapes.join(' | '));
+check('D21b. and a hostile identifier still yields a usable CATEGORY, so the operator is not left blind',
+  storeRules.safeUpstreamFragment(`Data too long for column '<img src=x>' at row 1`).includes('value_too_long')
+    && storeRules.safeUpstreamFragment(`Unknown column 'https://x.internal/y' in 'field list'`).length > 'unknown'.length,
+  `${storeRules.safeUpstreamFragment(`Data too long for column '<img src=x>' at row 1`)} | ${storeRules.safeUpstreamFragment(`Unknown column 'https://x.internal/y' in 'field list'`)}`);
+
+/*
+ * The one case where the redaction pass earns its keep, found by mutation-testing rather than by
+ * writing it first: an UNRECOGNISED sentence that carries a full quoted deal. Nothing collapses to a
+ * category here, so it is the gate alone that decides — and with the deal left in place the gate is
+ * obliged to drop the whole sentence, losing the operator's only clue ("hands_json rejected"). Collapse
+ * the payload and the same sentence is safe AND useful. If this arm ever goes red while D1-D17 stay
+ * green, the regression is in the redaction pass, not in the gate.
+ */
+const RESCUE_PROSE = `hands_json rejected at row 1 ${DEAL_JSON}`;
+const rescueFragment = storeRules.safeUpstreamFragment(RESCUE_PROSE);
+check('D22. an unrecognised sentence with an embedded deal is collapsed, not dropped whole',
+  rescueFragment.includes('hands_json rejected') && rescueFragment.includes('{…}')
+    && !rescueFragment.includes('"2S"') && storeRules.containsSensitiveShape(rescueFragment) === false,
+  rescueFragment.slice(0, 200));
+check('D22b. and the gate still refuses the SAME sentence with the collapse disabled (so D22 is not luck)',
+  storeRules.containsSensitiveShape(RESCUE_PROSE) === true, 'deal sentence judged clean without collapsing');
+check(`D20. the diagnostic stays a status message, not a paragraph, across all ${DISCLOSURE_CASES.length} shapes`,
+  detailLengths.length === DISCLOSURE_CASES.length
+    && detailLengths.every((n) => n > 0 && n < 700), `n=${detailLengths.length} max=${Math.max(...detailLengths)} min=${Math.min(...detailLengths)}`);
 check('R22. nothing left the mock host for the whole run', calls.offHost.length === 0, calls.offHost.slice(0, 3).join(','));
 
 let failed = 0;
