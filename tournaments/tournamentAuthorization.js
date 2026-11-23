@@ -810,7 +810,16 @@ function respondStoreResult(res, payload) {
     if (payload.error) {
       const status = TOURNAMENT_STORE_ERROR_STATUS[payload.error]
         ?? (/^club_account_|^club_store_/.test(String(payload.error)) ? 503 : 502);
-      return void res.status(status).json({ error: payload.error, detail: String(payload.detail ?? '') });
+      const body = { error: payload.error, detail: String(payload.detail ?? '') };
+      /* Which boards the failed call named, as DATA. The store already computed this list and the
+         responder used to drop it, leaving the caller to recover board numbers out of a sentence — and a
+         32-board failure puts all thirty-two in the prose anyway, which is a retry list nobody parses.
+         Additive only: the `{error, detail}` envelope a caller already depends on is unchanged, the list
+         is bounded, and it is never sent when the store names nothing. */
+      if (Array.isArray(payload.failedBoardNumbers) && payload.failedBoardNumbers.length > 0) {
+        body.failedBoardNumbers = payload.failedBoardNumbers.slice(0, 100).map((n) => String(n));
+      }
+      return void res.status(status).json(body);
     }
   }
   return void res.status(200).json({ status: 'success', data: payload ?? null });

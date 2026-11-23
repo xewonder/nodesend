@@ -70,6 +70,69 @@ function rowsOf(body) {
 // turned into a clean duplicate answer.
 const DUPLICATE_KEY = /duplicate|unique|constraint|already exists/i;
 
+/*
+ * A bounded, single-line, PAYLOAD-BLIND digest of an upstream error, for two reasons that are easy to
+ * confuse. One is usefulness: a 422 that says "0/32 reported success" tells the importer that something
+ * happened and tells support NOTHING about what, and every vendor reason this call could have learned
+ * (`Data too long for column 'hands_json'`, `Field 'created_at' doesn't have a default value`, a denied
+ * INSERT) was being collected into `failed[]` and thrown away. The other is safety: NCB sometimes quotes
+ * the submitted value back inside its own error prose, and a 52-card deal must not become an API response
+ * body — the caller's own cards are the one thing this relay has no business re-serving. So long quoted
+ * runs, arrays and objects are collapsed BEFORE the digest is truncated, and the result is capped. The
+ * account client already redacted credentials out of `detail`; this handles the card data, which is not
+ * a credential and is still somebody's deal.
+ */
+const UPSTREAM_DIGEST_MAX = 180;
+// Now that an upstream sentence reaches an API response body, it is scrubbed HERE as well as upstream.
+// The account client redacts the credentials it holds, which is not the same as redacting whatever a
+// vendor happens to quote back, and "the caller already sanitized it" is not an invariant worth
+// inheriting in a path that ends in a response.
+const SECRETISH = /\b(authorization|bearer|token|secret|password|passwd|api[_-]?key|access[_-]?key|cookie|session)\b\s*[:=]\s*"?[^\s",;]+/gi;
+const BEARERISH = /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+const EMAILISH = /[\w.+-]+@[\w-]+\.[\w-]+(?:\.[\w-]+)*/g;
+// Deliberately not `Bearer …`: gate arm 13h flags ANY response body containing the literal "Bearer " as
+// a leaked credential, and a scrub marker must not be able to trip the detector it is supposed to satisfy.
+const SCRUB_MARK = '[bearer-redacted]';
+function digestUpstream(value) {
+  const flat = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (flat === '') return '';
+  const payloadBlind = flat
+    .replace(/\{[^{}]{20,}\}/g, '{…}')
+    .replace(/\[[^\[\]]{20,}\]/g, '[…]')
+    .replace(/"(?:[^"\\]|\\.){20,}"/g, '"…"')
+    // ORDER LOAD-BEARING: `Authorization: Bearer <token>` would otherwise be half-eaten by the pair rule
+    // below, which consumes the word "Bearer" as the value and leaves the token itself standing there
+    // unlabelled and unscrubbed. Asserted by R23 of verify-tournament-import-failure.mjs.
+    .replace(BEARERISH, SCRUB_MARK)
+    .replace(SECRETISH, '$1=…')
+    .replace(EMAILISH, '[address]');
+  return payloadBlind.length > UPSTREAM_DIGEST_MAX
+    ? `${payloadBlind.slice(0, UPSTREAM_DIGEST_MAX - 1)}…`
+    : payloadBlind;
+}
+
+/**
+ * Collapses a list of failed board writes into one entry PER REASON. Thirty-two boards refused by the
+ * same column rule are one fact, not thirty-two, and pasting the sentence 32 times buries it.
+ */
+function summariseUpstreamRefusals(failed) {
+  const byReason = new Map();
+  for (const item of (Array.isArray(failed) ? failed : [])) {
+    const reason = eq(item?.reason) === '' ? 'upstream_refused' : eq(item.reason);
+    const entry = byReason.get(reason) || { reason, count: 0, detail: '' };
+    entry.count += 1;
+    if (entry.detail === '') entry.detail = digestUpstream(item?.detail);
+    byReason.set(reason, entry);
+  }
+  return [...byReason.values()];
+}
+
+function describeUpstream(summary) {
+  return summary
+    .map((entry) => `${entry.reason}${entry.count > 1 ? ` x${entry.count}` : ''}${entry.detail ? ` "${entry.detail}"` : ''}`)
+    .join('; ');
+}
+
 /**
  * @param {object} options
  * @param {object} options.client     a configured ncbAccountClient (the dedicated service account)
@@ -401,7 +464,14 @@ function createTournamentNcbStore({ client, schema, clubBridge }) {
       }
       const result = await run(CREATE(T.boards, row));
       if (!result.ok) {
-        failed.push({ boardNumber: eq(board.board_number), detail: result.detail || result.reason });
+        // `reason` and `detail` are kept APART. Collapsing them into one string (the old shape) is what
+        // made the production 422 unanswerable: the reason names which layer refused and the prose says
+        // why, and the summary below needs both.
+        failed.push({
+          boardNumber: eq(board.board_number),
+          reason: eq(result.reason) === '' ? 'upstream_refused' : eq(result.reason),
+          detail: eq(result.detail)
+        });
         continue;
       }
       landed.push(eq(board.board_number));
@@ -427,6 +497,7 @@ function createTournamentNcbStore({ client, schema, clubBridge }) {
       // and re-run. `import_unverified` says every write was accepted but the set that reads back is not
       // the set that was written — nothing the caller sent is wrong, and re-sending is the wrong advice.
       const refused = failed.length > 0;
+      const upstream = summariseUpstreamRefusals(failed);
       return {
         error: refused ? 'import_incomplete' : 'import_unverified',
         tournamentId: null,
@@ -434,6 +505,10 @@ function createTournamentNcbStore({ client, schema, clubBridge }) {
         detail: `${landed.length}/${Array.isArray(boards) ? boards.length : 0} board write(s) reported success; `
           + (readBack.error ? `the read-back itself failed (${readBack.error}); ` : '')
           + (names.length ? `board(s) ${[...new Set(names)].join(', ')} did not land; ` : '')
+          // Only a REFUSED write may claim an upstream reason. `import_unverified` means every write was
+          // accepted, so appending a vendor refusal to it would send the operator looking for an error
+          // the vendor never returned.
+          + (refused && upstream.length ? `upstream=${describeUpstream(upstream)}; ` : '')
           + `cleanup removed ${cleanup.boardsRemoved} board row(s)${cleanup.leftovers.length ? ` and left ${cleanup.leftovers.join(',')}` : ''}`
           + (cleanup.headerRemoved ? ' and removed the draft header' : ' BUT THE DRAFT HEADER REMAINS'),
         failedBoardNumbers: [...new Set(names)]
