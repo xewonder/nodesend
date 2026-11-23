@@ -17,23 +17,22 @@
  * without recreating a table (measured 2026-11-17), but it is the owner's operation through NCB
  * MCP, not NodeSend's.
  *
- *   tournaments        PRESENT: id, club_id, name, visibility, status, board_count, source_label,
- *                      created_at, updated_at, and `user_id` — which is NCB's row-ownership slot,
- *                      NOT the application owner (see THE OWNERSHIP SEPARATION below).
- *                      MISSING: owner_user_id, dedupe_key.
- *                      WANTED: UNIQUE(dedupe_key) — duplicate-import protection.
- *   tournament_boards  PRESENT: id, tournament_id, board_number, and the required PBN columns
- *                      (dealer, vulnerability, hands_json; tags_json where kept).
- *                      WANTED: UNIQUE(tournament_id, board_number) — ONE COMPOSITE KEY.
- *   tournament_attempts PRESENT: id, tournament_id, board_number, recorded_hand_id, original_seat,
- *                      created_at, and `user_id` (ownership again).
- *                      MISSING: player_user_id.
- *                      WANTED: UNIQUE(recorded_hand_id) — one attempt row per recorded hand.
+ *   tournaments        owner_user_id (the application owner) and dedupe_key (nullable), plus
+ *                      UNIQUE(dedupe_key). Board count, name, visibility, status, club_id and the
+ *                      timestamps are there too, as is `user_id` — which is NCB's row-ownership
+ *                      slot, NOT the owner (see THE OWNERSHIP SEPARATION below).
+ *   tournament_boards  tournament_id, board_number and the required PBN columns, plus
+ *                      UNIQUE(tournament_id, board_number) as ONE COMPOSITE KEY.
+ *   tournament_attempts player_user_id (the player who recorded the attempt), recorded_hand_id,
+ *                      tournament_id, board_number, original_seat, plus UNIQUE(recorded_hand_id).
  *
- * UNTIL THOSE COLUMNS EXIST, no valid TOURNAMENT_NCB_SCHEMA_JSON can be written for this contract,
- * which is the intended outcome: the mount builds no store and every /tournaments route answers 503.
- * A schema that named `user_id` as the owner would be accepted by NCB and would answer
- * authoritatively WRONG things, so it is refused at boot below instead.
+ * WHAT NODESEND HAS AND HAS NOT MEASURED about that schema. The columns and the three uniques are
+ * reported created by the owner's migration; this relay has not re-read the vendor catalogue and
+ * cannot, so a config naming a column that turns out to be absent is caught by the FIRST storage
+ * call that touches it (an unknown filter name fails the whole read, which the store reports as a
+ * refusal and the route answers 503) rather than by the validator. What the validator does refuse,
+ * before any request, is a schema that names `user_id` as an owner: NCB would accept that config and
+ * answer authoritatively WRONG things, so it is refused at boot below instead.
  *
  * WHY THE BOARD UNIQUE IS COMPOSITE, and why it is written in capitals. The live
  * `club_collection_boards` table carries TWO single-column uniques — one on `collection_id`, one on
