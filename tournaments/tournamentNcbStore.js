@@ -99,7 +99,17 @@ const UPSTREAM_CATEGORIES = Object.freeze([
   { id: 'column_no_default', test: /cannot be null|no default value/i, render: () => 'Column cannot be null' },
   { id: 'unknown_column', test: /unknown column\s*['"`]?(?<col>[A-Za-z0-9_]{1,64})/i,
     render: (m) => `Unknown column '${m.groups.col}'` },
-  { id: 'unknown_table', test: /table\s+['"`]?(?<tbl>[A-Za-z0-9_]{1,64})['"]?\s+doesn['`]t exist/i,
+  // `Data truncated for column` is MySQL's answer for a value outside an ENUM/domain set, which is a live
+  // candidate for the 0/32 failure (`vulnerability` accepting "None"/"NS"/"EW"/"Both" only if the column
+  // was declared that way) and was previously reported only as unrecognised prose.
+  { id: 'value_truncated', test: /data truncated for column\s*['"`]?(?<col>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `Data truncated for column '${m.groups.col}' (value outside the column's domain)` },
+  { id: 'value_truncated', test: /data truncated/i, render: () => 'Data truncated for column (value outside the column domain)' },
+  { id: 'invalid_json', test: /invalid json[^'"`]*?column\s*['"`]?(?<col>[A-Za-z0-9_]{1,64})/i,
+    render: (m) => `Invalid JSON value for column '${m.groups.col}'` },
+  { id: 'invalid_json', test: /invalid json|is not valid json|cannot be used as.*json/i,
+    render: () => 'Invalid JSON value for column' },
+  { id: 'unknown_table', test: /table\s+['"`]?(?<tbl>[A-Za-z0-9_]{1,64}(?:\.[A-Za-z0-9_]{1,64})?)['"`]?\s+doesn['`]t exist/i,
     render: (m) => `Table '${m.groups.tbl}' does not exist` },
   { id: 'permission_denied', test: /insert command denied to user\s+\S+\s+for table\s+['"`]?(?<tbl>[A-Za-z0-9_]{1,64})/i,
     render: (m) => `INSERT permission denied for table '${m.groups.tbl}'` },
@@ -133,13 +143,40 @@ const UPSTREAM_CATEGORIES = Object.freeze([
  */
 const CARD_TOKEN = /\b[2-9TJQKA][SHCD]\b/g;          // uppercase PBN tokens; prose rarely holds six
 const CARD_RUN = /(?:[2-9TJQKA][SHCD]){4}/;           // 2S3S4S5S — no separators at all
-const B64_CLASSIC = /[A-Za-z0-9+/]{24,}={0,2}/;       // no _ or -, so reason names are untouched
+/*
+ * B64_RUN, and why a bare length rule is wrong here. The character class contains `/`, because base64
+ * does — so the original form (`{24,}` with nothing else required) matched an ordinary REST path:
+ * `/v1/data/create/tournament` is 26 characters, and every vendor message that named an endpoint was
+ * therefore judged sensitive and blanked to `unrecognised`. That is the opposite failure from a leak: it
+ * throws away the diagnostic for the messages most likely to explain a routing or table problem. So a run
+ * must now look ENCODED as well as long — both cases and at least two digits, which is what base64 of any
+ * JSON body produces and what a path never does.
+ */
+const B64_RUN = /[A-Za-z0-9+/]{24,}/g;
+function encodedRuns(text) {
+  return (text.match(B64_RUN) || []).some((run) => {
+    const digits = (run.match(/\d/g) || []).length;
+    return digits >= 2 && /[a-z]/.test(run) && /[A-Z]/.test(run);
+  });
+}
 const OPAQUE_MIXED = /[A-Za-z0-9_-]{24,}/g;
 const HEX_RUN = /\b[0-9a-fA-F]{16,}\b/;
 const JWT_SHAPE = /\beyJ[A-Za-z0-9_-]{8,}/;
 const KEY_SHAPE = /\bsk-[A-Za-z0-9_-]{8,}/;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
-const HOSTISH = /\b[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+\.[a-z]{2,6}\b/i;
+/*
+ * Hostnames, and the two wrong answers this comment records. The first version needed TWO dots plus a
+ * 2-6 letter suffix, so `db.internal:3306` — one dot, eight-letter suffix — matched nothing at all and an
+ * internal host reached the response body. Widening the suffix alone did not fix it, because the
+ * `{2,6}` was never the binding constraint: `(?:\.[a-z0-9-]+)+\.[a-z]{2,12}` still demands a second dot.
+ * A general "looks like a hostname" pattern is also the wrong instrument here, because MySQL qualifies
+ * names the same way (`bridgemind.tournament_boards`) and blanking those would cost the diagnostic its
+ * most useful identifier. So the rule is now explicit: a KNOWN private suffix, or a dotted host with a
+ * port. An unlisted public hostname can still survive — recorded as a residual risk, not claimed as
+ * covered.
+ */
+const INTERNAL_SUFFIX = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:internal|localhost|local|lan|corp|intranet|localdomain|svc|amazonaws\.com|compute\.internal)\b/i;
+const HOST_PORT = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+:\d{1,5}\b/i;
 // A LABELED secret is flagged at ANY length. Without this rule the shortest thing the gate reacts to is a
 // 24-character run, so `token=abc123` inside an unrecognised sentence would be judged clean and the only
 // thing standing between it and a response body would be the redaction pass — which is an attempt, not a
@@ -161,13 +198,13 @@ function containsSensitiveShape(text) {
   if (s === '') return false;
   if ((s.match(CARD_TOKEN) || []).length >= 6) return true;
   if (CARD_RUN.test(s)) return true;
-  if (B64_CLASSIC.test(s)) return true;
+  if (encodedRuns(s)) return true;
   if (opaqueMixedRuns(s)) return true;
   if (HEX_RUN.test(s)) return true;
   if (JWT_SHAPE.test(s)) return true;
   if (KEY_SHAPE.test(s)) return true;
   if (IPV4.test(s)) return true;
-  if (HOSTISH.test(s)) return true;
+  if (INTERNAL_SUFFIX.test(s) || HOST_PORT.test(s)) return true;
   if (LABELED_SECRET.test(s)) return true;
   if (s.includes('@') || s.includes('://')) return true;   // any email or connection-string residue
   return false;
@@ -180,6 +217,25 @@ const BEARER_FORM = /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 // a leaked credential, and a scrub marker must not be able to trip the detector it is supposed to satisfy.
 const SCRUB_MARK = '[redacted]';
 
+/*
+ * `key=value` handling, and the bug this comment exists to prevent repeating. The first version collapsed
+ * EVERY pair whose key was six characters or longer — which also matched the vendor's own diagnostic
+ * envelope (`error=`, `status=`, `Message=`), so an UNRECOGNISED sentence reached the operator as
+ * `unrecognised([param] [param])`: noise, for exactly the causes that are hardest to name. Measured after
+ * cf7d45b shipped: it destroyed the proxy-outage signature this deployment has lived through before
+ * (`status=failed Message=null`) and gutted `Data truncated for column 'vulnerability'`. So now a KNOWN
+ * diagnostic key keeps its value unless that value is itself sensitive, and an unknown key keeps nothing.
+ */
+const DIAGNOSTIC_KEY = /^(?:error|status|message|msg|code|reason|detail|sqlstate|errno|err|hint|table|column|field|key|constraint|index|value|row|rows|position|verb|action|type|severity|database|schema)$/i;
+const QUERY_TAIL = /\?[^\s"'`]*(?:[=&])[^\s"'`]*/g;
+const KEY_VALUE = /\b([A-Za-z][A-Za-z0-9_]{0,40})=([^\s&,;"'`]*)/g;
+
+// Used as a String.replace callback, NOT as a standalone pass: `.replace(fn)` would coerce the function
+// into a search string and change nothing at all.
+function collapseKeyValue(_whole, key, value) {
+  return (DIAGNOSTIC_KEY.test(key) && !containsSensitiveShape(value)) ? `${key}=${value}` : `${key}=…`;
+}
+
 function redactUpstreamProse(raw) {
   const flat = String(raw ?? '').replace(/\s+/g, ' ').trim();
   if (flat === '') return '';
@@ -191,10 +247,12 @@ function redactUpstreamProse(raw) {
     // "Bearer" as the value and leaves the token itself standing there unlabelled and unscrubbed.
     .replace(BEARER_FORM, SCRUB_MARK)
     .replace(SECRET_PAIR, '$1=…')
-    // Any scheme URL and any query parameter, named or bare, is a connection string as far as a response
-    // body is concerned: the host is internal and the value is somebody's key.
+    // A scheme URL is a connection string: host, port and query are all internal.
     .replace(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`]*/g, '[url]')
-    .replace(/[A-Za-z0-9_.-]{6,}=(?:%3D)?[^\s&,;"'`]*/g, '[param]')
+    // A query tail is redacted only when it really looks like one (an `=` or `&` in the tail), so an
+    // ordinary question mark in prose is left alone.
+    .replace(QUERY_TAIL, '?[query]')
+    .replace(KEY_VALUE, collapseKeyValue)
     .replace(/[A-Za-z0-9._+-]{4,}@[A-Za-z0-9.-]+/g, '[address]');
 }
 

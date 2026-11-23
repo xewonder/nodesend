@@ -535,7 +535,12 @@ const CATEGORY_EXPECTATIONS = [
   [`permission denied for table tournament_boards`, 'permission_denied', "INSERT permission denied for table 'tournament_boards'"],
   [`Unknown column 'tags_json' in 'field list'`, 'unknown_column', "Unknown column 'tags_json'"],
   [`Duplicate entry '77-12' for key 'uk_tournament_board'`, 'duplicate_entry', "Duplicate entry for key 'uk_tournament_board'"],
-  [`a foreign key constraint fails`, 'foreign_key', 'Foreign key constraint fails']
+  [`a foreign key constraint fails`, 'foreign_key', 'Foreign key constraint fails'],
+  // The three shapes the shipped category table missed, found by asking what the live 422 would say for
+  // each SURVIVING candidate cause rather than by re-reading the code that produced them.
+  [`Data truncated for column 'vulnerability' at row 1`, 'value_truncated', "Data truncated for column 'vulnerability'"],
+  [`Invalid JSON value for column 'hands_json'`, 'invalid_json', "Invalid JSON value for column 'hands_json'"],
+  [`Table 'bridgemind.tournament_boards' doesn't exist`, 'unknown_table', "Table 'bridgemind.tournament_boards' does not exist"]
 ];
 const categoryMisses = CATEGORY_EXPECTATIONS
   .map(([raw, id, phrase]) => {
@@ -595,6 +600,85 @@ check('D22. an unrecognised sentence with an embedded deal is collapsed, not dro
   rescueFragment.slice(0, 200));
 check('D22b. and the gate still refuses the SAME sentence with the collapse disabled (so D22 is not luck)',
   storeRules.containsSensitiveShape(RESCUE_PROSE) === true, 'deal sentence judged clean without collapsing');
+
+/*
+ * The `key=value` defect, pinned. The shipped sanitizer collapsed every `longkey=value` pair, which
+ * includes the vendor's OWN envelope keys, so an unrecognized error reached the operator as
+ * `unrecognised([param] [param])`. The proxy-outage signature below is not hypothetical: production has
+ * answered `403 {"Message":null}` before, and that is precisely the sentence this rule destroyed.
+ */
+const PROXY_OUTAGE = 'status=failed Message=null';
+const outageFragment = storeRules.safeUpstreamFragment(PROXY_OUTAGE);
+check('D23. an unrecognised envelope keeps its own diagnostic keys readable',
+  outageFragment.includes('status=failed') && /Message=/.test(outageFragment),
+  outageFragment);
+check('D23b. no fragment is ever reduced to a redaction placeholder alone',
+  DISCLOSURE_CASES.map((c) => storeRules.safeUpstreamFragment(c.prose))
+    .concat([outageFragment, storeRules.safeUpstreamFragment('read timeout after 12000ms')])
+    .every((f) => f !== 'unrecognised([param])' && !/^\s*unrecognised\((\[param\]\s*)+\)$/.test(f) && !/^\s*unrecognised\(\s*\)$/.test(f))
+    && DISCLOSURE_CASES.map((c) => storeRules.safeUpstreamFragment(c.prose))
+      .filter((f) => f.startsWith('unrecognised(')).every((f) => f.length > 'unrecognised()'.length),
+  'a fragment collapsed to placeholders only');
+const DIAGNOSTIC_ENVELOPES = [
+  'error=lock wait timeout exceeded status=failed code=1205',
+  'status=failed Message=null',
+  'error=Deadlock found when trying to get lock; try restarting transaction errno=1213',
+  'reason=gateway_timeout status=failed attempt=2'
+];
+check('D24. a real vendor envelope survives with its words intact, not as placeholders',
+  DIAGNOSTIC_ENVELOPES.every((raw) => {
+    const got = storeRules.safeUpstreamFragment(raw);
+    return got.includes('error=') || got.includes('status=failed') || got.includes('reason=') || got.includes('Message=');
+  }), DIAGNOSTIC_ENVELOPES.map((r) => storeRules.safeUpstreamFragment(r)).join(' | '));
+// The narrowing must not reopen the hole the broad rule was closing: an UNLABELED value is still collapsed.
+check('D24b. and an unlabeled key value is still collapsed, so this fix did not undo finding 3',
+  !storeRules.safeUpstreamFragment('zorbflux=Sup3rSecretValue99 while writing').includes('Sup3rSecretValue99')
+    && !storeRules.safeUpstreamFragment('https://x.internal/p?abcdef0123456789&type=insert').includes('abcdef0123456789'),
+  `${storeRules.safeUpstreamFragment('zorbflux=Sup3rSecretValue99 while writing')} | ${storeRules.safeUpstreamFragment('https://x.internal/p?abcdef0123456789&type=insert')}`);
+check('D24c. prose containing an ordinary question mark is not eaten as a query string (the words AFTER the mark must survive)',
+  storeRules.safeUpstreamFragment('is the column nullable? check the migration').includes('nullable?')
+    && storeRules.safeUpstreamFragment('is the column nullable? check the migration').includes('check the migration'),
+  storeRules.safeUpstreamFragment('is the column nullable? check the migration'));
+// A query tail with NO scheme in front of it (`/path?somevalue&x=1`) is invisible to the URL rule, and a
+// lowercase-plus-digit token under 24 characters is invisible to every length rule. The token below is
+// deliberately NOT pure hex — `abcdef0123456789` was caught by HEX_RUN and proved nothing about this
+// path — so g/h/i/j are what leave the query-tail pass as the only thing standing between it and the
+// response body.
+check('D25. a scheme-less query tail is redacted even when the URL, hex and length rules all miss it',
+  !storeRules.safeUpstreamFragment('POST /v1/data/create/tournament_boards?abcdefghij123456&type=insert failed')
+    .includes('abcdefghij123456'),
+  storeRules.safeUpstreamFragment('POST /v1/data/create/tournament_boards?abcdefghij123456&type=insert failed'));
+/*
+ * The two defects found by asking WHY a green arm was green rather than accepting it.
+ *  · Over-blocking: base64's character class contains `/`, so `{24,}` alone matched the REST path
+ *    `/v1/data/create/tournament` and blanked any message naming an endpoint.
+ *  · Under-blocking: HOSTISH's `{2,6}` suffix bound did not match `internal`, so `db.internal:3306`
+ *    passed the gate and an internal hostname would have reached the response body.
+ */
+const PATH_PROSE = 'error at /api/v1/data/create/tournament_boards row 5 rejected';
+const pathFragment = storeRules.safeUpstreamFragment(PATH_PROSE);
+check('D26. a REST path in an unrecognised message is not mistaken for an encoded payload',
+  pathFragment.includes('/api/v1/data/create/tournament_boards') && pathFragment.includes('row 5'),
+  pathFragment);
+check('D26b. and a genuine encoded payload is STILL caught after that fix (D26 is not a loosening)',
+  storeRules.containsSensitiveShape(Buffer.from(DEAL_JSON).toString('base64')) === true
+    && storeRules.containsSensitiveShape('blob ' + Buffer.from('{\"a\":1,\"b\":2,\"c\":[3,4,5]}').toString('base64')) === true,
+  'encoded run no longer flagged');
+const HOST_PROSE = 'connect to db.internal:3306 timed out';
+check('D27. an internal hostname with a long suffix is not leaked into the diagnostic',
+  !storeRules.safeUpstreamFragment(HOST_PROSE).includes('db.internal'),
+  storeRules.safeUpstreamFragment(HOST_PROSE));
+check('D27b. and the hostname rule does not flag an ordinary dotted sentence or a qualified table name',
+  storeRules.containsSensitiveShape("Unknown column 'tags_json' in 'field list'") === false
+    && storeRules.containsSensitiveShape('e.g. board 12 is rejected') === false
+    && storeRules.safeUpstreamFragment("Table 'bridgemind.tournament_boards' doesn't exist").includes('bridgemind.tournament_boards'),
+  'host rule now over-fires on plain prose or on db-qualified names');
+// A dotted host whose suffix is NOT on the private list is reachable only by HOST_PORT, so without this
+// arm the port rule could be deleted and the suite would still be green (measured: it was).
+check('D27c. an unlisted dotted host is still caught when it arrives with a port',
+  !storeRules.safeUpstreamFragment('connect to mysql-host-node7.private:3306 timed out').includes('mysql-host-node7.private')
+    && storeRules.containsSensitiveShape('mysql-host-node7.private:3306') === true,
+  storeRules.safeUpstreamFragment('connect to mysql-host-node7.private:3306 timed out'));
 check(`D20. the diagnostic stays a status message, not a paragraph, across all ${DISCLOSURE_CASES.length} shapes`,
   detailLengths.length === DISCLOSURE_CASES.length
     && detailLengths.every((n) => n > 0 && n < 700), `n=${detailLengths.length} max=${Math.max(...detailLengths)} min=${Math.min(...detailLengths)}`);
