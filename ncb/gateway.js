@@ -87,6 +87,36 @@ const AUTHORITY_TABLES = ['system_admins', 'clubs', 'club_memberships',
 const TOURNAMENT_TABLES = ['tournaments', 'tournament_boards', 'tournament_attempts'];
 const TOURNAMENT_GATEWAY_REFUSAL = 'tournament_via_gateway_only';
 const TOURNAMENT_GATEWAY_DETAIL = 'tournament rows are served only by the /tournaments routes, which authorize owner, club and visibility server-side; the generic table relay refuses them on every verb';
+
+/*
+ * GAME RECORDS — the relay's DELETE verb, narrowed. `DELETE /games/:recordedHandId` (games/) is the only
+ * path that removes a game COMPLETELY: a recorded game is referenced by community publications, analysis
+ * reports, decision traces and tournament attempt links, and statistics are computed live from those
+ * rows, so a single-row relay delete does not delete a game — it leaves a wrong statistic.
+ *
+ * Measured against the shipped frontend (candidate 514ad394, read-only), the relay's delete verb is
+ * called on exactly two of these tables — `recorded_hands` (`deleteRecordedHand`, used by recorder cancel
+ * and abandoned-game cleanup) and `community_games` (`deleteCommunityGameBySource`, unpublish) — and on
+ * NEITHER `game_analysis_reports` nor `replay_attempts`. So:
+ *   · the two uncalled tables lose `delete` outright. Reads, creates and updates are untouched, so
+ *     recording, publication and tutoring keep working; only the unowned single-row removal closes, and it
+ *     closes with a NAME, so a stale bundle learns where the verb went instead of seeing
+ *     `table_not_allowed` (which reads like a deployment variable somebody forgot to set).
+ *   · the two live tables keep `delete`, but only on the caller's OWN rows. `recorded_hands.user_id` and
+ *     `community_games.user_id` are written by the frontend on every insert (App.jsx 2135/2294,
+ *     recordedHandsService 1341), so ownership is checked server-side rather than asserted by the client.
+ *     The comparison is against the SESSION identity inside the sealed handle — never a body or query
+ *     field, which is exactly why this path was a bypass: on `shared_readwrite` tables the bearer proves a
+ *     session, not a permission.
+ *   · a row whose owner column is empty is REFUSED, not allowed. Rows written before the column existed
+ *     cannot be attributed, and guessing on their behalf would be the unsafe fallback authorization this
+ *     feature forbids; they are the subject of the backfill handoff, and until then they go through the
+ *     System Admin route.
+ */
+const CALLER_DELETE_BLOCKED = ['game_analysis_reports', 'replay_attempts'];
+const CALLER_DELETE_BLOCK_REFUSAL = 'game_record_via_admin_route_only';
+const CALLER_DELETE_BLOCK_DETAIL = 'analysis reports and replay attempt rows are removed only by DELETE /games/:id, which sweeps every dependent row and verifies the removal; the generic relay may not delete them one row at a time';
+const CALLER_DELETE_OWNER_COLUMN = Object.freeze({ recorded_hands: 'user_id', community_games: 'user_id' });
 // NodeSend's own server-side ledger and per-user encrypted credential store. The browser never reads
 // or writes any of these — no call site exists — and the quota tables are `shared_readwrite` on the
 // vendor side, so they carry NO per-user row isolation: allowing them here would let any signed-in
@@ -887,6 +917,48 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
     });
   }
 
+  /*
+   * Proves the caller may delete THIS row, or refuses. Returns null to allow.
+   *
+   * Deny-by-default in every unclear case, and each branch says which kind of unclear it was, because an
+   * administrator debugging a failed cancel needs to know whether the storage was unreachable, the row
+   * was already gone, or the row carries no owner at all:
+   *   · the ownership read itself fails or is unreadable -> 503, nothing deleted (a transport fault is not
+   *     evidence of permission, and answering 401 here would be the mass-sign-out failure this gateway
+   *     already exists to prevent);
+   *   · no row with that id -> 404, the same answer the verb already gives today, so a double cancel is
+   *     not turned into a new error class;
+   *   · the owner column is empty or absent -> 403 `ownership_unverifiable`. Legacy rows are not
+   *     attributed by guesswork; the handoff covers backfill, and until then the admin route serves them.
+   *   · the owner column names someone else -> 403 `not_record_owner`.
+   * The caller identity comes from the opened seal (`resolved.session.userId`), never from the request.
+   */
+  async function guardCallerDelete({ table, id, ownerColumn, resolved }) {
+    const callerId = String(resolved?.session?.userId ?? '').trim();
+    if (callerId === '') {
+      event('ncb_gateway_delete_owner_unbound', { table });
+      return { status: 401, body: { status: 'error', data: null, error: 'invalid_session', reason: 'handle_names_no_account' } };
+    }
+    const read = await ncb.data('read', table, { id: '', query: `id=${encodeURIComponent(id)}&limit=1`, cookie: resolved.cookie });
+    if (read.kind !== 'ok') {
+      event('ncb_gateway_delete_ownership_unreadable', { table, kind: read.kind });
+      return { status: 503, body: { status: 'error', data: null, error: 'storage_unavailable', detail: 'the record could not be read to verify ownership; nothing was deleted' } };
+    }
+    const rows = Array.isArray(read.json?.data) ? read.json.data : [];
+    const row = rows.find((candidate) => String(candidate?.id ?? '') === String(id));
+    if (!row) return { status: 404, body: { status: 'error', data: null, error: 'not_found_or_not_yours' } };
+    const owner = String(row?.[ownerColumn] ?? '').trim();
+    if (owner === '') {
+      event('ncb_gateway_delete_owner_missing', { table });
+      return { status: 403, body: { status: 'error', data: null, error: 'ownership_unverifiable', detail: 'this row carries no owner value, so the relay cannot confirm it belongs to you; it must be removed through the System Admin game route' } };
+    }
+    if (owner !== callerId) {
+      event('ncb_gateway_delete_denied_foreign', { table });
+      return { status: 403, body: { status: 'error', data: null, error: 'not_record_owner', detail: 'a player may delete only their own records' } };
+    }
+    return null;
+  }
+
   function dataGuard(verbName) {
     return async (req, res) => {
       const table = String(req.params.table || '');
@@ -901,6 +973,18 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
           status: 'error', data: null,
           error: TOURNAMENT_GATEWAY_REFUSAL,
           detail: TOURNAMENT_GATEWAY_DETAIL
+        });
+      }
+      // Game-record tables the player app never deletes. Refused on the VERB only — reading and writing
+      // these tables is untouched, because tutoring and analysis flows legitimately do that — and refused
+      // before the credential is parsed, so the answer describes the table rule rather than a session
+      // problem the caller does not have.
+      if (verbName === 'delete' && CALLER_DELETE_BLOCKED.includes(table)) {
+        event('ncb_gateway_game_record_delete_refused', { table, verb: verbName });
+        return reply(res, 403, {
+          status: 'error', data: null,
+          error: CALLER_DELETE_BLOCK_REFUSAL,
+          detail: CALLER_DELETE_BLOCK_DETAIL
         });
       }
       if (!tables.includes(table)) {
@@ -932,6 +1016,15 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
       if (resolved.kind !== 'ok') {
         event('ncb_gateway_data_unauthenticated', { reason: resolved.kind, verb: verbName, table });
         return reply(res, 401, { status: 'error', data: null, error: 'invalid_session', reason: resolved.kind });
+      }
+
+      /* Owner verification for the one destructive verb the player app legitimately uses.
+       * The row is read on the CALLER's own credential first, and the stored owner column is compared to
+       * the identity inside the SEALED HANDLE — not to a body or query field, which is the exact
+       * assumption that made this path a bypass. Every unreadable or unattributable case denies. */
+      if (verbName === 'delete' && CALLER_DELETE_OWNER_COLUMN[table]) {
+        const refusal = await guardCallerDelete({ table, id, ownerColumn: CALLER_DELETE_OWNER_COLUMN[table], resolved });
+        if (refusal) return reply(res, refusal.status, refusal.body);
       }
 
       const body = ['create', 'update'].includes(verbName) && req.body !== undefined
@@ -1131,6 +1224,9 @@ module.exports = {
   // The tournament narrowing, as data: a gate asserts the blocked set and the refusal NAME the caller
   // receives, rather than re-typing them and passing while the shipped surface drifts.
   TOURNAMENT_TABLES, TOURNAMENT_GATEWAY_REFUSAL, TOURNAMENT_GATEWAY_DETAIL, AUTHORITY_TABLES, PLAYER_TABLE_WRITE_POLICY,
+  // The game-record DELETE narrowing, as data — same reason as above: the gate asserts the shipped sets
+  // and the refusal names, so a policy edited in one place cannot pass a test written against the other.
+  CALLER_DELETE_BLOCKED, CALLER_DELETE_BLOCK_REFUSAL, CALLER_DELETE_OWNER_COLUMN,
   extractUpstreamAuthCode, authErrorFields, AUTH_ERROR_CONTRACT, AUTH_BUCKET_CONTRACT, INVITATION_REFUSAL_CONTRACT,
   FALLBACK_BUCKET, UNKNOWN_CODE_MESSAGE_KEY, CODE_SHAPE
 };

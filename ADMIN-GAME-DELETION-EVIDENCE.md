@@ -129,3 +129,98 @@ One existing arm legitimately moved: `verify-clubs-gateway.mjs` **10j** asserts 
 - accepting §5's handoff as a tracked release blocker, so the relay path is closed in a follow-up and the guarantee is eventually true.
 
 **NO-GO** on describing the authorization story as complete today: the relay still lets any session delete a single game row, and that is outside this change's permitted scope.
+
+---
+
+# PART 2 — the relay bypass is now closed (§5 supersedes §5 above)
+
+Follow-up commit on the same branch. `§5`'s "still open" finding is resolved for the tables the player app
+does not legitimately delete from, and reduced to an ownership check for the two it does.
+
+## What was measured before designing
+
+The decisive unknown was not "can we block relay deletes" but **which player workflows actually issue
+them**. Enumerated literally in Greta `src/` (read-only; a loose first regex over-matched and produced
+false hits for all five tables — corrected to literal `delete/${TABLE}` and `method: 'DELETE'` sites):
+
+| Table | Frontend relay DELETE call site | Consequence |
+|---|---|---|
+| `recorded_hands` | `recordedHandsService.js:1493`, used at `App.jsx:1975` and `:2465` (recorder cancel, abandoned cleanup) | must keep working → owner-verified |
+| `community_games` | `recordedHandsService.js:1506` (`deleteCommunityGameBySource`, unpublish) | must keep working → owner-verified |
+| `game_analysis_reports` | none | `delete` closed on the relay |
+| `replay_attempts` | none | `delete` closed on the relay |
+
+Ownership is checkable because the app writes the owner itself: `user_id` appears in the recorded-hand
+payload (`App.jsx:2135`, `recordedHandsService:1222/1280/1341/1392`) and in the community payload
+(`App.jsx:2294`, `recordedHandsService:1341`). No assumption was made about rows the app did not write —
+see the fail-closed rule below.
+
+## The correction (`ncb/gateway.js`)
+
+`CALLER_DELETE_BLOCKED = [game_analysis_reports, replay_attempts]` → refused **on the delete verb only**,
+before the credential is parsed, with the named `game_record_via_admin_route_only` (not
+`table_not_allowed`, which an operator would misread as a missing deployment variable). Reads, creates and
+updates on those tables are untouched, so tutoring and analysis flows are unaffected.
+
+`CALLER_DELETE_OWNER_COLUMN = { recorded_hands: 'user_id', community_games: 'user_id' }` → before any
+caller delete is forwarded, the row is read **on the caller's own credential** and its owner column is
+compared to the identity inside the **sealed handle** (`resolved.session.userId`, verified against the
+mint site — `seal.seal({cookie, userId, instance, email})`). Nothing is ever read from the request body or
+query. Every ambiguous case denies:
+
+| Condition | Answer | Why |
+|---|---|---|
+| read fails / vendor unreadable | 503 `storage_unavailable` | a transport fault is not evidence of permission; answering 401 here is the mass-sign-out failure this gateway exists to prevent |
+| no row with that id | 404 `not_found_or_not_yours` | preserves the verb's existing answer, so a double cancel gets no new error class |
+| owner column empty/absent | 403 `ownership_unverifiable` | legacy rows are **not** attributed by guesswork; backfill or the admin route serves them |
+| owner ≠ session id | 403 `not_record_owner` | the bypass itself |
+
+The constants are exported so the gate asserts the shipped sets rather than a copy, matching the pattern
+`TOURNAMENT_TABLES` already uses.
+
+## Verification
+
+**`verify-game-delete-bypass.mjs` 20/20.** The fake vendor deliberately implements `shared_readwrite`
+**with no row isolation whatsoever** — control `X1` proves it by deleting player A's row directly at the
+vendor as player B and asserting the row *actually disappeared* (not merely that the call returned 200,
+which would be unfalsifiable). Every refusal below is therefore the gateway's doing, not the mock's. This
+matters: the neighbouring gateway fixture scopes reads by owner, and copying that would have made all 20
+arms pass for the wrong reason — the exact `offset=` failure mode.
+
+Arms: 1 cross-account denied and row survives · 1b refusal is named · 1c a vendor-`administrator` session
+is refused too (role is not ownership) · **1d claiming the real owner in the query and body buys nothing**
+· 2/3 the closed tables refuse even their own owner, with the reason named · 3b the block is DELETE-only
+(read/create/update still work) · 4 recorder cancel on the caller's own row still succeeds · 5 community
+unpublish still succeeds · 5b unpublish does not extend to another player's row · 6a no-owner row refused
+· 6b unknown id is 404 with no delete forwarded · 6c unreadable ownership read is 503 with nothing removed
+· 6d absent owner column fails closed · 7 an unrelated full-policy table is untouched (no wildcard block)
+· 8/8b the admin route still answers, and the gate asserts the shipped constants · X2 the gateway forwarded
+exactly one delete for the whole run — the legitimate one.
+
+**Eight plants, all detected** (`gateway.js` restored byte-identically each time): block removed → 4 red;
+ownership check removed → 10 red; empty-owner fail-open → 1 red; compared identity not from the session →
+7 red (caught by 1d); narrowing widened to every verb → 1 red; unreadable read allowed → 1 red; missing row
+treated as owned → 2 red; owner map pointed at a column no row carries → 6 red.
+
+Two harness bugs surfaced on the way and are worth recording, because both would have produced a
+misleading report: the first Q4 plant was **inert** (a `claimedUserId ??` fallback that can never fire on a
+real seal), and a rewritten plant loop destructured a *string* into `[from, to]`, turning all eight edits
+into no-ops and printing eight impossible "NOT DETECTED" results. The second failure is why the harness now
+refuses to run a plant that changes no bytes, and why arm `NC4b`-style inertness checks are worth their
+cost in test code.
+
+## Residual items after Part 2
+
+1. **Legacy rows with an empty `user_id` cannot be cancelled by their owner** — they answer
+   `403 ownership_unverifiable`. This is deliberate fail-closed behaviour, and it makes the backfill
+   handoff user-visible rather than silent: until `recorded_hands.user_id` / `community_games.user_id` are
+   confirmed populated, affected players must use the admin route. **This is the one user-visible
+   regression risk in Part 2 and should be checked against live data before deploy.**
+2. Service-account delete reach for the cascade route is still unproven (Part 1 §9.2) — unchanged.
+3. The relay still *reads* these tables for any session (`shared_readwrite` has no row isolation), so
+   cross-account disclosure is a separate, pre-existing issue; this change only closes the destructive
+   verb. Not claimed as fixed.
+
+**Status:** the authorization bypass on the deletion *workflow* is closed. `DELETE /games/:id` is now the
+only way to remove a game completely, no player can delete another player's game through the relay, and
+the two legitimate player workflows are pinned by tests as still working.
