@@ -20,6 +20,10 @@ COPY ncb/ ./ncb/
 # bridge.js requires ./tournaments at boot, so an image missing this directory builds green, answers a
 # health check for the length of a container restart, and then crash-loops on `Cannot find module`.
 COPY tournaments/ ./tournaments/
+# Games follows the identical rule and would fail the identical way without it: bridge.js requires
+# ./games at boot, so an image missing this directory builds green, answers a health check for the length
+# of a container restart, and then crash-loops on `Cannot find module`.
+COPY games/ ./games/
 
 ENV PORT=3001
 

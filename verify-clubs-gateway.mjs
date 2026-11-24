@@ -1334,17 +1334,29 @@ function mountedClubPaths() {
   // become a way for an undeclared route to disappear into a bucket nobody reads.
   const tournament = bridge.tournamentMount?.router
     ? collectRoutes(bridge.tournamentMount.router.stack ?? [], 0, emptyBucket()) : null;
+  // Game deletion is a FOURTH named router, accounted by router IDENTITY and drift-checked against its
+  // own declared surface — the same discipline as the tournament router above. Excluding it without
+  // asserting it would let an undeclared destructive route disappear here.
+  const game = bridge.gameDeletionMount?.router
+    ? collectRoutes(bridge.gameDeletionMount.router.stack ?? [], 0, emptyBucket()) : null;
+  const gameDeclared = (bridge.gameDeletionMount?.routes ?? []).map((r) => `${r.method} ${r.path}`);
   const unaccounted = [];
   for (const layer of app._router.stack) {
     if (layer.name !== 'router' || !layer.handle?.stack) continue;
     if (layer.handle === bridge.clubMount.router || layer.handle === bridge.ncbMount.router
-      || (bridge.tournamentMount && layer.handle === bridge.tournamentMount.router)) continue;
+      || (bridge.tournamentMount && layer.handle === bridge.tournamentMount.router)
+      || (bridge.gameDeletionMount && layer.handle === bridge.gameDeletionMount.router)) continue;
     const extra = collectRoutes(layer.handle.stack, 0, emptyBucket());
     unaccounted.push(...extra.direct, ...extra.nested);
   }
   return {
     direct: club.direct, nested: club.nested, gateway: gateway.direct, unaccounted,
     tournament: tournament?.direct ?? null,
+    game: game?.direct ?? null, gameDeclared,
+    gameDrift: game ? [
+      ...gameDeclared.filter((r) => !game.direct.includes(r)),
+      ...game.direct.filter((r) => !gameDeclared.includes(r))
+    ] : null,
     tournamentDrift: tournament ? [
       ...(bridge.tournamentRoutes ?? []).map((r) => `${r.method} ${r.path}`)
         .filter((r) => !tournament.direct.includes(r)),
@@ -1354,7 +1366,7 @@ function mountedClubPaths() {
   };
 }
 const { direct: mounted, nested: mountedNested, gateway: mountedGateway, unaccounted: unaccountedRoutes,
-  tournament: mountedTournament, tournamentDrift } = mountedClubPaths();
+  tournament: mountedTournament, tournamentDrift, game: mountedGame, gameDrift, gameDeclared } = mountedClubPaths();
 const declared = clubRoutes.map((route) => `${route.method} ${route.path}`);
 const notMounted = declared.filter((route) => !mounted.includes(route));
 const undeclared = mounted.filter((route) => !declared.includes(route));
@@ -1415,14 +1427,21 @@ check('10i. /health.clubs.routes counts the contract routes plus the one server-
 // The tournament router is asserted on its own count AND on drift against its declared list, which
 // is what makes naming it here narrower than the blind exclusion it replaces: a tournament route
 // mounted without being declared (or declared without being mounted) still reddens this arm.
-check('10j. the mounted routers are exactly the club mount, the player gateway and the tournament mount, and each is its declared surface',
+check('10j. the mounted routers are exactly the club mount, the player gateway, the tournament mount and the game-deletion mount, and each is its declared surface',
   unaccountedRoutes.length === 0
   && mountedGateway.length === bridge.ncbMount.health().routes
   && mountedGateway.every((route) => route.includes(' /ncb'))
-  && mountedTournament !== null && tournamentDrift.length === 0
+  // Array.isArray, not `!== null`: a missing key yields undefined, and `undefined !== null` is TRUE —
+  // which is exactly how a dropped inventory field could read as a pass. This was measured, not guessed.
+  && Array.isArray(mountedTournament) && Array.isArray(mountedGame) && tournamentDrift.length === 0
   && mountedTournament.length === bridge.tournamentRoutes.length
-  && mountedTournament.every((route) => route.includes(' /tournaments')),
-  `unaccounted=[${unaccountedRoutes.join(', ')}] gateway=${mountedGateway.length}/${bridge.ncbMount.health().routes} tournament=${mountedTournament === null ? 'absent' : mountedTournament.length}/${bridge.tournamentRoutes?.length ?? 0} drift=${(tournamentDrift ?? []).join('|')}`);
+  && mountedTournament.every((route) => route.includes(' /tournaments'))
+  // The destructive route is held to the same accounting as the others: exactly one declared verb,
+  // no drift, and nothing mounted under /games that the mount did not declare.
+  && mountedGame !== null && (gameDrift ?? []).length === 0
+  && mountedGame.length === 1 && gameDeclared.length === 1
+  && mountedGame[0] === 'DELETE /games/:recordedHandId',
+  `unaccounted=[${unaccountedRoutes.join(', ')}] gateway=${mountedGateway.length}/${bridge.ncbMount.health().routes} tournament=${mountedTournament === null ? 'absent' : mountedTournament.length}/${bridge.tournamentRoutes?.length ?? 0} drift=${(tournamentDrift ?? []).join('|')} game=[${(mountedGame ?? []).join(', ')}] gameDrift=${(gameDrift ?? []).join('|')}`);
 
 // ── pure authority decision, without any I/O at all ─────────────────────────
 const pureDenials = [

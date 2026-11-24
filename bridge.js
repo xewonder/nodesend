@@ -65,6 +65,11 @@ const { buildClubMount, describeClubStoreState, clubHealth } = require("./clubs"
 // rather than from a second rule. What it needs from this file is the session resolver and the club
 // mount's already-built account client, so one credential pool serves both features.
 const { buildTournamentMount, describeTournamentStoreState, tournamentHealth } = require("./tournaments");
+// System Admin permanent game deletion. It rides the SAME dedicated service account and the SAME
+// `system_admins` authority as Clubs and Tournaments, and it is the only path that may destroy a
+// recorded game: the generic relay's `delete/recorded_hands` authorizes nothing on this deployment
+// (the table is `shared_readwrite`, so a bearer proves a session and not a permission).
+const { buildGameDeletionMount, gameDeletionHealth } = require("./games");
 const { buildNcbGateway, createCorsResolver, INVITATION_REFUSAL_CONTRACT } = require("./ncb/gateway");
 const { createInvitationClaim } = require("./ncb/invitationClaim");
 const { createInvitationReservations } = require("./ncb/invitationReservations");
@@ -2936,6 +2941,9 @@ app.get("/health", (req, res) => res.json({
   // this feature has no second membership rule to configure. Still no credential, email, table name or
   // row content.
   tournaments: tournamentHealth(tournamentMount),
+  // Game deletion reports the same three facts apart from the others. Deliberately NO table names, ids,
+  // or anything about which games exist: /health is unauthenticated on this deployment.
+  gameDeletion: gameDeletionHealth(gameDeletionMount),
   /* Which USE rule this process enforces, and whether it has a privileged channel to enforce it with.
      Two booleans and no name, no table and no host: `required` is the half of the row-level-security
      migration that lives in this container, and an operator proving a deploy needs to SEE it land
@@ -3744,6 +3752,27 @@ app.use(clubMount.router);
 // Registered next to the club mount and for the same reason: these are the only routes that may touch a
 // tournament row, and the generic table relay refuses those three tables by name.
 app.use(tournamentMount.router);
+/* SYSTEM ADMIN GAME DELETION — mounted alongside the club mount, for the reason `clubs/index.js` gives:
+ * an absent route answers 404, and a 404 reads as "NodeSend has no deletion feature" rather than as a
+ * configuration refusal. Mounted and 503-ing tells the administrator the truth.
+ *
+ * The account client and the authority are the club mount's — one credential pool, one `system_admins`
+ * answer, no second rule about who an administrator is. `authenticate` is the same resolver
+ * `requireBridgeSession` uses, so this destructive route cannot have a weaker session check than the
+ * rest of the relay. */
+const gameDeletionMount = buildGameDeletionMount({
+  env: process.env,
+  clubAccount: clubMount.account || null,
+  authenticate: async (req) => {
+    const resolved = await resolveSessionUser(req);
+    if (!resolved.ok) return { ok: false, status: resolved.status, code: resolved.code };
+    return { ok: true, id: resolved.userId, role: resolved.role };
+  },
+  // Audit on the bridge log: names, counts and a timestamp only. No hand, no card data, no email, and
+  // no new table — schema changes are out of scope for this work.
+  onAudit: (record) => safeEvent("admin_game_deletion", record)
+});
+app.use(gameDeletionMount.router);
 
 /* THE SYSTEM AI AUTHORITY.
  *
@@ -4260,6 +4289,9 @@ if (require.main === module) {
       // Same reasoning as Clubs: a tournament feature that cannot store anything is invisible from the
       // outside unless the container says so when it starts.
       tournaments: describeTournamentStoreState(),
+      // Printed at boot for the same reason: an administrator whose deletion route cannot reach the
+      // store must learn that at startup, not from a 503 on a destructive click.
+      gameDeletion: gameDeletionHealth(gameDeletionMount),
       // Which transport the container came up on, said out loud: a deployment that means to be
       // native and forgot the variable looks identical to a working one from the outside, and the
       // first symptom is players being told to sign in forever.
@@ -4377,6 +4409,11 @@ module.exports = {
   // makes, and the schema reader the mount actually consults — not a copy that could drift from either
   // repo. `tournamentMount` is what `app.use` registered.
   buildTournamentMount, describeTournamentStoreState, tournamentHealth, tournamentMount,
+  // Game deletion, exported on the same footing as every other rule here: the gate must exercise the
+  // router this process actually serves and the rules the route actually applies — not a copy.
+  buildGameDeletionMount, gameDeletionHealth, gameDeletionMount,
+  gameDeletionRules: require("./games/gameDeletion.js"),
+  gameDeletionStore: require("./games/gameDeletionStore.js"),
   tournamentAuthorize: require("./tournaments/tournamentAuthorization.js").authorizeTournamentOperation,
   tournamentAccessRule: require("./tournaments/tournamentAuthorization.js").resolveTournamentAccess,
   tournamentListScopeRule: require("./tournaments/tournamentAuthorization.js").tournamentListScope,
