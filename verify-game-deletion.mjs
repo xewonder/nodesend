@@ -605,6 +605,43 @@ check('NC3e. the sweep order is satellites-first and canonical-last — the reco
     && rules.SWEEP_STEPS.indexOf('communityGames') < rules.SWEEP_STEPS.indexOf('recordedHand'),
   rules.SWEEP_STEPS.join(','));
 
+/* ── frontend contract compatibility (candidate 514ad394) ──────────────────────────────────────
+ * The client's ONLY signal for a refusal is `body.error.code`: it switches on HTTP status for
+ * 200/401/403/404/503 and maps everything else to `malformed_envelope`. So the backend's obligation is
+ * that every non-success answer carries a non-empty code AND message, and that nothing ever claims
+ * `deleted:true` without the row being gone. Arms C1-C4 pin exactly that. */
+const refusalBodies = [
+  ['not-system-admin', user.body], ['club-admin', clubAdmin.body], ['unauthenticated', anonBody],
+  ['forged-role', forged.body], ['foreign-children', foreign.body], ['partial-sweep', partial.body],
+  ['unconfirmed-delete', lying.body], ['unreachable', unreachable.body]
+].filter(([, body]) => body);
+const badRefusals = refusalBodies
+  .filter(([, body]) => typeof body?.error?.code !== 'string' || body.error.code.trim() === ''
+    || typeof body?.error?.message !== 'string' || body.error.message.trim() === '')
+  .map(([label, body]) => `${label}=${JSON.stringify(body).slice(0, 70)}`);
+check('C1. every refusal carries the object-form error.code and message the client reads',
+  badRefusals.length === 0, badRefusals.join(' | '));
+check('C2. no refusal is ever shaped like a success (no data key, status is not success)',
+  refusalBodies.every(([, body]) => body?.status !== 'success' && body?.data === undefined),
+  JSON.stringify(refusalBodies.filter(([, b]) => b?.data !== undefined).map(([l]) => l)));
+const sd = ok.body?.data ?? {};
+check('C3. the success envelope exposes exactly the fields the client consumes, with usable types',
+  sd.deleted === true && typeof sd.alreadyAbsent === 'boolean' && sd.removed && typeof sd.removed === 'object'
+    && ['recordedHands', 'communityGames', 'analysisReports', 'decisionTraces', 'tournamentAttempts', 'replayAttempts']
+      .every((k) => Number.isInteger(sd.removed[k]))
+    && Number.isInteger(sd.replayChildren) && ok.body?.error === undefined,
+  JSON.stringify(sd).slice(0, 260));
+check('C3b. an idempotent repeat also satisfies the client gate (it requires deleted === true to proceed)',
+  repeat.body?.data?.deleted === true && repeat.body?.data?.alreadyAbsent === true,
+  JSON.stringify(repeat.body?.data).slice(0, 200));
+// The documented gap, asserted rather than assumed away: the client at 514ad394 has no branch for 409 or
+// 502, so both land in `malformed_envelope` ("Nothing was deleted" — SAFE, but it discards the two most
+// actionable answers this route produces). The codes still arrive intact, which is what the handoff needs.
+check('C4. the codes the client cannot yet map still arrive named (handoff prerequisite)',
+  foreign.body?.error?.code === 'foreign_replay_descendants' && foreign.status === 409
+    && partial.body?.error?.code === 'game_deletion_incomplete' && (partial.status === 502 || partial.status === 503),
+  `${foreign.status}/${foreign.body?.error?.code} ${partial.status}/${partial.body?.error?.code}`);
+
 check('NC3. no request in this run ever left the mock host', calls.offHost.length === 0, calls.offHost.slice(0, 3).join(','));
 /*
  * A guard against the exact defect this file just had: a fault knob was renamed and one arm kept

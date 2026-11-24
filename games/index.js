@@ -41,7 +41,20 @@ const GAME_DELETION_ROUTES = Object.freeze([
   { op: 'deleteRecordedGame', method: 'DELETE', path: '/games/:recordedHandId' }
 ]);
 
-/** Reasons that mean "the authority/storage could not be consulted" — a 503, not a denial. */
+/*
+ * Two different failures were being collapsed into one 503.
+ *
+ * A TRANSPORT failure means the storage was never consulted: retrying later is genuinely the right
+ * instruction, and 503 says that. A REFUSED write means the storage answered and said NO — most likely
+ * the dedicated account has no delete grant on the table (the open capability question in the release
+ * notes). Telling an administrator "the game store could not be reached, try again later" about a
+ * permission refusal sends them to wait instead of to fix it, and a retry can never succeed. So the two
+ * are separated: transport -> 503 `club_store_unavailable`; refusal/unconfirmed -> 502
+ * `game_deletion_incomplete`, whose detail names the step. Both remain retry-safe, because the sweep is
+ * satellites-first and the canonical row survives either way.
+ */
+const TRANSPORT_REASONS = /^(?:club_account_unreachable|club_account_login_failed|club_account_rejected|club_account_cooling_down|game_store_request_failed|game_read_unreadable|club_store_|club_schema_|club_account_unconfigured)/;
+/** Kept for the pre-sweep checks, where these names still mean "cannot be consulted at all". */
 const UNAVAILABLE_REASONS = /^(?:club_account_|club_store_|game_store_request_failed|game_read_unreadable|club_schema_)/;
 
 /**
@@ -154,7 +167,7 @@ function buildGameDeletionMount({
       const f = executed.failure;
       // A partial sweep is NEVER a success. The canonical row is still present (steps run satellites
       // first), so the caller can retry the identical request and finish the job.
-      const code = UNAVAILABLE_REASONS.test(f.reason || '') ? 'club_store_unavailable' : 'game_deletion_incomplete';
+      const code = TRANSPORT_REASONS.test(f.reason || '') ? 'club_store_unavailable' : 'game_deletion_incomplete';
       const http = code === 'club_store_unavailable' ? 503 : 502;
       const detail = `${f.step || 'sweep'}: ${eq(f.detail) || eq(f.reason)}`;
       if (typeof onAudit === 'function') {

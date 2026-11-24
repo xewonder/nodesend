@@ -363,3 +363,102 @@ swallows that error.
 **GO for integration**: merge and deploy behind the existing System-Admin-only surface, then run §5 on
 disposable staging rows. Step 2 of that plan is the actual capability test, and it is read-only with respect
 to real data. Do not broaden `community_games` beyond `shared_read` to make it pass; escalate to option A.
+
+---
+
+# PART 4 — integration readiness against frontend `514ad394`
+
+## 1. Candidate state (verified, not recalled)
+
+| Item | Result |
+|---|---|
+| Worktree `ns-gamedel` | clean (`git status --short` empty) |
+| HEAD | `cf70be478d565fa8868f35eefb433f05e1d763fb` |
+| Remote `main` | `da49f84…` by both `ls-remote` and `gh api` — **nothing pushed** |
+| Stack | `838c295` → `81d9141` → `cf70be4` |
+| Dirty `NodeSend` checkout | preserved, 14 entries, never read into the branch |
+| Greta | read-only; its 34 modified files predate this session (checked `src/App.jsx` mtime `2026-11-22`) and the deletion client exists only as a committed object |
+
+Feature presence, read from the loaded modules rather than from this document: route `DELETE /games/:recordedHandId`
+registered; `isSystemAdmin` present in the mount; sweep `tournamentAttempts, decisionTraces, analysisReports,
+replayAttempts, communityGames, replayChildren, recordedHand` (canonical last); tables
+`recorded_hands, community_games, game_analysis_reports, ai_decision_traces, tournament_attempts,
+replay_attempts`; coach disposition `preserved-and-reported`; gateway `CALLER_DELETE_BLOCKED =
+[game_analysis_reports, replay_attempts]`, `CALLER_DELETE_OWNER_COLUMN = {recorded_hands: user_id,
+community_games: user_id}`; `game_delete_unconfirmed` present in the store.
+
+## 2. Contract compatibility with the client of record
+
+**Compatible, verified by reading both sides:**
+
+| Contract point | Evidence |
+|---|---|
+| URL and verb | client `` `${GATEWAY}/games/${encodeURIComponent(id)}` `` ↔ route `/games/:recordedHandId` |
+| Bearer header | `sessionAuth.js` emits `{ Authorization: 'Bearer <token>' }` from `SESSION_TOKEN_KEY`; `api.js:153-155` stores the gateway's own `body.token`, i.e. the **sealed `ncbs1.` handle** — which is what `resolveSessionUser` requires under `native` transport (a raw token is refused 401 `unsupported_credential`, by design) |
+| Success shape | client needs `status==='success'`, `data.deleted===true`; route emits exactly that, plus `alreadyAbsent`, `neverFound`→`noTraceRemaining`, `removed`, `replayChildren` |
+| 401 / 403 `not_system_admin` / 503 | all mapped by the client, and produced with those exact codes |
+| Cache invalidation | client drops leaderboards and both first-page caches **only after** `deleted===true`; an idempotent repeat still sets `deleted:true`, so the caches are not left stale (arm `C3b`) |
+| No false success | every refusal is `{status:'error', error:{code,message}}` with **no** `data` key (arms `C1`/`C2`), so the client's `deleted !== true` guard always trips |
+
+**Two mismatches, both on the client's side, neither a data risk:**
+
+1. **Unmapped statuses.** The client branches on 200/401/403/404/503 only (verified: `mentions 409: false,
+   mentions 502: false`). The route's two most actionable answers — **409 `foreign_replay_descendants`** and
+   **502 `game_deletion_incomplete`** — therefore fall into `malformed_envelope` and render as *"The server
+   answer was not a deletion confirmation. Nothing was deleted."* Safe (nothing is claimed, caches stay), but
+   it throws away "delete the other players' replays first" and "retry the same request to finish".
+2. **One code shares a status.** A malformed id is 404 `invalid_game_id`, and the client maps every 404 to
+   `game_not_found` (*"no game with this id"*). Harmless in practice — the client validates `/^\d+$/` first,
+   so it can only arise from a hand-built request — but the message would be wrong.
+
+**Handoff (Greta, small and exact):** in `gameDeletionService.js`, after the status branches, switch on
+`code` before defaulting: `foreign_replay_descendants` → new reason `replay_conflict`;
+`game_deletion_incomplete` → new reason `deletion_incomplete`; then add `gameDeletionErrReplayConflict` and
+`gameDeletionErrIncomplete` to `en/admin.json` and `el/admin.json`, extend `DELETE_REASON_KEYS` in
+`GameReviewAdmin.jsx`, and prefer `invalid_game_id` over `game_not_found` when the code says so. The
+backend already sends everything needed; **no backend status should be changed to fit the gap**, because
+mapping a refusal to "storage unavailable" would tell an administrator to wait for something that will never
+recover.
+
+## 3. Backend correction made here — one minimal, and it was my own bug
+
+While asserting the contract I found two refusals that had been collapsing into the same 503: a
+**transport** failure (storage never consulted — "try again later" is right) and a **vendor-refused write**
+(the storage answered *no*, which under the open capability question most likely means the dedicated account
+lacks a delete grant). Telling an admin "the game store could not be reached, try later" about a permission
+refusal sends them to wait instead of to fix it, and the retry can never succeed. `TRANSPORT_REASONS` now
+separates them: transport → 503 `club_store_unavailable`; refusal or unconfirmed removal → 502
+`game_deletion_incomplete` naming the step. Arms `C1`–`C4` and plants `T1`–`T4` pin it (T1 → `C4` red,
+T2 → `C1` red, T3 → `C3` + `G1/7-9` red, T4 → `16` + `C3b` red).
+
+## 4. Staging availability — **none exists**
+
+Scanned both repos for instance identifiers and staging-style names. Real instances found:
+**`55954_bridgemind` only** (`.env.example`); the other values (`diag_instance`, `inst`, `test_instance`) are
+in-file test fixtures in gate scripts, and every "staging/sandbox" mention is either this document or an
+unrelated script. There is no second database, no staging deploy target, and no configuration in either repo
+that would point NodeSend at an equivalent-but-disposable instance.
+
+Consequences, stated plainly:
+
+- §5's plan as written ("preferably a separate staging database") **cannot be executed today**. Building one
+  is a Questera task, not a NodeSend change: an instance whose RLS classes differ from production would give
+  a **false GO** on the only question that matters (whether the service account can delete).
+- Until a faithful staging exists, the capability question can only be answered by a **disposable test inside
+  production**, which is a separately authorized act and is not performed here. The minimal safe form of it:
+  two throwaway NCB accounts, one game chain created through the normal relay flows by `qa-owner` (never
+  touching the existing 13 games / 2 community rows / 6 reports / 271 traces / 1 attempt / 1 flag), one
+  System Admin `DELETE /games/:id`, read-back, then stop. A 200 with the expected counts answers §2 of Part
+  3; a 502 naming `club_account_forbidden` at `communityGames` proves the grant is missing and escalates to
+  option A. **No production write is authorized by this document.**
+
+## 5. Final verdict
+
+| Question | Answer |
+|---|---|
+| Backend ↔ frontend contract | Compatible on every path that claims success; two client-side mapping gaps, no data risk, handoff specified |
+| Staging available | **No** — single instance `55954_bridgemind`, no second database in either repo |
+| Can true delete permission be tested today | **Not safely** — only in production with explicit authorization, or after staging is provisioned with equivalent RLS |
+| Tests | gate 55/55 (+C1–C4, T1–T4 plants), full suite **1,525 arms, 0 failures** |
+| Commit | this commit on `feature/admin-game-deletion-backend`, nothing pushed |
+| **GO / NO-GO** | **GO** to merge and deploy behind the System-Admin surface for a *staged* rollout where the first deletion is a throwaway chain owned by a test account, with a stop on any 502. **NO-GO** for announcing the feature as working, and **NO-GO** on any bulk or routine admin use, until §4's capability test has actually returned 200 with the expected counts |
