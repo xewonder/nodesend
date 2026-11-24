@@ -462,3 +462,136 @@ Consequences, stated plainly:
 | Tests | gate 55/55 (+C1–C4, T1–T4 plants), full suite **1,525 arms, 0 failures** |
 | Commit | this commit on `feature/admin-game-deletion-backend`, nothing pushed |
 | **GO / NO-GO** | **GO** to merge and deploy behind the System-Admin surface for a *staged* rollout where the first deletion is a throwaway chain owned by a test account, with a stop on any 502. **NO-GO** for announcing the feature as working, and **NO-GO** on any bulk or routine admin use, until §4's capability test has actually returned 200 with the expected counts |
+---
+
+# PART 5 — P0: the cascade deleted other players' satellites. Fixed, and proven falsifiable.
+
+Deployed premise for this part: `0f868b8` on main and live. Found while preparing the Game 524
+acceptance, while auditing `execute()` against its own filters — not from a test failure.
+
+## 1. The defect (MEASURED in source, live-reachable in shape)
+
+`recorded_hands` descendants were owner-checked (`§3`). The satellites were not: `execute()` built
+`ids = [canonicalId, ...replayChildIds]` and deleted every row whose reference column equalled one of
+them. **`user_id` / `userId` / `ownerId` occur 0 times in the whole of `gameDeletionStore.js` at
+`0f868b8`** (measured against `git show 0f868b8:games/gameDeletionStore.js`, not from memory).
+
+Why that reaches real data, from the frontend's own writers:
+
+| Row | Written by | Shape |
+|---|---|---|
+| `replay_attempts` | `replayEligibility.js:112-121` `startReplayAttempt` | `{ root_hand_id: A's game, user_id: B }` |
+| `community_games` | publish path, `user_id` on every insert | B publishes a replay of A's game → `root_hand_id: A's game`, `user_id: B` |
+
+`root_hand_id` names a chain's FIRST row, so a filter on the deleted game's id selects those rows.
+Deleting player A's game therefore destroyed B's publication (removing it from the Community pool and
+the live statistics computed from it) and B's consumed replay attempt — silently, with a 200 and no
+refusal. The existing `409 foreign_replay_descendants` covered only `recorded_hands` children.
+
+**Why the green gate could not have caught it.** Every seeded satellite carried the same
+`publisher_user_id: '7'` as the target owner. That column does not exist in the frontend at all — the
+fixture invented it. A fixture uniform on the one dimension the code never filters makes the whole bug
+class invisible. The fixture is now corrected to the live column and deliberately seeded to DIFFER.
+
+## 2. Ownership policy implemented
+
+| Cascade table | Owner column(s), resolution order | Proof |
+|---|---|---|
+| `community_games` | `user_id` | relay owner rule already used it (`CALLER_DELETE_OWNER_COLUMN`) |
+| `replay_attempts` | `user_id` | `replayEligibility.js:117` |
+| `game_analysis_reports` | `user_id` (= hand owner) | `gameAnalysisService.js:305` |
+| `ai_decision_traces` | `user_id` | `aiDecisionTraces.js:62/105/139` |
+| `tournament_attempts` | `player_user_id`, then `user_id` | `tournamentNcbStore.js:927` writes the player; NCB stamps the service account |
+
+Rules, each pinned by an arm:
+* **A reference match is not ownership.** Audited for direct matches (`source_hand_id`, `recorded_hand_id`)
+  as well as lineage matches (`root_hand_id`) — F2.
+* **Authorship is not ownership.** A report authored by a coach but owned by the player still cascades (r1).
+* **The service account is not the owner.** `tournament_attempts` resolves from `player_user_id` first, or
+  every legitimate deletion would refuse (P3 proves 24 arms redden if that priority flips).
+* **Unreadable fails closed.** A selected row with no readable owner refuses; so does a canonical row with
+  no readable owner — and that case is reported as *unverifiable*, not as *foreign*, because the repair differs.
+* **Scoped to selected rows.** Foreign rows keyed to OTHER games must not make a game undeletable (F7/F7b).
+* **One probe list.** `SWEEP_PROBES` drives the audit, the sweep and the absence proof, so they cannot
+  disagree about what was in scope (NC5e).
+* Preserved unchanged: the child policy, tournament-attempt link handling, coach-flag preservation,
+  canonical-last ordering, read-back proof, the transport/refusal 503-vs-502 split.
+
+## 3. Answer shape
+
+`409` with `body.error.code = "foreign_satellite_owners"` — object envelope unchanged, one new code.
+Message carries counts, never ids, table names or account ids (NC4c). Two variants of one code:
+* pre-flight (before any write): *"… so the cascade cannot be completed safely. Nothing was deleted."*
+* mid-sweep backstop: *"… The cascade stopped there; records already removed by this request are not
+  restorable."* — it never claims nothing was deleted when earlier satellites are already gone.
+A store that cannot produce the inventory is refused 503 rather than swept un-audited (NC5i).
+
+## 4. Verification
+
+`verify-game-deletion.mjs`: **77/77** (was 55; +22 arms — F1–F8, NC5–NC5i, 16f/16g, NC4c).
+Full affected suites, all green: game-deletion 77, game-delete-bypass 20, ncb-gateway 132,
+ncb-integration 98, clubs-gateway 287, tournaments-gateway 221, tournaments-integration 24,
+session-quota 407, signin-guardrails 8, invitation-reservations 50, invitation-code-rule 57,
+decision-key 48, system-AI 32, trickster 21, import-failure 65 → **1,547 arms, 0 failures**.
+
+Negative controls — each plant disables one clause; every one reddened at least one arm, and every file
+was restored byte-identically (digest-verified):
+
+| Plant | Red arms |
+|---|---|
+| P1 pre-flight refusal disabled | F1 F2 F3 F4 F5 |
+| P2 sweep backstop disabled | NC5 NC5b NC5c |
+| P3 owner priority flipped to `user_id` | 24 red, incl. G1/7-9, F7, NC5d |
+| P4 unreadable owner treated as own (fail OPEN) | F4 F6 NC5c NC5g C1 C2 |
+| P5 `community_games.root_hand_id` probe removed | F1 F1b F4 F8 NC5 NC5e C4 |
+| P6 mid-sweep stop degraded to generic 502 | NC5h |
+| P7 inventory-less store allowed to sweep | NC5i |
+| P8 absence proof ignores `community_games` | 16f |
+| P9 table with no owner policy waved through | NC5f |
+| P10 only the canonical id audited | F5 |
+
+P1 leaves F6 green on purpose: with the pre-flight disabled, F6's row is still caught by the sweep
+backstop — two independent layers, separately tested.
+
+## 5. BridgeMind-Greta handoff (exact, 4 edits)
+
+Client at `9430fb8` maps named codes at `gameDeletionService.js:137-143`; an unmapped code reaches
+`:151` → `malformed_envelope` ("not a recognized deletion error — treated as NOT deleted"). **Safe** (it
+never claims deletion) but it discards the most actionable answer this route produces.
+
+1. `src/services/gameDeletionService.js` — `GAME_DELETION_REASONS`: add
+   `foreign_satellite_owners: 'foreign_satellite_owners'`.
+2. same file, `GAME_DELETION_REASON_DOCS`: add
+   `foreign_satellite_owners: '409 — refused intact: a publication, replay attempt or report in the cascade belongs to another account (or has no readable owner); NOTHING was deleted'`.
+3. same file, after `:138`: add
+   `if (code === 'foreign_satellite_owners') return refusal(GAME_DELETION_REASONS.foreign_satellite_owners, code);`
+4. `src/components/admin/GameReviewAdmin.jsx` `DELETE_REASON_KEYS` (`:303-320`): add
+   `foreign_satellite_owners: 'gameDeletionErrForeignSatellites'`, plus that key in
+   `src/locales/en/admin.json` and `src/locales/el/admin.json`. Suggested EN text: *"Another player's
+   publication or replay attempt is attached to this game, so nothing was deleted. Remove those records
+   first."* Do NOT reuse the replay-descendants line: it tells the admin to delete replay descendants,
+   which is a different repair. `verifyAdminGameDeletion` B16 pins the reason table, so it must be
+   extended with the new key in the same change.
+
+## 6. Still uncertain after this fix
+
+* **Service-account DELETE reach** remains unproven (Part 3 §2). No mock can prove a vendor grant; the
+  unpublish-success evidence is void because `recordedHandsService.js:1506` swallows the delete error.
+* **Legacy rows with an empty `user_id`** now fail closed for their whole cascade, matching the documented
+  backfill handoff. A game with no satellites is still deletable — the unreadable owner blocks the
+  cascade, not the single row.
+* **Race between audit and sweep** is closed for deletion (the backstop tests the same predicate at the
+  write) but a row created between them can leave a dangling reference; NCB has no transactions, so this
+  is reported as a partial sweep, not prevented.
+* **No staging instance** exists (Part 4 §4); nothing in this part was executed against production.
+
+## 7. Verdict
+
+| Question | Answer |
+|---|---|
+| Defect confirmed | Yes — no owner predicate existed in the satellite sweep at `0f868b8` |
+| Fixed | Yes, pre-flight + per-write backstop + single probe list |
+| Protection falsifiable | Yes — 10 plants, all detected, tree restored |
+| Live rows affected so far | Unknown; no deletion has ever been executed by this project |
+| GO / NO-GO — backend safety release | **GO**, as a recommendation only: nothing was pushed or deployed here, per instruction. If released, it must be the prerequisite for any further deletion acceptance, and health + the verb control re-verified after deploy (the deployed SHA changes) |
+| GO / NO-GO — deleting Game 524 on the CURRENT build | **NO-GO** until the corrected inventory is returned. Foreign-owned satellites were reachable by `root_hand_id`; on `0f868b8` they would be deleted, not refused |

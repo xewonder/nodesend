@@ -21,6 +21,8 @@
  *     rows IS the correction; a decrement would invent a stored total that does not exist.
  *   * no `deleted: true` unless the canonical row was confirmed gone.
  *   * no client-supplied authority. `removed`/`alreadyAbsent`/`replayChildren` are all computed here.
+ *   * no cascade row deleted on a reference match alone. Every satellite the sweep can reach is audited
+ *     against the canonical game's owner BEFORE the first write, and an unreadable owner refuses (§4b).
  */
 
 /** The five tables one canonical game touches, and the column that ties each to it. */
@@ -125,6 +127,143 @@ function classifyReplayChildren({ ownerId = null, children = [] } = {}) {
   return { own, foreign, hasForeign: foreign.length > 0 };
 }
 
+/*
+ * ── 4b. SATELLITE OWNERSHIP ──────────────────────────────────────────────────────────────────────
+ *
+ * THE DEFECT THIS SECTION EXISTS TO PREVENT. `recorded_hands` descendants are owner-checked, but the
+ * SATELLITES (publications, replay attempts, reports, traces, attempt links) are selected by a reference
+ * column alone. `replay_attempts` and `community_games` both carry a `root_hand_id`, which names the
+ * FIRST row of a replay chain rather than the row being described — so another player's row is matched by
+ * a filter on the deleted game's id. Without an owner predicate, deleting A's game silently destroyed
+ * B's publication of it and B's consumed replay attempt. `replayEligibility.js:112-121` is the proof that
+ * this shape exists in production data: `startReplayAttempt` writes `{ root_hand_id: A's game, user_id: B }`.
+ *
+ * THE POLICY, and why each clause is a rule rather than a preference:
+ *   · Ownership is read from the column the LIVE WRITER fills, never from the NCB-stamped `user_id`
+ *     alone. `tournament_attempts` is written by NodeSend on the service account, so its stamped
+ *     `user_id` is the service account and its real owner is `player_user_id`; reports, traces,
+ *     publications and attempts all carry an explicit `user_id` set to the HAND OWNER by the frontend
+ *     (gameAnalysisService.js:305, aiDecisionTraces.js:62/105/139, replayEligibility.js:117).
+ *     `publisher_user_id` does not exist in the frontend at all — a fixture that invented it is the
+ *     reason this class of defect survived a green gate.
+ *   · An author is not an owner. A report written by a coach about the player's game is owned by the
+ *     player (`user_id`) and is part of the game; `author_user_id` is not consulted.
+ *   · A row whose owner cannot be read REFUSES the request. "Unknown" is never a licence to delete
+ *     someone else's record, and the canonical row's own unreadable owner authorises nothing either.
+ *   · The check runs over the SAME probe list the sweep deletes from, so the audit and the write can
+ *     never disagree about what was in scope.
+ *   · A refusal is scoped to the selected rows. Foreign rows elsewhere in the same table, keyed to other
+ *     games, do not block a deletion — otherwise one stray row would make every game undeletable.
+ */
+
+/** Per cascade table: the columns that may name the owning account, in resolution order. */
+const SATELLITE_OWNER_COLUMNS = Object.freeze({
+  tournamentAttempts: Object.freeze(['player_user_id', 'user_id']),
+  decisionTraces: Object.freeze(['user_id']),
+  analysisReports: Object.freeze(['user_id']),
+  replayAttempts: Object.freeze(['user_id']),
+  communityGames: Object.freeze(['user_id'])
+});
+
+/**
+ * The (table, column) pairs through which a satellite is selected for deletion. THE SINGLE SOURCE: the
+ * ownership preflight and the sweep both iterate this, so a probe added here is audited automatically and
+ * a probe that exists in one place only cannot be introduced silently.
+ */
+const SWEEP_PROBES = Object.freeze([
+  { key: 'tournamentAttempts', column: 'recordedHandId' },
+  { key: 'decisionTraces', column: 'recordedHandId' },
+  { key: 'analysisReports', column: 'recordedHandId' },
+  { key: 'replayAttempts', column: 'recordedHandId' },
+  { key: 'replayAttempts', column: 'rootHandId' },
+  // Two passes, deduplicated by row id: NCB has no OR in its filter grammar.
+  { key: 'communityGames', column: 'sourceHandId' },
+  { key: 'communityGames', column: 'rootHandId' }
+]);
+
+/** The key whose rows are collected across several columns before deletion (its own read-back proof). */
+const MULTI_COLUMN_SATELLITE = 'communityGames';
+
+/** Resolve the account that owns one satellite row, or report that it cannot be resolved. */
+function satelliteOwner({ row = null, key = null } = {}) {
+  const candidates = SATELLITE_OWNER_COLUMNS[key];
+  if (!Array.isArray(candidates)) return { readable: false, owner: '' };
+  for (const column of candidates) {
+    const value = eq(row?.[column]);
+    if (value !== '') return { readable: true, owner: value, column };
+  }
+  return { readable: false, owner: '' };
+}
+
+/**
+ * Sort selected satellite rows into own / foreign / unreadable. `groups` is `{ [tableKey]: rows }`.
+ * Counts and table keys are returned, never row ids or account ids: this feeds an API response, and
+ * naming which accounts hold a publication of a game discloses exactly the private relationship the
+ * route must not leak.
+ */
+function classifySatellites({ ownerId = null, groups = {} } = {}) {
+  const owner = eq(ownerId);
+  const own = [];
+  const foreign = [];
+  const unverifiable = [];
+  for (const [key, tableRows] of Object.entries(groups && typeof groups === 'object' ? groups : {})) {
+    if (!SATELLITE_OWNER_COLUMNS[key]) {
+      // A selected table with no declared owner policy is a hole in the audit, not a free pass.
+      unverifiable.push({ key, count: (Array.isArray(tableRows) ? tableRows : []).length });
+      continue;
+    }
+    for (const row of (Array.isArray(tableRows) ? tableRows : [])) {
+      const found = satelliteOwner({ row, key });
+      // No reference owner means nothing can be established about ANY row, in either direction. That is
+      // reported as unverifiable rather than "foreign", because the repair is different: the game row
+      // itself needs its owner backfilled, not somebody else's record moved.
+      if (owner === '' || !found.readable) unverifiable.push({ key, count: 1 });
+      else if (found.owner === owner) own.push({ key, count: 1 });
+      else foreign.push({ key, count: 1 });
+    }
+  }
+  const fold = (list) => list.reduce((total, entry) => total + entry.count, 0);
+  return {
+    ownCount: fold(own),
+    foreignCount: fold(foreign),
+    unverifiableCount: fold(unverifiable),
+    ownerUnreadable: owner === '',
+    blockedTables: [...new Set([...foreign, ...unverifiable].map((entry) => entry.key))],
+    blocked: foreign.length + unverifiable.length > 0
+  };
+}
+
+/**
+ * The pre-write refusal. Same code whether the rows are foreign or merely unreadable, because the
+ * administrator's action is the same and the envelope stays one vocabulary; the MESSAGE separates them,
+ * because "3 of these are somebody else's" and "1 has no owner recorded" are different repairs.
+ */
+function checkSatelliteOwnership({ ownerId = null, groups = {} } = {}) {
+  const verdict = classifySatellites({ ownerId, groups });
+  if (!verdict.blocked) return { ok: true, verdict };
+  return { ok: false, verdict, refusal: { http: 409, ...satelliteRefusal(verdict) } };
+}
+
+/** The refusal body, and its partial-sweep variant (see the store's per-row backstop). */
+function satelliteRefusal({ foreignCount = 0, unverifiableCount = 0, ownerUnreadable = false } = {}, { partial = false } = {}) {
+  const parts = [];
+  if (foreignCount > 0) parts.push(`${foreignCount} record(s) belong to another account`);
+  if (unverifiableCount > 0) {
+    parts.push(ownerUnreadable
+      ? `${unverifiableCount} record(s) cannot be checked because the recorded game itself has no readable owner`
+      : `${unverifiableCount} record(s) have no readable owner`);
+  }
+  // A caller that reports a block without counts still gets a true sentence, never a leading comma.
+  if (parts.length === 0) parts.push('at least one cascade record is not established as this game owner\u2019s');
+  const tail = partial
+    ? 'The cascade stopped there; records already removed by this request are not restorable.'
+    : 'Nothing was deleted.';
+  return {
+    code: 'foreign_satellite_owners',
+    message: `${parts.join(' and ')}, so the cascade cannot be completed safely. ${tail}`
+  };
+}
+
 /**
  * The deletion plan. Returns `{ ok:false, refusal }` rather than a partial plan whenever the cascade
  * cannot be completed honestly, so the caller cannot accidentally write first and ask later.
@@ -191,6 +330,10 @@ const REFUSALS = Object.freeze({
   game_store_unavailable: () => deletionRefusal(503, 'club_store_unavailable', 'The game store could not be reached; nothing was deleted. Retry later.'),
   foreign_replay_descendants: (count) => deletionRefusal(409, 'foreign_replay_descendants',
     `${count} replay descendant(s) of this game belong to another account. Nothing was deleted.`),
+  foreign_satellite_owners: (verdict, options) => {
+    const body = satelliteRefusal(verdict, options);
+    return deletionRefusal(409, body.code, body.message);
+  },
   incomplete: (detail) => deletionRefusal(502, 'game_deletion_incomplete',
     `The deletion stopped before it completed (${detail}). The game is still recorded; retry the same request to finish the cleanup.`)
 });
@@ -253,9 +396,16 @@ module.exports = {
   COACH_FLAG_TABLE,
   COACH_FLAGS_DISPOSITION,
   SWEEP_STEPS,
+  SWEEP_PROBES,
+  SATELLITE_OWNER_COLUMNS,
+  MULTI_COLUMN_SATELLITE,
   REFUSALS,
   isCanonicalGameId,
   classifyReplayChildren,
+  satelliteOwner,
+  classifySatellites,
+  checkSatelliteOwnership,
+  satelliteRefusal,
   planGameDeletion,
   sweepTargetIds,
   exactRowOps,

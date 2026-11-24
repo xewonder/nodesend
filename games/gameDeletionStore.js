@@ -18,9 +18,14 @@
  *      reported only if the filter now returns nothing. A send-without-removal is a failure, not a 200.
  *   3. No filter ever goes wider than one id. `null`/empty ids throw instead of issuing an unfiltered
  *      request, because an unfiltered delete on a shared table is a bulk deletion wearing a filter.
+ *   4. A reference match is not an ownership claim. `root_hand_id` names a chain's FIRST row, so a filter
+ *      on the deleted game's id selects OTHER players' publications and replay attempts. The mount audits
+ *      every row `findSatellites` can return and refuses before entering this file, and `execute` repeats
+ *      the same per-row test at the moment of deletion — the backstop is here because a row written
+ *      between the audit and the sweep must still not be removable. (§4b of `gameDeletion.js`.)
  */
 
-const { GAME_TABLES, GAME_COLUMNS, COACH_FLAG_TABLE, exactRowOps } = require('./gameDeletion.js');
+const { GAME_TABLES, GAME_COLUMNS, COACH_FLAG_TABLE, exactRowOps, SWEEP_PROBES, MULTI_COLUMN_SATELLITE, classifySatellites, satelliteRefusal } = require('./gameDeletion.js');
 
 const READ = (table, query) => ({ group: 'data', path: `read/${table}${query ? `?${query}` : ''}`, method: 'GET' });
 const REMOVE = (table, id) => ({ group: 'data', path: `delete/${table}/${encodeURIComponent(id)}`, method: 'DELETE' });
@@ -30,6 +35,21 @@ const MAX_ROWS_PER_TABLE = 1000;
 
 /** A refusal object, in the shape the mount maps to an HTTP answer. Nothing here throws past a crash. */
 const storeFailure = (reason, detail) => ({ storeFailure: true, reason, detail: eq(detail) });
+
+/**
+ * The mid-sweep ownership stop. `partial` is true because other satellites may already be gone: the
+ * message must not promise "nothing was deleted" when that is no longer the state, and the mount maps
+ * this reason to 409 with the same code the preflight uses.
+ */
+const foreignSatelliteFailure = ({ key, blocked }) => ({
+  ...storeFailure('foreign_satellite_owners', satelliteRefusal(blocked, { partial: true }).message),
+  step: key,
+  // The verdict travels with the failure so the mount can rebuild the same precise message the preflight
+  // would have produced — including whether the game's OWN owner is the unreadable part.
+  verdict: blocked,
+  foreignCount: blocked.foreignCount,
+  unverifiableCount: blocked.unverifiableCount
+});
 
 function rowsOf(body) {
   if (body && typeof body === 'object' && !Array.isArray(body) && 'status' in body && body.status !== 'success') return null;
@@ -152,24 +172,48 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { count: seen.size };
   }
 
+  /**
+   * Every satellite row the sweep can select, grouped by table key and deduplicated by row id. Driven by
+   * `SWEEP_PROBES`, which is the same list `execute` deletes from — so an added probe is audited on the
+   * day it is added instead of becoming the next silent cascade.
+   */
+  async function findSatellites(ids) {
+    const groups = {};
+    for (const probe of SWEEP_PROBES) {
+      const table = T[probe.key];
+      const column = C[probe.key] && C[probe.key][probe.column];
+      if (!table || !column) {
+        return storeFailure('game_read_unreadable', `the deletion inventory declares no column for ${probe.key}.${probe.column}`);
+      }
+      const found = await rowsForAny(table, column, ids);
+      if (found.storeFailure) return found;
+      const seen = groups[probe.key] || new Map();
+      for (const row of found.rows) {
+        const rowId = eq(row?.id);
+        if (rowId !== '' && !seen.has(rowId)) seen.set(rowId, row);
+      }
+      groups[probe.key] = seen;
+    }
+    const out = {};
+    for (const key of Object.keys(groups)) out[key] = [...groups[key].values()];
+    return { groups: out };
+  }
+
   /** Satellite count without deleting — used to tell "already swept" from "never existed". */
   async function countSatellites(ids) {
-    // Every table the sweep touches is probed, or a game that still has a satellite row could be
-    // reported as "no trace remaining" — the one claim this function exists to make honestly.
-    const probes = [
-      [T.tournamentAttempts, C.tournamentAttempts.recordedHandId],
-      [T.decisionTraces, C.decisionTraces.recordedHandId],
-      [T.analysisReports, C.analysisReports.recordedHandId],
-      [T.replayAttempts, C.replayAttempts.recordedHandId],
-      [T.replayAttempts, C.replayAttempts.rootHandId]
-    ];
+    // Every table AND column the sweep touches is probed, or a game that still has a satellite row could
+    // be reported as "no trace remaining" — the one claim this function exists to make honestly. Derived
+    // from SWEEP_PROBES so `community_games` cannot fall out of the proof the way it once did.
     let total = 0;
-    for (const [table, column] of probes) {
-      for (const id of ids) {
-        const found = await findBy(table, column, id);
-        if (found.storeFailure) return found;
-        total += found.rows.length;
-      }
+    const counted = new Set();
+    let unique = 0;
+    for (const probe of SWEEP_PROBES) {
+      const found = await rowsForAny(T[probe.key], C[probe.key][probe.column], ids);
+      if (found.storeFailure) return found;
+      // rowsForAny deduplicates within one column, so a row matched by two probes of the same table would
+      // still count twice across probes. `total` is a count of ROWS, not of matches.
+      for (const row of found.rows) counted.add(eq(row?.id) || `${probe.key}:${++unique}`);
+      total = counted.size;
     }
     return { total };
   }
@@ -178,24 +222,21 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
    * Execute the plan. Returns `{ result }` on a confirmed sweep, `{ failure }` on any stop, never a
    * partial success. `removedSoFar` is returned with the failure so a retry (and an operator) can see
    * exactly what state the data is in.
+   *
+   * `ownerId` is the canonical game's owner. It is re-tested per row here, not only by the mount's
+   * preflight, because the preflight and the sweep are two reads: a row that is not owned by the game's
+   * owner stops the sweep at that row rather than being deleted.
    */
-  async function execute({ canonicalId, replayChildIds }) {
+  async function execute({ canonicalId, replayChildIds, ownerId = '' }) {
     const ids = [canonicalId, ...replayChildIds];
     const removed = { recordedHands: 0, communityGames: 0, analysisReports: 0, decisionTraces: 0, tournamentAttempts: 0, replayAttempts: 0 };
 
     // 1-4: satellites keyed to any id in scope, by exact equality, one table at a time. Tables that carry
     // BOTH a direct and a chain reference (traces, replay attempts) are swept by each, because a row that
     // names only the chain root still describes a game that is about to stop existing.
-    for (const [key, table, columns] of [
-      ['tournamentAttempts', T.tournamentAttempts, [C.tournamentAttempts.recordedHandId]],
-      ['decisionTraces', T.decisionTraces, [C.decisionTraces.recordedHandId]],
-      ['analysisReports', T.analysisReports, [C.analysisReports.recordedHandId]],
-      ['replayAttempts', T.replayAttempts, [C.replayAttempts.recordedHandId, C.replayAttempts.rootHandId]]
-    ]) {
-      for (const column of columns) {
-        await sweepTable({ key, table, column, ids, removed });
-        if (removed.__failure) break;
-      }
+    for (const probe of SWEEP_PROBES) {
+      if (probe.key === MULTI_COLUMN_SATELLITE) continue;
+      await sweepTable({ key: probe.key, table: T[probe.key], column: C[probe.key][probe.column], ids, ownerId, removed });
       if (removed.__failure) break;
     }
     if (removed.__failure) {
@@ -204,13 +245,15 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
       return { failure, removedSoFar: removed };
     }
 
-    async function sweepTable({ key, table, column, ids: targetIds, removed: tally }) {
+    async function sweepTable({ key, table, column, ids: targetIds, ownerId: owner, removed: tally }) {
       for (const id of targetIds) {
         const found = await findBy(table, column, id);
         if (found.storeFailure) { tally.__failure = { ...found, step: key, removedSoFar: { ...tally } }; return; }
         if (found.rows.length === 0) continue;
         // Only rows whose column really equals this id are deleted (`findBy` already re-asserted it), so
         // a trace whose recorded_hand_id is NULL can never be reached from here.
+        const audit = classifySatellites({ ownerId: owner, groups: { [key]: found.rows } });
+        if (audit.blocked) { tally.__failure = foreignSatelliteFailure({ key, blocked: audit }); return; }
         const done = await removeRows({ table, column, value: id, rows: found.rows });
         if (done.storeFailure) { tally.__failure = { ...done, step: key, removedSoFar: { ...tally } }; return; }
         tally[key] += done.removed;
@@ -221,8 +264,11 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     // NCB query (no OR in its grammar), so it is two equality passes over the same id set, deduplicated
     // by row id so a row matching both is counted and deleted exactly once.
     const communityRows = new Map();
+    const communityColumns = SWEEP_PROBES
+      .filter((probe) => probe.key === MULTI_COLUMN_SATELLITE)
+      .map((probe) => C[MULTI_COLUMN_SATELLITE][probe.column]);
     for (const id of ids) {
-      for (const column of [C.communityGames.sourceHandId, C.communityGames.rootHandId]) {
+      for (const column of communityColumns) {
         const found = await findBy(T.communityGames, column, id);
         if (found.storeFailure) return { failure: { ...found, step: 'communityGames', removedSoFar: { ...removed } } };
         for (const row of found.rows) {
@@ -233,6 +279,11 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     }
     const publications = [...communityRows.values()];
     if (publications.length > 0) {
+      // Same backstop as the generic sweep, over the whole deduplicated set: a publication belonging to
+      // another account is the single most likely foreign row, because publishing someone's replay is a
+      // normal thing for that player to do.
+      const audit = classifySatellites({ ownerId, groups: { communityGames: publications } });
+      if (audit.blocked) return { failure: foreignSatelliteFailure({ key: 'communityGames', blocked: audit }), removedSoFar: { ...removed } };
       const ids2 = exactRowOps(publications);
       if (ids2.length !== publications.length) {
         return { failure: storeFailure('game_row_id_unusable', 'community_games returned a row without an addressable id'), step: 'communityGames', removedSoFar: { ...removed } };
@@ -286,7 +337,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { count };
   }
 
-  return { findCanonical, findChildren, countSatellites, countCoachFlags, execute, readBackPublications };
+  return { findCanonical, findChildren, findSatellites, countSatellites, countCoachFlags, execute, readBackPublications };
 }
 
 module.exports = { createGameDeletionStore, rowsOf, MAX_ROWS_PER_TABLE };

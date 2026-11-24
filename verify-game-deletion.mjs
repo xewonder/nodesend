@@ -84,10 +84,13 @@ const rows = {
 };
 const COLUMNS = {
   recorded_hands: ['id', 'user_id', 'root_hand_id', 'parent_hand_id', 'board_data'],
-  community_games: ['id', 'source_hand_id', 'root_hand_id', 'publisher_user_id'],
-  game_analysis_reports: ['id', 'recorded_hand_id', 'author_user_id'],
-  ai_decision_traces: ['id', 'recorded_hand_id', 'board_id', 'root_hand_id', 'kind'],
-  tournament_attempts: ['id', 'tournament_id', 'recorded_hand_id', 'player_user_id'],
+  // `publisher_user_id` was invented by an earlier version of this file and exists nowhere in the
+  // frontend; the live owner column is `user_id`, written on every insert. Uniform owner values across
+  // these tables are precisely what let a missing owner predicate survive a green suite.
+  community_games: ['id', 'source_hand_id', 'root_hand_id', 'user_id'],
+  game_analysis_reports: ['id', 'recorded_hand_id', 'author_user_id', 'user_id'],
+  ai_decision_traces: ['id', 'recorded_hand_id', 'board_id', 'root_hand_id', 'kind', 'user_id'],
+  tournament_attempts: ['id', 'tournament_id', 'recorded_hand_id', 'player_user_id', 'user_id'],
   replay_attempts: ['id', 'recorded_hand_id', 'root_hand_id', 'user_id'],
   coach_feedback_flags: ['id', 'hand_id', 'root_hand_id', 'coach_user_id', 'user_id'],
   tournaments: ['id', 'owner_user_id', 'name'],
@@ -214,38 +217,76 @@ const del = async (id, token = 'tok-admin', extra = {}) => {
   return { status: res.status, body };
 };
 
-const seedGame = ({ foreignChild = false, communityRoot = false, flagTrace = true } = {}) => {
+/*
+ * The fixture. Every satellite row carries the owner column the LIVE WRITER fills, because the shape that
+ * hid the defect was a fixture in which every satellite belonged to the same account: an owner predicate
+ * that is never exercised on a differing value is not a tested rule. `userB = '12'` is the other account.
+ */
+const OWNER_A = '7';
+const OWNER_B = '12';
+const seedGame = ({
+  foreignChild = false, communityRoot = false, flagTrace = true,
+  foreignCommunityRoot = false,   // B published A's game: matched via root_hand_id
+  foreignCommunitySource = false, // B's publication naming A's game directly as its source
+  foreignAttempt = false,         // B consumed a replay attempt on A's chain (replayEligibility.js:117)
+  unownedSatellite = false,       // a selected row whose owner column is empty
+  mixedForeign = false,           // foreign rows in three different cascade tables at once
+  stranger = false,               // foreign rows keyed to OTHER games: must not block anything
+  orphanOwner = false,            // the canonical game row itself has no readable owner
+  noChildren = false              // no replay descendants, so the child rule cannot pre-empt the audit
+} = {}) => {
   for (const k of Object.keys(rows)) {
     if (['system_admins', 'clubs', 'club_memberships'].includes(k)) continue;
     rows[k].length = 0;
   }
   calls.deletes.length = 0;
   calls.reads.length = 0;
-  rows.recorded_hands.push({ id: GAME, user_id: '7', root_hand_id: null, board_data: '{"private":"cards"}' });
-  rows.recorded_hands.push({ id: '5002', user_id: '7', root_hand_id: GAME, board_data: 'child-own' });    // same owner
-  rows.recorded_hands.push({ id: '5003', user_id: '7', root_hand_id: GAME, board_data: 'child-own-2' });  // same owner
-  if (foreignChild) rows.recorded_hands.push({ id: '5004', user_id: '12', root_hand_id: GAME, board_data: 'someone else game' });
-  rows.community_games.push({ id: 'c1', source_hand_id: GAME, root_hand_id: null, publisher_user_id: '7' });
-  if (communityRoot) rows.community_games.push({ id: 'c2', source_hand_id: '5002', root_hand_id: GAME, publisher_user_id: '7' });
-  rows.game_analysis_reports.push({ id: 'r1', recorded_hand_id: GAME, author_user_id: '4' });
-  rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, kind: 'game' });
-  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot' });
-  rows.tournament_attempts.push({ id: 'a1', tournament_id: 'T1', recorded_hand_id: GAME, player_user_id: '7' });
+  rows.recorded_hands.push({ id: GAME, user_id: orphanOwner ? null : OWNER_A, root_hand_id: null, board_data: '{"private":"cards"}' });
+  if (!noChildren) {
+    rows.recorded_hands.push({ id: '5002', user_id: OWNER_A, root_hand_id: GAME, board_data: 'child-own' });    // same owner
+    rows.recorded_hands.push({ id: '5003', user_id: OWNER_A, root_hand_id: GAME, board_data: 'child-own-2' });  // same owner
+  }
+  if (foreignChild) rows.recorded_hands.push({ id: '5004', user_id: OWNER_B, root_hand_id: GAME, board_data: 'someone else game' });
+  rows.community_games.push({ id: 'c1', source_hand_id: GAME, root_hand_id: null, user_id: OWNER_A });
+  if (communityRoot) rows.community_games.push({ id: 'c2', source_hand_id: '5002', root_hand_id: GAME, user_id: OWNER_A });
+  if (foreignCommunityRoot) rows.community_games.push({ id: 'cF1', source_hand_id: '6120', root_hand_id: GAME, user_id: OWNER_B });
+  if (foreignCommunitySource) rows.community_games.push({ id: 'cF2', source_hand_id: GAME, root_hand_id: GAME, user_id: OWNER_B });
+  if (unownedSatellite) rows.community_games.push({ id: 'cU1', source_hand_id: null, root_hand_id: GAME, user_id: null });
+  if (stranger) {
+    rows.community_games.push({ id: 'cS1', source_hand_id: '8801', root_hand_id: '8801', user_id: OWNER_B });
+    rows.replay_attempts.push({ id: 'raS1', recorded_hand_id: '8801', root_hand_id: '8801', user_id: OWNER_B });
+    rows.game_analysis_reports.push({ id: 'rS1', recorded_hand_id: '8801', author_user_id: OWNER_B, user_id: OWNER_B });
+    rows.ai_decision_traces.push({ id: 'tS1', recorded_hand_id: '8801', board_id: '95', root_hand_id: '8801', kind: 'game', user_id: OWNER_B });
+    rows.tournament_attempts.push({ id: 'aS2', tournament_id: 'T1', recorded_hand_id: '8801', player_user_id: OWNER_B, user_id: SERVICE_ID });
+  }
+  // A report authored by the coach but OWNED by the player: authorship is not ownership, and it must
+  // still cascade. `gameAnalysisService.js:305` writes user_id = the hand owner.
+  rows.game_analysis_reports.push({ id: 'r1', recorded_hand_id: GAME, author_user_id: '4', user_id: OWNER_A });
+  if (mixedForeign) rows.game_analysis_reports.push({ id: 'rF1', recorded_hand_id: GAME, author_user_id: OWNER_B, user_id: OWNER_B });
+  rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, kind: 'game', user_id: OWNER_A });
+  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: '4' });
+  // NodeSend writes the attempt link on the SERVICE ACCOUNT, so its stamped user_id is NOT the player.
+  // Resolution must prefer `player_user_id`, or every legitimate deletion refuses.
+  rows.tournament_attempts.push({ id: 'a1', tournament_id: 'T1', recorded_hand_id: GAME, player_user_id: OWNER_A, user_id: SERVICE_ID });
+  if (mixedForeign) rows.tournament_attempts.push({ id: 'aS1', tournament_id: 'T1', recorded_hand_id: '5002', player_user_id: OWNER_B, user_id: SERVICE_ID });
   // A replay attempt keyed directly to the game, and one that names ONLY the chain root — the second is
   // invisible to a sweep that looks at recorded_hand_id alone.
-  rows.replay_attempts.push({ id: 'ra1', recorded_hand_id: GAME, root_hand_id: GAME, user_id: '7' });
-  rows.replay_attempts.push({ id: 'ra2', recorded_hand_id: null, root_hand_id: GAME, user_id: '7' });
+  rows.replay_attempts.push({ id: 'ra1', recorded_hand_id: GAME, root_hand_id: GAME, user_id: OWNER_A });
+  rows.replay_attempts.push({ id: 'ra2', recorded_hand_id: null, root_hand_id: GAME, user_id: OWNER_A });
+  if (foreignAttempt) rows.replay_attempts.push({ id: 'raF1', recorded_hand_id: null, root_hand_id: GAME, user_id: OWNER_B });
+  if (stranger) rows.replay_attempts.push({ id: 'raS1', recorded_hand_id: '8801', root_hand_id: '8801', user_id: OWNER_B });
+  if (mixedForeign) rows.replay_attempts.push({ id: 'raF2', recorded_hand_id: '5002', root_hand_id: GAME, user_id: OWNER_B });
   // Coach flags: another person's record. Counted and reported, never deleted.
   rows.coach_feedback_flags.push({ id: 'f1', hand_id: GAME, root_hand_id: GAME, coach_user_id: '4', user_id: '4' });
   rows.coach_feedback_flags.push({ id: 'f2', hand_id: '7777', root_hand_id: '7777', coach_user_id: '4', user_id: '4' });
   // A child that names this game ONLY as its parent: root_hand_id points at an older row, so a
   // root-only child search would miss it and leave a dangling parent reference.
-  rows.recorded_hands.push({ id: '5099', user_id: '7', root_hand_id: '4404', parent_hand_id: GAME, board_data: 'mid-chain child' });
+  if (!noChildren) rows.recorded_hands.push({ id: '5099', user_id: OWNER_A, root_hand_id: '4404', parent_hand_id: GAME, board_data: 'mid-chain child' });
   // Unrelated data that must survive byte-identically.
   rows.recorded_hands.push({ id: '7777', user_id: '8', root_hand_id: null, board_data: 'another player' });
   rows.tournaments.push({ id: 'T1', owner_user_id: '4', name: 'Autumn Congress' });
   rows.tournament_boards.push({ id: 'b1', tournament_id: 'T1', board_number: '1' });
-  rows.tournament_attempts.push({ id: 'a2', tournament_id: 'T1', recorded_hand_id: '7777', player_user_id: '9' });
+  rows.tournament_attempts.push({ id: 'a2', tournament_id: 'T1', recorded_hand_id: '7777', player_user_id: '9', user_id: SERVICE_ID });
 };
 
 const snapshot = (table) => JSON.stringify(rows[table]);
@@ -419,11 +460,33 @@ const partialLook = await del(survivorGame, 'tok-admin');
 check('16d. with the canonical row gone but a replay_attempt still keyed to it, clean absence is NOT claimed',
   partialLook.status === 200 && partialLook.body?.data?.alreadyAbsent === true
     && partialLook.body?.data?.noTraceRemaining === false,
-  JSON.stringify(partialLook.body?.data).slice(0, 200));
+  JSON.stringify(partialLook.body?.data ?? null).slice(0, 200));
 check('16e. and no write was issued for the leftover row — the route reports the gap rather than cleaning it up itself',
   survivorIds.length > 0 && rows.replay_attempts.length === survivorIds.length
     && !calls.deletes.some((c) => c.table === 'replay_attempts' && survivorIds.includes(c.id)),
   `leftover=${JSON.stringify(survivorIds)}`);
+
+/* The same claim for the table the old satellite probe list omitted entirely. Everything else is emptied
+ * so ONLY a community_games row can make the answer false — an arm satisfied by any probe is not testing
+ * the probe it exists for (measured on 16d). */
+seedGame();
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === GAME), 1);
+rows.game_analysis_reports.length = 0;
+rows.ai_decision_traces.length = 0;
+rows.tournament_attempts.length = 0;
+rows.replay_attempts.length = 0;
+rows.community_games.length = 0;
+// One row that matches BOTH community probes: the count is of rows, not of matches.
+rows.community_games.push({ id: 'cLeft', source_hand_id: GAME, root_hand_id: GAME, user_id: OWNER_A });
+const leftoverPublication = await del(GAME, 'tok-admin');
+check('16f. a surviving community publication keyed to the game also forbids the clean-absence claim',
+  leftoverPublication.status === 200 && leftoverPublication.body?.data?.alreadyAbsent === true
+    && leftoverPublication.body?.data?.noTraceRemaining === false,
+  JSON.stringify(leftoverPublication.body?.data ?? null).slice(0, 200));
+check('16g. and it is reported without touching the surviving row',
+  rows.community_games.length === 1 && rows.community_games[0].id === 'cLeft'
+    && !calls.deletes.some((c) => c.table === 'community_games' && c.id === 'cLeft'),
+  JSON.stringify(rows.community_games));
 
 // The inventory itself: a table the sweep should cover must be declared, and asserting the list is
 // louder and more diagnosable than a crash when someone drops it.
@@ -441,10 +504,11 @@ check('D4b. coach flags are declared as preserved-and-reported, never as a sweep
   `${rules.COACH_FLAGS_DISPOSITION} / ${rules.SWEEP_STEPS.join(',')}`);
 
 check('16c. and the two are reported INDISTINGUISHABLY, because NodeSend has no tombstone to tell them apart',
-  JSON.stringify(repeat.body.data.alreadyAbsent) === JSON.stringify(neverSeen.body.data.alreadyAbsent)
+  Boolean(repeat.body?.data && neverSeen.body?.data)
+    && JSON.stringify(repeat.body.data.alreadyAbsent) === JSON.stringify(neverSeen.body.data.alreadyAbsent)
     && repeat.body.data.deleted === neverSeen.body.data.deleted
     && !JSON.stringify(repeat.body).includes('existed') && !JSON.stringify(neverSeen.body).includes('existed'),
-  `${JSON.stringify(repeat.body.data)} vs ${JSON.stringify(neverSeen.body.data)}`);
+  `${JSON.stringify(repeat.body?.data)} vs ${JSON.stringify(neverSeen.body?.data)}`);
 
 // ── 4: foreign replay descendants ───────────────────────────────────────────────────────────────
 seedGame({ foreignChild: true });
@@ -458,6 +522,106 @@ check('4b. the refusal counts descendants without naming other players\u2019 ids
   !JSON.stringify(foreign.body).includes('5004') && !JSON.stringify(foreign.body).includes('someone else')
     && /\b1\b/.test(String(foreign.body?.error?.message ?? '')),
   JSON.stringify(foreign.body).slice(0, 220));
+
+/* ── 4c: SATELLITE OWNERSHIP ────────────────────────────────────────────────────────────────────
+ * The defect this section exists for: the deployed sweep selected satellites by a REFERENCE column
+ * alone, and `community_games.root_hand_id` / `replay_attempts.root_hand_id` name a replay chain's FIRST
+ * game — so another player's publication or consumed attempt matched the filter and was deleted without
+ * any refusal. Every arm below compares a FULL snapshot of every table, because "zero records deleted"
+ * is only evidence if nothing at all moved.
+ */
+const AUDIT_TABLES = Object.keys(rows).filter((k) => !['system_admins', 'clubs', 'club_memberships'].includes(k));
+const snapshotAll = () => AUDIT_TABLES.map((t) => `${t}=${snapshot(t)}`).join('|');
+const idFree = (body) => {
+  const text = JSON.stringify(body ?? {});
+  return !['cF1', 'cF2', 'cU1', 'rF1', 'raF1', 'raF2', 'aS1', 'community_games', 'replay_attempts', OWNER_B].some((leak) => text.includes(leak));
+};
+
+seedGame({ foreignCommunityRoot: true });
+let worldBefore = snapshotAll();
+const fRoot = await del(GAME, 'tok-admin');
+check('F1. a publication owned by ANOTHER player, matched through root_hand_id, refuses the whole request',
+  fRoot.status === 409 && fRoot.body?.error?.code === 'foreign_satellite_owners'
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore,
+  `${fRoot.status} ${JSON.stringify(fRoot.body).slice(0, 200)} deletes=${calls.deletes.length}`);
+check('F1b. the refusal counts the row and names no id, table or account',
+  /\b1 record\(s\) belong to another account\b/.test(String(fRoot.body?.error?.message ?? '')) && idFree(fRoot.body),
+  JSON.stringify(fRoot.body).slice(0, 200));
+
+seedGame({ foreignCommunitySource: true });
+worldBefore = snapshotAll();
+const fSource = await del(GAME, 'tok-admin');
+check('F2. ownership, not lineage, is the rule: a FOREIGN publication keyed DIRECTLY to the game also refuses',
+  fSource.status === 409 && fSource.body?.error?.code === 'foreign_satellite_owners'
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore,
+  `${fSource.status} ${JSON.stringify(fSource.body).slice(0, 200)}`);
+
+seedGame({ foreignAttempt: true });
+worldBefore = snapshotAll();
+const fAttempt = await del(GAME, 'tok-admin');
+check('F3. another player\u2019s consumed replay attempt refuses the deletion and is left intact',
+  fAttempt.status === 409 && fAttempt.body?.error?.code === 'foreign_satellite_owners'
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore
+    && rows.replay_attempts.some((r) => r.id === 'raF1' && r.user_id === OWNER_B),
+  `${fAttempt.status} ${JSON.stringify(fAttempt.body).slice(0, 200)}`);
+
+seedGame({ unownedSatellite: true });
+worldBefore = snapshotAll();
+const fUnowned = await del(GAME, 'tok-admin');
+check('F4. a selected satellite with NO readable owner fails closed: unknown ownership never authorises a delete',
+  fUnowned.status === 409 && fUnowned.body?.error?.code === 'foreign_satellite_owners'
+    && /no readable owner/.test(String(fUnowned.body?.error?.message ?? ''))
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore,
+  `${fUnowned.status} ${JSON.stringify(fUnowned.body).slice(0, 200)}`);
+
+seedGame({ mixedForeign: true });
+worldBefore = snapshotAll();
+const fMixed = await del(GAME, 'tok-admin');
+check('F5. mixed ownership across three cascade tables is one refusal counting all three, written nowhere',
+  fMixed.status === 409 && fMixed.body?.error?.code === 'foreign_satellite_owners'
+    && /^3 record\(s\) belong to another account/.test(String(fMixed.body?.error?.message ?? ''))
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore,
+  `${fMixed.status} ${JSON.stringify(fMixed.body).slice(0, 220)}`);
+
+seedGame({ orphanOwner: true, noChildren: true });
+worldBefore = snapshotAll();
+const fOrphan = await del(GAME, 'tok-admin');
+check('F6. an unreadable owner on the canonical game is never assumed to cover its satellites',
+  fOrphan.status === 409 && fOrphan.body?.error?.code === 'foreign_satellite_owners'
+    && /the recorded game itself has no readable owner/.test(String(fOrphan.body?.error?.message ?? ''))
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore,
+  `${fOrphan.status} ${JSON.stringify(fOrphan.body).slice(0, 220)}`);
+
+seedGame({ stranger: true, communityRoot: true });
+const strangers = {
+  community: snapshot('community_games').includes('cS1'),
+  attempts: rows.replay_attempts.filter((r) => r.user_id === OWNER_B).map((r) => r.id).join(','),
+  reports: snapshot('game_analysis_reports').includes('rS1'),
+  traces: rows.ai_decision_traces.filter((t) => t.user_id === OWNER_B).map((t) => t.id).join(','),
+  links: rows.tournament_attempts.filter((a) => a.player_user_id === OWNER_B).map((a) => a.id).join(',')
+};
+const fStranger = await del(GAME, 'tok-admin');
+check('F7. foreign rows elsewhere in the same tables, keyed to OTHER games, do not block a legitimate deletion',
+  fStranger.status === 200 && fStranger.body?.data?.deleted === true,
+  `${fStranger.status} ${JSON.stringify(fStranger.body).slice(0, 220)}`);
+check('F7b. and every one of those unrelated foreign rows survives byte-identically, never addressed by a delete',
+  snapshot('community_games').includes('cS1') && rows.replay_attempts.filter((r) => r.user_id === OWNER_B).map((r) => r.id).join(',') === strangers.attempts
+    && snapshot('game_analysis_reports').includes('rS1') && rows.tournament_attempts.filter((a) => a.player_user_id === OWNER_B).map((a) => a.id).join(',') === strangers.links
+    && rows.ai_decision_traces.filter((t) => t.user_id === OWNER_B).map((t) => t.id).join(',') === strangers.traces
+    && !calls.deletes.some((c) => ['cS1', 'raS1', 'rS1', 'tS1', 'aS2'].includes(c.id)),
+  `before=${JSON.stringify(strangers)} after=${JSON.stringify({ c: rows.community_games.map((r) => r.id), ra: rows.replay_attempts.map((r) => r.id) })}`);
+
+/* A refusal has to be escapable by doing the right thing, or it is a broken feature rather than a guard:
+   re-own the publication (the repair an administrator would actually make) and the same request completes. */
+seedGame({ foreignCommunityRoot: true, communityRoot: true });
+const fBlocked = await del(GAME, 'tok-admin');
+rows.community_games.find((c) => c.id === 'cF1').user_id = OWNER_A;
+const fRepaired = await del(GAME, 'tok-admin');
+check('F8. the refusal is actionable: once the satellite belongs to the game owner, the same request completes',
+  fBlocked.status === 409 && fRepaired.status === 200 && fRepaired.body?.data?.deleted === true
+    && fRepaired.body?.data?.removed?.communityGames === 3
+    && !rows.recorded_hands.some((r) => r.id === GAME),
+  `${fBlocked.status} then ${fRepaired.status} ${JSON.stringify(fRepaired.body).slice(0, 200)}`);
 
 // ── 17: partial failure and safe retry ──────────────────────────────────────────────────────────
 seedGame({ communityRoot: true });
@@ -564,6 +728,68 @@ check('NC3d. a child with an unreadable owner is treated as FOREIGN, never as de
   rules.classifyReplayChildren({ ownerId: '7', children: [{ id: 'x', user_id: null }, { id: 'y' }] }).hasForeign === true
     && rules.classifyReplayChildren({ ownerId: '', children: [{ id: 'x', user_id: '7' }] }).hasForeign === true,
   JSON.stringify(rules.classifyReplayChildren({ ownerId: '7', children: [{ id: 'x', user_id: null }] })));
+/* ── NC5: the store's OWN backstop, and the rules behind it ──────────────────────────────────────
+ * F1-F6 prove the mount refuses. They would all still pass if the STORE were the unsafe part and the
+ * mount merely happened to ask first. These arms call the store directly, with no preflight, which is
+ * exactly the shape of a row written between the audit and the sweep.
+ */
+const directClient = {
+  configured: true,
+  async request(spec) {
+    const res = await fetch(`https://${MOCK_HOST}/data/${spec.path}`, {
+      method: spec.method || 'GET', headers: { authorization: `Bearer ${SERVICE_TOKEN}` }
+    });
+    let body = null;
+    try { body = await res.json(); } catch {}
+    return { ok: res.ok && body?.status !== 'failed', body };
+  }
+};
+seedGame({ foreignCommunityRoot: true });
+const backstop = await storeModule.createGameDeletionStore({ client: directClient })
+  .execute({ canonicalId: GAME, replayChildIds: ['5002', '5003', '5099'], ownerId: OWNER_A });
+check('NC5. the sweep itself refuses a foreign satellite when no preflight ran: the store is not trusted to its caller',
+  backstop.failure?.reason === 'foreign_satellite_owners' && backstop.failure?.step === 'communityGames'
+    && backstop.failure?.verdict?.foreignCount === 1,
+  JSON.stringify(backstop.failure ?? backstop.result ?? null).slice(0, 220));
+check('NC5b. and the foreign row was never addressed by a delete call, survived, and the canonical row survived too',
+  !calls.deletes.some((c) => c.id === 'cF1') && rows.community_games.some((c) => c.id === 'cF1')
+    && rows.recorded_hands.some((r) => r.id === GAME) && backstop.result === undefined,
+  `deletes=${JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`))}`);
+seedGame({ foreignAttempt: true });
+const noOwnerArg = await storeModule.createGameDeletionStore({ client: directClient })
+  .execute({ canonicalId: GAME, replayChildIds: [] });
+check('NC5c. an execute() call that omits the owner fails CLOSED rather than deleting everything it matched',
+  noOwnerArg.failure?.reason === 'foreign_satellite_owners'
+    && rows.replay_attempts.some((r) => r.id === 'raF1') && rows.recorded_hands.some((r) => r.id === GAME),
+  JSON.stringify(noOwnerArg.failure ?? noOwnerArg.result ?? null).slice(0, 200));
+
+check('NC5d. ownership resolves from player_user_id BEFORE the NCB-stamped user_id, so a service-account link is still the player\u2019s',
+  rules.satelliteOwner({ row: { player_user_id: OWNER_A, user_id: SERVICE_ID }, key: 'tournamentAttempts' }).owner === OWNER_A
+    && rules.satelliteOwner({ row: { user_id: OWNER_A }, key: 'communityGames' }).owner === OWNER_A
+    && rules.satelliteOwner({ row: {}, key: 'communityGames' }).readable === false
+    && rules.satelliteOwner({ row: { user_id: OWNER_A }, key: 'not_a_table' }).readable === false,
+  JSON.stringify(rules.satelliteOwner({ row: { player_user_id: OWNER_A, user_id: SERVICE_ID }, key: 'tournamentAttempts' })));
+// The audit and the write must read ONE list. If a probe is added to the sweep without an owner policy,
+// or an owner policy exists for a table nothing selects, this reddens instead of becoming the next defect.
+check('NC5e. every cascade probe has an owner policy, and the audited probe list is the sweep\u2019s own',
+  rules.SWEEP_PROBES.every((probe) => Array.isArray(rules.SATELLITE_OWNER_COLUMNS[probe.key])
+    && rules.SATELLITE_OWNER_COLUMNS[probe.key].length > 0
+    && Boolean(rules.GAME_COLUMNS[probe.key][probe.column]))
+    && rules.SWEEP_PROBES.filter((p) => p.key === 'communityGames').map((p) => p.column).sort().join(',') === 'rootHandId,sourceHandId'
+    && rules.SWEEP_PROBES.map((p) => p.key).filter((k, i, all) => all.indexOf(k) === i).sort().join(',')
+      === 'analysisReports,communityGames,decisionTraces,replayAttempts,tournamentAttempts'
+    && rules.MULTI_COLUMN_SATELLITE === 'communityGames',
+  JSON.stringify(rules.SWEEP_PROBES));
+check('NC5f. a table with no declared owner policy is counted as unverifiable, never as safe to delete',
+  rules.classifySatellites({ ownerId: OWNER_A, groups: { mysteryTable: [{ id: 'z', user_id: OWNER_A }] } }).blocked === true
+    && rules.classifySatellites({ ownerId: OWNER_A, groups: { communityGames: [{ id: 'z', user_id: OWNER_A }] } }).blocked === false,
+  JSON.stringify(rules.classifySatellites({ ownerId: OWNER_A, groups: { mysteryTable: [{ id: 'z' }] } })));
+check('NC5g. an unreadable canonical owner never authorises a satellite delete, and never claims foreign ownership either',
+  rules.classifySatellites({ ownerId: '', groups: { communityGames: [{ id: 'z', user_id: OWNER_A }] } }).unverifiableCount === 1
+    && rules.classifySatellites({ ownerId: '', groups: { communityGames: [{ id: 'z', user_id: OWNER_A }] } }).foreignCount === 0
+    && rules.classifySatellites({ ownerId: OWNER_A, groups: { communityGames: [{ id: 'z', user_id: OWNER_B }] } }).foreignCount === 1,
+  JSON.stringify(rules.classifySatellites({ ownerId: '', groups: { communityGames: [{ id: 'z', user_id: OWNER_A }] } })));
+
 // A throw inside the sweep must ANSWER, not hang. Express 4 does not catch a rejected async handler, so
 // without a catch-all the socket stalls and the caller cannot tell whether rows were removed — the worst
 // possible outcome for a destructive verb. Proven with a stub store that throws on purpose.
@@ -577,6 +803,7 @@ faultApp.use(bridge.buildGameDeletionMount({
   deletionStore: {
     findCanonical: async () => ({ row: { id: '5001', user_id: '7', root_hand_id: null } }),
     findChildren: async () => ({ rows: [] }),
+    findSatellites: async () => ({ groups: {} }),
     countSatellites: async () => ({ total: 0 }),
     execute: async () => { throw new TypeError('simulated internal fault mid-sweep'); }
   }
@@ -600,6 +827,58 @@ check('NC3f. an internal fault answers a named refusal instead of hanging the so
     && !JSON.stringify(faultAnswer.body).includes('simulated internal fault'),
   JSON.stringify(faultAnswer).slice(0, 200));
 
+/* Two mount-level shapes the HTTP fixture cannot produce on its own, built with a stub store: a refusal
+ * discovered DURING the sweep (its answer must keep the code, not degrade into "retry the same request"),
+ * and a store that cannot supply the inventory at all (which must never be swept un-audited). */
+async function callStubMount(deletionStore, id = '5001') {
+  const stubApp = express();
+  stubApp.use(bridge.buildGameDeletionMount({
+    env: process.env,
+    authenticate: async () => ({ ok: true, id: '1' }),
+    clubStore: { isSystemAdmin: async () => ({ declared: true, available: true, isAdmin: true }) },
+    clubAccount: { configured: true },
+    deletionStore
+  }).router);
+  const stubServer = stubApp.listen(0, '127.0.0.1');
+  await new Promise((resolve) => stubServer.once('listening', resolve));
+  try {
+    const res = await fetch(`http://127.0.0.1:${stubServer.address().port}/games/${id}`, {
+      method: 'DELETE', headers: { authorization: 'Bearer x' }
+    });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  } finally { stubServer.close(); }
+}
+const midSweep = await callStubMount({
+  findCanonical: async () => ({ row: { id: '5001', user_id: OWNER_A, root_hand_id: null } }),
+  findChildren: async () => ({ rows: [] }),
+  findSatellites: async () => ({ groups: {} }),
+  countSatellites: async () => ({ total: 0 }),
+  execute: async () => ({
+    failure: {
+      storeFailure: true, reason: 'foreign_satellite_owners', step: 'communityGames',
+      verdict: { foreignCount: 2, unverifiableCount: 1, ownerUnreadable: false },
+      removedSoFar: { communityGames: 0 }
+    }
+  })
+});
+check('NC5h. an ownership stop discovered mid-sweep keeps its code as a 409 and says the cleanup is partial',
+  midSweep.status === 409 && midSweep.body?.error?.code === 'foreign_satellite_owners'
+    && /2 record\(s\) belong to another account and 1 record\(s\) have no readable owner/.test(String(midSweep.body?.error?.message ?? ''))
+    && /not restorable/.test(String(midSweep.body?.error?.message ?? ''))
+    && midSweep.body?.data === undefined,
+  JSON.stringify(midSweep).slice(0, 240));
+const noInventory = await callStubMount({
+  findCanonical: async () => ({ row: { id: '5001', user_id: OWNER_A, root_hand_id: null } }),
+  findChildren: async () => ({ rows: [] }),
+  countSatellites: async () => ({ total: 0 }),
+  execute: async () => { throw new Error('the sweep must not be entered without an ownership audit'); }
+});
+check('NC5i. a store that cannot produce the satellite inventory is refused before any write, never swept un-audited',
+  noInventory.status === 503 && noInventory.body?.error?.code === 'club_store_unavailable'
+    && noInventory.body?.data === undefined
+    && !JSON.stringify(noInventory.body).includes('must not be entered'),
+  JSON.stringify(noInventory).slice(0, 200));
+
 check('NC3e. the sweep order is satellites-first and canonical-last — the recovery marker contract',
   rules.SWEEP_STEPS.indexOf('recordedHand') === rules.SWEEP_STEPS.length - 1
     && rules.SWEEP_STEPS.indexOf('communityGames') < rules.SWEEP_STEPS.indexOf('recordedHand'),
@@ -613,7 +892,10 @@ check('NC3e. the sweep order is satellites-first and canonical-last — the reco
 const refusalBodies = [
   ['not-system-admin', user.body], ['club-admin', clubAdmin.body], ['unauthenticated', anonBody],
   ['forged-role', forged.body], ['foreign-children', foreign.body], ['partial-sweep', partial.body],
-  ['unconfirmed-delete', lying.body], ['unreachable', unreachable.body]
+  ['unconfirmed-delete', lying.body], ['unreachable', unreachable.body],
+  ['foreign-satellites', fRoot.body], ['foreign-direct', fSource.body], ['foreign-attempt', fAttempt.body],
+  ['unowned-satellite', fUnowned.body], ['mixed-satellites', fMixed.body], ['orphan-owner', fOrphan.body],
+  ['mid-sweep-stop', midSweep.body], ['inventory-unavailable', noInventory.body]
 ].filter(([, body]) => body);
 const badRefusals = refusalBodies
   .filter(([, body]) => typeof body?.error?.code !== 'string' || body.error.code.trim() === ''
@@ -633,14 +915,15 @@ check('C3. the success envelope exposes exactly the fields the client consumes, 
   JSON.stringify(sd).slice(0, 260));
 check('C3b. an idempotent repeat also satisfies the client gate (it requires deleted === true to proceed)',
   repeat.body?.data?.deleted === true && repeat.body?.data?.alreadyAbsent === true,
-  JSON.stringify(repeat.body?.data).slice(0, 200));
+  JSON.stringify(repeat.body?.data ?? null).slice(0, 200));
 // The documented gap, asserted rather than assumed away: the client at 514ad394 has no branch for 409 or
 // 502, so both land in `malformed_envelope` ("Nothing was deleted" — SAFE, but it discards the two most
 // actionable answers this route produces). The codes still arrive intact, which is what the handoff needs.
 check('C4. the codes the client cannot yet map still arrive named (handoff prerequisite)',
   foreign.body?.error?.code === 'foreign_replay_descendants' && foreign.status === 409
+    && fRoot.body?.error?.code === 'foreign_satellite_owners' && fRoot.status === 409
     && partial.body?.error?.code === 'game_deletion_incomplete' && (partial.status === 502 || partial.status === 503),
-  `${foreign.status}/${foreign.body?.error?.code} ${partial.status}/${partial.body?.error?.code}`);
+  `${foreign.status}/${foreign.body?.error?.code} ${fRoot.status}/${fRoot.body?.error?.code} ${partial.status}/${partial.body?.error?.code}`);
 
 check('NC3. no request in this run ever left the mock host', calls.offHost.length === 0, calls.offHost.slice(0, 3).join(','));
 /*
@@ -659,10 +942,15 @@ check('NC4b. every declared fault knob is actually read by the mock (no inert ne
   inertKnobs.length === 0, `inert: ${inertKnobs.join(', ')}`);
 check('NC4. no credential, bearer or private hand content appears in any deletion answer',
   (() => {
-    const seen = JSON.stringify([ok.body, foreign.body, partial.body, lying.body, unreachable.body, repeat.body]);
+    const seen = JSON.stringify([ok.body, foreign.body, partial.body, lying.body, unreachable.body, repeat.body,
+      fRoot.body, fMixed.body, fOrphan.body, midSweep.body, noInventory.body]);
     return !seen.includes(SERVICE_TOKEN) && !seen.includes(PASSWORD) && !seen.includes(SERVICE_EMAIL)
       && !seen.includes('{"private":"cards"}') && !seen.includes('Bearer ');
   })(), '');
+check('NC4c. no ownership refusal names a table, a row id or another account id',
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].every((answer) => idFree(answer.body))
+    && idFree(noInventory.body),
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].map((a) => JSON.stringify(a.body).slice(0, 90)).join(' | '));
 
 let failed = 0;
 for (const r of results) {

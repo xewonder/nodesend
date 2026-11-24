@@ -27,7 +27,8 @@ const { createClubNcbStore } = require('../clubs/clubNcbStore.js');
 const { readClubSchemaConfig } = require('../clubs/clubSchema.js');
 const { createGameDeletionStore } = require('./gameDeletionStore.js');
 const {
-  isCanonicalGameId, planGameDeletion, deletionResult, REFUSALS, auditRecord, GAME_COLUMNS, GAME_TABLES
+  isCanonicalGameId, planGameDeletion, deletionResult, REFUSALS, auditRecord, GAME_COLUMNS, GAME_TABLES,
+  sweepTargetIds, checkSatelliteOwnership
 } = require('./gameDeletion.js');
 
 const eq = (value) => String(value ?? '').trim();
@@ -162,9 +163,41 @@ function buildGameDeletionMount({
       return reply(res, answer);
     }
 
-    const executed = await store.execute({ canonicalId: plan.canonicalId, replayChildIds: plan.replayChildIds });
+    /*
+     * 3b. SATELLITE OWNERSHIP — audited here, after the child policy and before the first write.
+     *
+     * The children are already owner-checked by `planGameDeletion`, but the satellites are selected by
+     * REFERENCE columns that name a whole replay chain: `community_games.root_hand_id` and
+     * `replay_attempts.root_hand_id` point at the chain's FIRST game, so another player's publication or
+     * consumed attempt is matched by a filter on THIS game's id. A reference match is not ownership, and
+     * the canonical row's owner is never assumed to extend to them — an unreadable owner fails closed.
+     * If the store cannot produce the inventory, the request is refused rather than swept un-audited.
+     */
+    const ownerId = eq(canonical.row[GAME_COLUMNS.recordedHands.userId]);
+    if (typeof store.findSatellites !== 'function') return reply(res, REFUSALS.game_store_unavailable());
+    const satellites = await store.findSatellites(sweepTargetIds(plan));
+    if (satellites.storeFailure) {
+      return reply(res, satellites.reason.match(UNAVAILABLE_REASONS) ? REFUSALS.game_store_unavailable()
+        : REFUSALS.incomplete(satellites.reason));
+    }
+    const ownership = checkSatelliteOwnership({ ownerId, groups: satellites.groups });
+    if (ownership.ok !== true) {
+      const r = ownership.refusal;
+      return reply(res, { http: r.http, body: { status: 'error', error: { code: r.code, message: r.message } } });
+    }
+
+    const executed = await store.execute({ canonicalId: plan.canonicalId, replayChildIds: plan.replayChildIds, ownerId });
     if (executed.failure) {
       const f = executed.failure;
+      // A row the sweep found that the audit did not clear is a REFUSAL with the same code the preflight
+      // uses, not an incomplete-write report: the administrator needs to know which accounts are in the
+      // way, and "retry the same request" would be an instruction that can never succeed.
+      if (f.reason === 'foreign_satellite_owners') {
+        if (typeof onAudit === 'function') {
+          onAudit({ ...auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: f.removedSoFar ?? null, replayChildren: 0 } }), failure: `${f.step || 'sweep'}: foreign_satellite_owners` });
+        }
+        return reply(res, REFUSALS.foreign_satellite_owners(f.verdict ?? f, { partial: true }));
+      }
       // A partial sweep is NEVER a success. The canonical row is still present (steps run satellites
       // first), so the caller can retry the identical request and finish the job.
       const code = TRANSPORT_REASONS.test(f.reason || '') ? 'club_store_unavailable' : 'game_deletion_incomplete';
