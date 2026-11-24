@@ -75,17 +75,21 @@ const rows = {
   game_analysis_reports: [],
   ai_decision_traces: [],
   tournament_attempts: [],
+  replay_attempts: [],
+  coach_feedback_flags: [],
   tournaments: [],
   tournament_boards: [],
   club_board_collections: [],
   club_collection_boards: []
 };
 const COLUMNS = {
-  recorded_hands: ['id', 'user_id', 'root_hand_id', 'board_data'],
+  recorded_hands: ['id', 'user_id', 'root_hand_id', 'parent_hand_id', 'board_data'],
   community_games: ['id', 'source_hand_id', 'root_hand_id', 'publisher_user_id'],
   game_analysis_reports: ['id', 'recorded_hand_id', 'author_user_id'],
   ai_decision_traces: ['id', 'recorded_hand_id', 'board_id', 'root_hand_id', 'kind'],
   tournament_attempts: ['id', 'tournament_id', 'recorded_hand_id', 'player_user_id'],
+  replay_attempts: ['id', 'recorded_hand_id', 'root_hand_id', 'user_id'],
+  coach_feedback_flags: ['id', 'hand_id', 'root_hand_id', 'coach_user_id', 'user_id'],
   tournaments: ['id', 'owner_user_id', 'name'],
   tournament_boards: ['id', 'tournament_id', 'board_number'],
   system_admins: ['id', 'admin_user_id', 'user_id'],
@@ -187,6 +191,9 @@ globalThis.fetch = async (url, init = {}) => {
 
 const bridge = require(path.join(ROOT, 'bridge.js'));
 const { app } = bridge;
+// Declared with the bridge it comes from: arms use the SHIPPED rules objects instead of re-typing table and
+// column names, and declaring this after its first use would be a temporal-dead-zone crash (measured).
+const rules = bridge.gameDeletionRules;
 const server = app.listen(0, '127.0.0.1');
 await new Promise((resolve) => server.once('listening', resolve));
 LOOPBACK = `127.0.0.1:${server.address().port}`;
@@ -224,6 +231,16 @@ const seedGame = ({ foreignChild = false, communityRoot = false, flagTrace = tru
   rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, kind: 'game' });
   if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot' });
   rows.tournament_attempts.push({ id: 'a1', tournament_id: 'T1', recorded_hand_id: GAME, player_user_id: '7' });
+  // A replay attempt keyed directly to the game, and one that names ONLY the chain root — the second is
+  // invisible to a sweep that looks at recorded_hand_id alone.
+  rows.replay_attempts.push({ id: 'ra1', recorded_hand_id: GAME, root_hand_id: GAME, user_id: '7' });
+  rows.replay_attempts.push({ id: 'ra2', recorded_hand_id: null, root_hand_id: GAME, user_id: '7' });
+  // Coach flags: another person's record. Counted and reported, never deleted.
+  rows.coach_feedback_flags.push({ id: 'f1', hand_id: GAME, root_hand_id: GAME, coach_user_id: '4', user_id: '4' });
+  rows.coach_feedback_flags.push({ id: 'f2', hand_id: '7777', root_hand_id: '7777', coach_user_id: '4', user_id: '4' });
+  // A child that names this game ONLY as its parent: root_hand_id points at an older row, so a
+  // root-only child search would miss it and leave a dangling parent reference.
+  rows.recorded_hands.push({ id: '5099', user_id: '7', root_hand_id: '4404', parent_hand_id: GAME, board_data: 'mid-chain child' });
   // Unrelated data that must survive byte-identically.
   rows.recorded_hands.push({ id: '7777', user_id: '8', root_hand_id: null, board_data: 'another player' });
   rows.tournaments.push({ id: 'T1', owner_user_id: '4', name: 'Autumn Congress' });
@@ -298,7 +315,8 @@ const d = ok.body?.data ?? {};
 check('G1/7-9. System Admin deletion succeeds with the exact per-table counts',
   ok.status === 200 && ok.body?.status === 'success' && d.deleted === true && d.alreadyAbsent === false
     && d.removed?.tournamentAttempts === 1 && d.removed?.decisionTraces === 1
-    && d.removed?.analysisReports === 1 && d.removed?.communityGames === 2 && d.removed?.recordedHands === 3,
+    && d.removed?.analysisReports === 1 && d.removed?.communityGames === 2 && d.removed?.recordedHands === 4
+    && d.removed?.replayAttempts === 2,
   `${ok.status} ${JSON.stringify(ok.body).slice(0, 300)}`);
 check('7. every community publication row is gone, by BOTH source_hand_id and root_hand_id, counted once',
   rows.community_games.filter((c) => c.source_hand_id === GAME || c.root_hand_id === GAME).length === 0,
@@ -316,8 +334,29 @@ check('11. the tournament attempt LINK is removed while the tournament and its b
     && snapshot('tournament_boards') === before.boards && JSON.stringify(rows.tournament_attempts.filter((a) => a.id === 'a2')) === before.otherAttempts,
   `attempts=${JSON.stringify(rows.tournament_attempts)}`);
 check('12. same-owner replay descendants are deleted as a reported cascade',
-  d.replayChildren === 2 && !rows.recorded_hands.some((r) => r.root_hand_id === GAME) && !rows.recorded_hands.some((r) => r.id === GAME),
+  d.replayChildren === 3 && !rows.recorded_hands.some((r) => r.root_hand_id === GAME) && !rows.recorded_hands.some((r) => r.id === GAME),
   `replayChildren=${d.replayChildren} hands=${JSON.stringify(rows.recorded_hands.map((r) => r.id))}`);
+/*
+ * Three dependencies the original implementation did not cover, found by auditing the sweep against the
+ * live column list rather than against the handoff prose. Each is pinned by an arm that goes red if the
+ * fix is removed (verified by plants R1-R3).
+ */
+check('D1. a replay attempt naming ONLY the chain root is swept, not just one keyed to the game',
+  rows.replay_attempts.length === 0, JSON.stringify(rows.replay_attempts));
+check('D2. a child that names this game only through parent_hand_id is found and deleted, so no parent reference dangles',
+  !rows.recorded_hands.some((r) => r.id === '5099')
+    && rows.recorded_hands.every((r) => r.parent_hand_id !== GAME)
+    && d.replayChildren === 3,
+  `children=${d.replayChildren} hands=${JSON.stringify(rows.recorded_hands.map((r) => [r.id, r.parent_hand_id]))}`);
+check('D3. coach flags SURVIVE a game deletion and are reported, not silently destroyed or silently dropped',
+  rows.coach_feedback_flags.length === 2
+    && rows.coach_feedback_flags.some((f) => f.id === 'f1')
+    && d.preserved?.coachFeedbackFlags === 1
+    && !calls.deletes.some((c) => c.table === 'coach_feedback_flags'),
+  `flags=${JSON.stringify(rows.coach_feedback_flags.map((f) => f.id))} preserved=${JSON.stringify(d.preserved)}`);
+check('D3b. an unrelated coach flag on another player\u2019s game is untouched by the count and the sweep',
+  rows.coach_feedback_flags.some((f) => f.id === 'f2' && f.hand_id === '7777'),
+  JSON.stringify(rows.coach_feedback_flags));
 check('13. no dangling root reference survives the sweep',
   rows.recorded_hands.every((r) => r.root_hand_id !== GAME)
     && rows.community_games.every((c) => c.root_hand_id !== GAME && c.source_hand_id !== GAME),
@@ -355,6 +394,52 @@ check('16b. an id with no trace anywhere answers the same idempotent success, wi
 // The claim this route CANNOT make, asserted so nobody adds it by accident: with no tombstone table, a
 // game deleted a moment ago and an id that never existed are the same observable state. Anything that
 // reports them differently would be inventing a fact.
+/* A crash between the canonical delete and an earlier step must not be reported as a clean absence:
+   `noTraceRemaining` is only allowed to say true when EVERY table the sweep touches is quiet. Deleting
+   the canonical row directly at the vendor, leaving a replay_attempt behind, is exactly that state. */
+seedGame();
+const survivorGame = '5001';
+// The surviving satellite must be reachable ONLY through the recorded_hand_id probe, or removing that
+// probe still leaves the root_hand_id probe able to find something and the arm cannot tell the
+// difference. An earlier version of this arm was satisfied by either path (measured by plant R5).
+rows.replay_attempts = rows.replay_attempts.filter((r) => r.recorded_hand_id === survivorGame);
+rows.replay_attempts.forEach((r) => { r.root_hand_id = 'some-other-root'; });
+const survivorIds = rows.replay_attempts.map((r) => r.id);
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === survivorGame), 1);
+/* Every OTHER satellite table must be emptied first. An earlier version of this arm left the reports,
+   traces and community rows in place, so `total` was non-zero through an unrelated probe and the plant
+   that removed the replay_attempt probe was still green — a masked assertion, not a passing one. */
+rows.game_analysis_reports.length = 0;
+rows.ai_decision_traces.length = 0;
+rows.community_games.length = 0;
+rows.tournament_attempts.length = 0;
+rows.recorded_hands.filter((r) => r.root_hand_id === survivorGame || r.parent_hand_id === survivorGame)
+  .forEach((r) => { r.root_hand_id = 'elsewhere'; r.parent_hand_id = 'elsewhere'; });
+const partialLook = await del(survivorGame, 'tok-admin');
+check('16d. with the canonical row gone but a replay_attempt still keyed to it, clean absence is NOT claimed',
+  partialLook.status === 200 && partialLook.body?.data?.alreadyAbsent === true
+    && partialLook.body?.data?.noTraceRemaining === false,
+  JSON.stringify(partialLook.body?.data).slice(0, 200));
+check('16e. and no write was issued for the leftover row — the route reports the gap rather than cleaning it up itself',
+  survivorIds.length > 0 && rows.replay_attempts.length === survivorIds.length
+    && !calls.deletes.some((c) => c.table === 'replay_attempts' && survivorIds.includes(c.id)),
+  `leftover=${JSON.stringify(survivorIds)}`);
+
+// The inventory itself: a table the sweep should cover must be declared, and asserting the list is
+// louder and more diagnosable than a crash when someone drops it.
+check('D4. the declared dependency inventory covers every table the live schema references by game id',
+  Object.values(rules.GAME_TABLES).join(',') === 'recorded_hands,community_games,game_analysis_reports,ai_decision_traces,tournament_attempts,replay_attempts'
+    && rules.GAME_COLUMNS.replayAttempts.recordedHandId === 'recorded_hand_id'
+    && rules.GAME_COLUMNS.replayAttempts.rootHandId === 'root_hand_id'
+    && rules.GAME_COLUMNS.recordedHands.parentHandId === 'parent_hand_id',
+  JSON.stringify({ tables: rules.GAME_TABLES, coach: rules.COACH_FLAG_TABLE }));
+check('D4b. coach flags are declared as preserved-and-reported, never as a sweep target',
+  rules.COACH_FLAGS_DISPOSITION === 'preserved-and-reported'
+    && rules.COACH_FLAG_TABLE.table === 'coach_feedback_flags'
+    && !Object.values(rules.GAME_TABLES).includes('coach_feedback_flags')
+    && !rules.SWEEP_STEPS.includes('coachFlags'),
+  `${rules.COACH_FLAGS_DISPOSITION} / ${rules.SWEEP_STEPS.join(',')}`);
+
 check('16c. and the two are reported INDISTINGUISHABLY, because NodeSend has no tombstone to tell them apart',
   JSON.stringify(repeat.body.data.alreadyAbsent) === JSON.stringify(neverSeen.body.data.alreadyAbsent)
     && repeat.body.data.deleted === neverSeen.body.data.deleted
@@ -445,7 +530,7 @@ check('20. clubs, tournaments and health still answer as before; the new mount d
     && (tourneys.status === 200 || tourneys.status === 403 || tourneys.status === 503),
   `${health.status} clubs=${health.clubs?.configured} tours=${health.tournaments?.configured} clubsHttp=${clubs.status} toursHttp=${tourneys.status}`);
 // ── unit boundaries that the HTTP route cannot reach, asserted directly ─────────────────────────
-const rules = bridge.gameDeletionRules;
+// (`rules` is declared next to the bridge that provides it, above the first arm that uses it.)
 const storeModule = bridge.gameDeletionStore;
 check('NC3a. deleted:true is IMPOSSIBLE without confirmedGone, at the envelope builder itself',
   rules.deletionResult({ removed: { communityGames: 2 }, confirmedGone: false }).body.data.deleted === false

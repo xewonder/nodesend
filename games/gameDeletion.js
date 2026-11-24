@@ -29,8 +29,25 @@ const GAME_TABLES = Object.freeze({
   communityGames: 'community_games',
   analysisReports: 'game_analysis_reports',
   decisionTraces: 'ai_decision_traces',
-  tournamentAttempts: 'tournament_attempts'
+  tournamentAttempts: 'tournament_attempts',
+  // Found by the storage-readiness review rather than by the original handoff. A replay attempt's whole
+  // meaning is "an attempt at this recorded hand", so leaving one behind is a dangling reference of
+  // exactly the kind this route exists to prevent — and it is invisible to a sweep that knows only about
+  // tournament_attempts.
+  replayAttempts: 'replay_attempts'
 });
+
+/*
+ * COACH FLAGS ARE DELIBERATELY NOT IN THE SWEEP.
+ * A `coach_feedback_flags` row belongs to the COACH who raised it, not to the player whose game is being
+ * deleted: it is the reviewer's work product and, on this deployment, evidence about a player. Deleting
+ * it would destroy another person's record behind an admin's click on someone else's game — the same
+ * principle that refuses a foreign replay child. Leaving it is the lesser harm, and it is NOT silent: the
+ * count is returned as `preserved.coachFeedbackFlags`, so the administrator knows a flag now points at a
+ * game that is gone, and the coach-facing cleanup is carried as a separate decision in the handoff.
+ */
+const COACH_FLAG_TABLE = Object.freeze({ table: 'coach_feedback_flags', handId: 'hand_id', rootHandId: 'root_hand_id' });
+const COACH_FLAGS_DISPOSITION = 'preserved-and-reported';
 
 /**
  * Column names as the live schema spells them. NodeSend has no games schema config (these tables are
@@ -39,11 +56,17 @@ const GAME_TABLES = Object.freeze({
  * this backend rather than silently widening it, and `gameDeletionStore` treats that as a refusal.
  */
 const GAME_COLUMNS = Object.freeze({
-  recordedHands: { id: 'id', userId: 'user_id', rootHandId: 'root_hand_id' },
+  // parent_hand_id is as much a reference as root_hand_id. A chain is root -> child -> grandchild, and
+  // every row carries the ROOT in root_hand_id (App.jsx: `const rootId = hand.rootHandId ?? hand.id`),
+  // while parent_hand_id names the previous row. So a game that is itself a replay has a child whose
+  // parent_hand_id is this id but whose root_hand_id is a DIFFERENT row: sweeping only on root_hand_id
+  // deletes this row and leaves that child pointing at nothing. Both columns are therefore searched.
+  recordedHands: { id: 'id', userId: 'user_id', rootHandId: 'root_hand_id', parentHandId: 'parent_hand_id' },
   communityGames: { id: 'id', sourceHandId: 'source_hand_id', rootHandId: 'root_hand_id' },
   analysisReports: { id: 'id', recordedHandId: 'recorded_hand_id' },
-  decisionTraces: { id: 'id', recordedHandId: 'recorded_hand_id' },
-  tournamentAttempts: { id: 'id', recordedHandId: 'recorded_hand_id' }
+  decisionTraces: { id: 'id', recordedHandId: 'recorded_hand_id', rootHandId: 'root_hand_id' },
+  tournamentAttempts: { id: 'id', recordedHandId: 'recorded_hand_id' },
+  replayAttempts: { id: 'id', recordedHandId: 'recorded_hand_id', rootHandId: 'root_hand_id' }
 });
 
 /**
@@ -56,6 +79,7 @@ const SWEEP_STEPS = Object.freeze([
   'tournamentAttempts',
   'decisionTraces',
   'analysisReports',
+  'replayAttempts',
   'communityGames',
   'replayChildren',
   'recordedHand'
@@ -182,14 +206,18 @@ const REFUSALS = Object.freeze({
  * mentioning the id remains, which is what was actually read, and the gate asserts the two cases are
  * indistinguishable rather than pretending otherwise.
  */
-function deletionResult({ removed = {}, replayChildren = 0, alreadyAbsent = false, noTraceRemaining = false, confirmedGone = false }) {
+function deletionResult({ removed = {}, replayChildren = 0, preserved = {}, alreadyAbsent = false, noTraceRemaining = false, confirmedGone = false }) {
   const counts = {
     recordedHands: Number(removed.recordedHands) || 0,
     communityGames: Number(removed.communityGames) || 0,
     analysisReports: Number(removed.analysisReports) || 0,
     decisionTraces: Number(removed.decisionTraces) || 0,
-    tournamentAttempts: Number(removed.tournamentAttempts) || 0
+    tournamentAttempts: Number(removed.tournamentAttempts) || 0,
+    replayAttempts: Number(removed.replayAttempts) || 0
   };
+  // Reported, never deleted — see COACH_FLAG_TABLE. A zero here means the game had no flags; a non-zero
+  // means the administrator should expect a flag pointing at a game that is now gone.
+  const kept = { coachFeedbackFlags: Number(preserved.coachFeedbackFlags) || 0 };
   return {
     http: 200,
     body: {
@@ -199,6 +227,7 @@ function deletionResult({ removed = {}, replayChildren = 0, alreadyAbsent = fals
         alreadyAbsent: alreadyAbsent === true,
         noTraceRemaining: noTraceRemaining === true,
         removed: counts,
+        preserved: kept,
         replayChildren: Number(replayChildren) || 0
       }
     }
@@ -221,6 +250,8 @@ function auditRecord({ adminUserId, gameId, result }) {
 module.exports = {
   GAME_TABLES,
   GAME_COLUMNS,
+  COACH_FLAG_TABLE,
+  COACH_FLAGS_DISPOSITION,
   SWEEP_STEPS,
   REFUSALS,
   isCanonicalGameId,

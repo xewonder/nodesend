@@ -224,3 +224,142 @@ cost in test code.
 **Status:** the authorization bypass on the deletion *workflow* is closed. `DELETE /games/:id` is now the
 only way to remove a game completely, no player can delete another player's game through the relay, and
 the two legitimate player workflows are pinned by tests as still working.
+
+---
+
+# PART 3 — storage readiness: identity, permissions, cascade completeness
+
+## 1. Which identity actually deletes (verified in code, not assumed)
+
+`clubs/ncbAccountClient.js` → `authenticatedRequest()` calls `rawFetch(url, { method, body, bearer: token })`,
+where `token` is obtained from `/auth/sign-in/email` using `CLUB_NCB_EMAIL` / `CLUB_NCB_PASSWORD`, and the
+session identity is pinned by `CLUB_NCB_EXPECTED_USER_ID` (identity mismatch ⇒ refusal). So:
+
+- **The deleting identity is the dedicated club service account's own NCB session** — the same account Clubs
+  and Tournaments use. One credential pool, one sign-in, one cooldown. The caller's bearer never touches
+  storage on this path (arm-proved in Part 1: `7g`/`T2`).
+- It is **not** an administrative identity. NCB exposes no admin bypass through this API: the route surface is
+  `path + Instance + bearer` with no caller-type discriminator, so the account can be no more privileged than
+  an ordinary NCB session holding the same table grants.
+- It is **not** a row owner for the rows this cascade deletes. `recorded_hands` and `community_games` rows were
+  created by *players'* sessions, so under NCB's ownership stamping (`user_id` is auto-stamped from the
+  writing session) the service account is a stranger to those rows.
+- Under `private` RLS the same property is what makes the account able to read `system_admins` rows it wrote
+  (Part 1) — and equally unable to assume ownership of rows it did not write.
+
+Read-back after each delete uses the same account and the same equality filters, so **read-back capability is
+the same open question as delete capability** — not an independent assumption.
+
+## 2. Does `community_games` = `shared_read` block it? **Unproven, and the obvious evidence is void**
+
+Two facts make this the binding unknown, and one of them removes what looked like proof:
+
+1. `recordedHandsService.js:1506` performs the player-side community delete as
+   `dataFetch(...).catch(() => {})` — **the error is swallowed**. So "players unpublish today, therefore
+   DELETE on `community_games` is permitted" does not follow: a denied delete would look like a successful
+   unpublish to the UI. The only production signal we thought we had is not a signal.
+2. If `shared_read` is accurate, non-owner writes are refused, and the service account is a non-owner — so
+   step 4 of the sweep fails and the whole deletion correctly answers **502/503 with the canonical row
+   intact** (fail-closed, verified by plants in Parts 1–2). The feature would then be a no-op in production
+   rather than a data hazard.
+
+Consequence for the release decision: **the route is safe to deploy but cannot be assumed to work.** Nothing
+about `shared_read` needs to change, and per §2 of the brief it must not be broadened to `shared_readwrite`
+to make deletion "succeed" — that would hand destructive power over other players' publications to ordinary
+sessions, which is the exact hole Part 2 closed.
+
+The narrowly scoped alternatives, in preference order, all requiring separate authorization:
+
+- **A. Grant the dedicated account a scoped delete privilege** on the game tables (`recorded_hands`,
+  `community_games`, `game_analysis_reports`, `ai_decision_traces`, `tournament_attempts`, `replay_attempts`)
+  at the vendor — no RLS class change, no player-facing widening. Preferred.
+- **B. A vendor-side cascade executed by an already-privileged channel** (NCB MCP) with NodeSend issuing one
+  audited request per game — only if A is unavailable.
+- **C. Ownership transfer before delete** — rejected: NCB's `UPDATE` of `user_id` moves row ownership
+  (measured 2026-11-17), so "transferring" a row to the service account to delete it is a silent ownership
+  rewrite of a player's data, and it mutates the very column the deletion is supposed to be neutral about.
+
+## 3. Cascade completeness — three real gaps found and fixed
+
+Auditing the implemented sweep against the live column list (not the handoff prose) found that my own
+implementation was incomplete:
+
+| Dependency | Before | Now |
+|---|---|---|
+| `replay_attempts.recorded_hand_id` / `.root_hand_id` | **table absent from the sweep entirely** | swept by both columns; `removed.replayAttempts` reported |
+| `recorded_hands.parent_hand_id` | children found by `root_hand_id` **only** | children found by both columns, deduplicated by row id |
+| `coach_feedback_flags.hand_id` / `.root_hand_id` | unaccounted for | **preserved and reported** as `preserved.coachFeedbackFlags`; never deleted |
+
+- `parent_hand_id` matters concretely: `root_hand_id` names the chain's *first* row while `parent_hand_id`
+  names the previous one (`App.jsx: const rootId = hand.rootHandId ?? hand.id`). Deleting a game that is
+  itself a replay therefore left a child whose parent no longer existed — precisely the dangling reference
+  the brief forbids. Arm `D2` reproduces it with a mid-chain child.
+- Coach flags are **not** deletion dependencies. They are another person's work product about a game;
+  deleting them would destroy a coach's record behind an admin's click, and nulling their reference would
+  be provenance damage again. They are counted so the outcome is visible, and `D3`/`D3b` fail if anything
+  ever issues a delete against that table.
+- `countCoachFlags` initially double-counted a flag carrying the same value in both columns; the gate caught
+  it by asserting an exact number rather than "non-zero", and it now deduplicates by row id.
+
+## 4. Verification
+
+`verify-game-deletion.mjs` **50/50** (was 42; +8 arms: `D1`, `D2`, `D3`, `D3b`, `D4`, `D4b`, `16d`, `16e`).
+Six new plants, **all detected**: chain-root-only attempt not swept → 2 red; `parent_hand_id` discovery
+removed → 3 red; coach flags swept → 2 red; flag count not deduplicated → 1 red; absence-probe ignoring
+`replay_attempts` → 1 red; `replay_attempts` dropped from the inventory → the gate refuses to produce a
+report (loud, though less diagnosable than `D4`'s assertion).
+
+Two of these arms were **masked** at first and had to be rewritten: `16d` initially left the other satellite
+tables populated, so an unrelated probe satisfied it and plant R5 stayed green; and `R3` was first written as
+an inert edit that changed no bytes. Both failures are recorded here because a plant that cannot fail is not
+a control.
+
+Full regression at the final state — **1,550 arms, 0 failures**: game deletion 50 · relay bypass 20 · NCB
+gateway 132 · NCB integration 98 · clubs 287 · tournaments 221 · tournaments integration 24 · import-failure
+65 · session quota 407 · invitation reservations 50 · invitation-code rule 57 · decision-key 48 · system-AI
+32 · trickster 21 · sign-in guardrails 8.
+
+## 5. Disposable-data verification plan (owner-executed; nothing here was run)
+
+**Where:** a staging database with the same schema *and the same RLS classes*, never production, and never the
+13 recorded games / 2 community rows / 6 reports / 271 traces / 1 attempt / 1 flag that exist today.
+
+**Setup (one disposable owner):** create disposable NCB accounts `qa-owner` and `qa-other`; through the
+existing relay with each account's own session, create: 1 `recorded_hands` (owner A) with 2 replay children
+(one `root_hand_id`-linked, one **`parent_hand_id`-only**), 2 `community_games` (one keyed by
+`source_hand_id`, one by `root_hand_id`), 1 `game_analysis_reports`, 2 `ai_decision_traces` (one
+`recorded_hand_id = game`, one **`recorded_hand_id = NULL` flag snapshot**), 1 `replay_attempts` keyed only
+by `root_hand_id`, 1 `tournament_attempts` on a disposable tournament, and 1 `coach_feedback_flags` for a
+disposable `qa-other` game (must survive).
+
+**Steps and expected results** — one paste-able command per step, run against the deployed NodeSend with the
+operator's own session:
+
+1. As `qa-other` (ordinary player): `DELETE /ncb/data/delete/recorded_hands/<A's id>` → expect **403
+   `not_record_owner`**, row still present. *Fails if Part 2 regressed.*
+2. As a System Admin: `DELETE /games/<A's id>` → expect **200** `deleted:true`, and
+   `removed = {recordedHands:4, communityGames:2, analysisReports:1, decisionTraces:1, tournamentAttempts:1,
+   replayAttempts:2}`, `preserved.coachFeedbackFlags:1`, `replayChildren:3`.
+   **If this answers 502/503 naming `club_account_forbidden` or `game_delete_unconfirmed` at the
+   `communityGames` step, §2 is answered: the dedicated account cannot delete, and option A is required.**
+3. Read back through existing routes only: `GET /games/<id>` → 404; the owner's `GET /tournaments` and the
+   community/My Games lists no longer return the game; the flag-snapshot trace and `qa-other`'s flag are
+   still present.
+4. Repeat step 2 → **200 `alreadyAbsent:true`**, zero new writes.
+5. Statistics: confirm the owner's standing drops by exactly the deleted publication and no other row changed.
+6. Stop conditions: any 503 naming the club account, any `BUT THE DRAFT HEADER REMAINS`, any deletion of a row
+   not in the disposable set → **STOP**, keep the canonical row as the recovery marker, and report.
+
+If staging cannot reproduce the vendor's RLS classes, this plan proves *code paths* only, and §2's permission
+question stays open until resolved with Questera — a staging environment with different grants would give a
+false GO.
+
+## 6. GO / NO-GO
+
+**NO-GO for release to players** as of this commit: the deletion cannot be assumed to reach `community_games`,
+and the one piece of evidence that suggested it could (player unpublish works) is void because the frontend
+swallows that error.
+
+**GO for integration**: merge and deploy behind the existing System-Admin-only surface, then run §5 on
+disposable staging rows. Step 2 of that plan is the actual capability test, and it is read-only with respect
+to real data. Do not broaden `community_games` beyond `shared_read` to make it pass; escalate to option A.

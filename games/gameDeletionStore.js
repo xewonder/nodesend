@@ -20,7 +20,7 @@
  *      request, because an unfiltered delete on a shared table is a bulk deletion wearing a filter.
  */
 
-const { GAME_TABLES, GAME_COLUMNS, exactRowOps } = require('./gameDeletion.js');
+const { GAME_TABLES, GAME_COLUMNS, COACH_FLAG_TABLE, exactRowOps } = require('./gameDeletion.js');
 
 const READ = (table, query) => ({ group: 'data', path: `read/${table}${query ? `?${query}` : ''}`, method: 'GET' });
 const REMOVE = (table, id) => ({ group: 'data', path: `delete/${table}/${encodeURIComponent(id)}`, method: 'DELETE' });
@@ -101,6 +101,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
 
   const C = GAME_COLUMNS;
   const T = GAME_TABLES;
+  const COACH = COACH_FLAG_TABLE;
 
   async function findCanonical(gameId) {
     const found = await findBy(T.recordedHands, C.recordedHands.id, gameId);
@@ -108,20 +109,59 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { row: found.rows[0] ?? null };
   }
 
+  /*
+   * Children are rows that reference this game by EITHER chain column, deduplicated by row id.
+   * Searching only `root_hand_id` is the bug this comment exists to prevent: root_hand_id points at the
+   * chain's FIRST row, while parent_hand_id points at the previous one. So when the game being deleted is
+   * itself a replay (root_hand_id = some older row), its child has parent_hand_id = this id and
+   * root_hand_id = that older row — invisible to a root-only search, and left dangling by the sweep.
+   */
   async function findChildren(gameId) {
-    const found = await findBy(T.recordedHands, C.recordedHands.rootHandId, gameId);
-    if (found.storeFailure) return found;
-    // The canonical row itself has root_hand_id NULL, so it cannot appear here; if a deployment stores
-    // it differently, drop any self-reference rather than deleting the canonical row as a "child".
-    return { rows: found.rows.filter((row) => eq(row[C.recordedHands.id]) !== eq(gameId)) };
+    const byId = new Map();
+    for (const column of [C.recordedHands.rootHandId, C.recordedHands.parentHandId]) {
+      const found = await findBy(T.recordedHands, column, gameId);
+      if (found.storeFailure) return found;
+      for (const row of found.rows) {
+        const rowId = eq(row[C.recordedHands.id]);
+        // A row that IS the canonical game can never be its own child; dropping any self-reference keeps
+        // a weird stored value from turning the canonical row into a "descendant".
+        if (rowId !== '' && rowId !== eq(gameId) && !byId.has(rowId)) byId.set(rowId, row);
+      }
+    }
+    return { rows: [...byId.values()] };
+  }
+
+  /**
+   * Coach flags that reference this chain — counted and reported, never deleted (see rules module).
+   * Deduplicated by row id: a flag typically carries the SAME value in hand_id and root_hand_id, so
+   * summing per-column hits would report one flag twice. That is the same trap the community publication
+   * sweep avoids, and the gate caught it here by asserting an exact count rather than a non-zero one.
+   */
+  async function countCoachFlags(ids) {
+    const seen = new Set();
+    for (const column of [COACH.handId, COACH.rootHandId]) {
+      for (const id of ids) {
+        const found = await findBy(COACH.table, column, id);
+        if (found.storeFailure) return { unavailable: true, count: seen.size };   // unknown, never a confident 0
+        for (const row of found.rows) {
+          const rowId = eq(row?.id);
+          if (rowId !== '') seen.add(rowId);
+        }
+      }
+    }
+    return { count: seen.size };
   }
 
   /** Satellite count without deleting — used to tell "already swept" from "never existed". */
   async function countSatellites(ids) {
+    // Every table the sweep touches is probed, or a game that still has a satellite row could be
+    // reported as "no trace remaining" — the one claim this function exists to make honestly.
     const probes = [
       [T.tournamentAttempts, C.tournamentAttempts.recordedHandId],
       [T.decisionTraces, C.decisionTraces.recordedHandId],
-      [T.analysisReports, C.analysisReports.recordedHandId]
+      [T.analysisReports, C.analysisReports.recordedHandId],
+      [T.replayAttempts, C.replayAttempts.recordedHandId],
+      [T.replayAttempts, C.replayAttempts.rootHandId]
     ];
     let total = 0;
     for (const [table, column] of probes) {
@@ -141,23 +181,39 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
    */
   async function execute({ canonicalId, replayChildIds }) {
     const ids = [canonicalId, ...replayChildIds];
-    const removed = { recordedHands: 0, communityGames: 0, analysisReports: 0, decisionTraces: 0, tournamentAttempts: 0 };
+    const removed = { recordedHands: 0, communityGames: 0, analysisReports: 0, decisionTraces: 0, tournamentAttempts: 0, replayAttempts: 0 };
 
-    // 1-3: satellites keyed to any id in scope, by exact equality, one table at a time.
-    for (const [key, table, column] of [
-      ['tournamentAttempts', T.tournamentAttempts, C.tournamentAttempts.recordedHandId],
-      ['decisionTraces', T.decisionTraces, C.decisionTraces.recordedHandId],
-      ['analysisReports', T.analysisReports, C.analysisReports.recordedHandId]
+    // 1-4: satellites keyed to any id in scope, by exact equality, one table at a time. Tables that carry
+    // BOTH a direct and a chain reference (traces, replay attempts) are swept by each, because a row that
+    // names only the chain root still describes a game that is about to stop existing.
+    for (const [key, table, columns] of [
+      ['tournamentAttempts', T.tournamentAttempts, [C.tournamentAttempts.recordedHandId]],
+      ['decisionTraces', T.decisionTraces, [C.decisionTraces.recordedHandId]],
+      ['analysisReports', T.analysisReports, [C.analysisReports.recordedHandId]],
+      ['replayAttempts', T.replayAttempts, [C.replayAttempts.recordedHandId, C.replayAttempts.rootHandId]]
     ]) {
-      for (const id of ids) {
+      for (const column of columns) {
+        await sweepTable({ key, table, column, ids, removed });
+        if (removed.__failure) break;
+      }
+      if (removed.__failure) break;
+    }
+    if (removed.__failure) {
+      const failure = removed.__failure;
+      delete removed.__failure;
+      return { failure, removedSoFar: removed };
+    }
+
+    async function sweepTable({ key, table, column, ids: targetIds, removed: tally }) {
+      for (const id of targetIds) {
         const found = await findBy(table, column, id);
-        if (found.storeFailure) return { failure: { ...found, step: key, removedSoFar: { ...removed } } };
+        if (found.storeFailure) { tally.__failure = { ...found, step: key, removedSoFar: { ...tally } }; return; }
         if (found.rows.length === 0) continue;
         // Only rows whose column really equals this id are deleted (`findBy` already re-asserted it), so
         // a trace whose recorded_hand_id is NULL can never be reached from here.
         const done = await removeRows({ table, column, value: id, rows: found.rows });
-        if (done.storeFailure) return { failure: { ...done, step: key, removedSoFar: { ...removed } } };
-        removed[key] += done.removed;
+        if (done.storeFailure) { tally.__failure = { ...done, step: key, removedSoFar: { ...tally } }; return; }
+        tally[key] += done.removed;
       }
     }
 
@@ -230,7 +286,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { count };
   }
 
-  return { findCanonical, findChildren, countSatellites, execute, readBackPublications };
+  return { findCanonical, findChildren, countSatellites, countCoachFlags, execute, readBackPublications };
 }
 
 module.exports = { createGameDeletionStore, rowsOf, MAX_ROWS_PER_TABLE };

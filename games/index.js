@@ -163,9 +163,18 @@ function buildGameDeletionMount({
       return reply(res, { http, body: { status: 'error', error: { code, message: `Nothing was reported as deleted. ${detail}` } } });
     }
 
+    /* Coach flags are counted AFTER the sweep so the number describes what is actually left pointing at
+     * a deleted game. An unreadable count is reported as `unavailable`, never as a confident 0: an
+     * administrator reading "0 flags" when the read failed would draw the opposite conclusion from the
+     * truth, which is the refused-vs-empty failure this codebase already refuses to make twice. */
+    const flagged = typeof store.countCoachFlags === 'function'
+      ? await store.countCoachFlags([plan.canonicalId, ...plan.replayChildIds])
+      : { count: 0, unavailable: true };
     const answer = deletionResult({
       removed: executed.result.removed,
       replayChildren: executed.result.replayChildren,
+      // A failed count is reported as unknown (null), never as a confident 0.
+      preserved: { coachFeedbackFlags: flagged?.unavailable ? null : (flagged?.count ?? 0) },
       alreadyAbsent: false,
       confirmedGone: true
     });
