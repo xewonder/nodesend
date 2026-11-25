@@ -33,17 +33,30 @@ const REMOVE = (table, id) => ({ group: 'data', path: `delete/${table}/${encodeU
 const eq = (value) => String(value ?? '').trim();
 const MAX_ROWS_PER_TABLE = 1000;
 
-/** A refusal object, in the shape the mount maps to an HTTP answer. Nothing here throws past a crash. */
-const storeFailure = (reason, detail) => ({ storeFailure: true, reason, detail: eq(detail) });
+/**
+ * A refusal object, in the shape the mount maps to an HTTP answer. Nothing here throws past a crash.
+ *
+ * `storageStatus` is the vendor's HTTP status when one was received, or null when the storage was never
+ * reached. It travels with the failure because the reason name alone cannot separate "NCB answered 403"
+ * from "NCB answered 500" from "the fetch timed out", and those three need three different sentences. The
+ * number is metadata, not record content, so it is safe to log and safe to return.
+ */
+const storeFailure = (reason, detail, storageStatus = null) => ({
+  storeFailure: true,
+  reason: eq(reason) || 'game_store_request_failed',
+  detail: eq(detail),
+  storageStatus: Number.isInteger(Number(storageStatus)) && Number(storageStatus) > 0 ? Number(storageStatus) : null
+});
 
 /**
  * The mid-sweep ownership stop. `partial` is true because other satellites may already be gone: the
  * message must not promise "nothing was deleted" when that is no longer the state, and the mount maps
  * this reason to 409 with the same code the preflight uses.
  */
-const foreignSatelliteFailure = ({ key, blocked }) => ({
+const foreignSatelliteFailure = ({ key, column = null, blocked }) => ({
   ...storeFailure('foreign_satellite_owners', satelliteRefusal(blocked, { partial: true }).message),
   step: key,
+  column,
   // The verdict travels with the failure so the mount can rebuild the same precise message the preflight
   // would have produced — including whether the game's OWN owner is the unreadable part.
   verdict: blocked,
@@ -68,7 +81,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
 
   async function run(spec) {
     const answer = await client.request(spec);
-    if (!answer.ok) return storeFailure(answer.reason || 'game_store_request_failed', answer.detail);
+    if (!answer.ok) return storeFailure(answer.reason || 'game_store_request_failed', answer.detail, answer.httpStatus);
     return { body: answer.body };
   }
 
@@ -79,7 +92,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     const result = await run(READ(table, `${column}=${encodeURIComponent(id)}&limit=${Math.min(rowLimit, MAX_ROWS_PER_TABLE)}${extra}`));
     if (result.storeFailure) return result;
     const rows = rowsOf(result.body);
-    if (rows === null) return storeFailure('game_read_unreadable', `the read of ${table} did not return a row set`);
+    if (rows === null) return { ...storeFailure('game_read_unreadable', `the read of ${table} did not return a row set`), column };
     // Re-assert the filter locally. A backend that ignored the filter would otherwise turn a
     // single-game sweep into a bulk delete, and this route must not be able to do that even by accident.
     const matched = rows.filter((row) => eq(row?.[column]) === id);
@@ -90,17 +103,20 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
   async function removeRows({ table, column, value, rows }) {
     const ids = exactRowOps(rows);
     if (ids.length !== rows.length) {
-      return storeFailure('game_row_id_unusable', `${table} returned a row without an addressable id; nothing was deleted from it`);
+      return { ...storeFailure('game_row_id_unusable', `${table} returned a row without an addressable id; nothing was deleted from it`), column };
     }
     for (const id of ids) {
       const removed = await run(REMOVE(table, id));
-      if (removed.storeFailure) return { ...removed, table };
+      if (removed.storeFailure) return { ...removed, table, column };
     }
     const after = await findBy(table, column, value);
-    if (after.storeFailure) return { ...after, table };
+    if (after.storeFailure) return { ...after, table, column };
     if (after.rows.length > 0) {
-      return storeFailure('game_delete_unconfirmed',
-        `${after.rows.length} row(s) of ${table} are still present after the delete calls; nothing was reported as removed`);
+      return {
+        ...storeFailure('game_delete_unconfirmed',
+          `${after.rows.length} row(s) of ${table} are still present after the delete calls; nothing was reported as removed`),
+        column
+      };
     }
     return { removed: ids.length };
   }
@@ -183,10 +199,13 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
       const table = T[probe.key];
       const column = C[probe.key] && C[probe.key][probe.column];
       if (!table || !column) {
-        return storeFailure('game_read_unreadable', `the deletion inventory declares no column for ${probe.key}.${probe.column}`);
+        return {
+          ...storeFailure('game_read_unreadable', `the deletion inventory declares no column for ${probe.key}.${probe.column}`),
+          step: probe.key, column: eq(probe.column) || null
+        };
       }
       const found = await rowsForAny(table, column, ids);
-      if (found.storeFailure) return found;
+      if (found.storeFailure) return { ...found, step: probe.key };
       const seen = groups[probe.key] || new Map();
       for (const row of found.rows) {
         const rowId = eq(row?.id);
@@ -231,12 +250,15 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     const ids = [canonicalId, ...replayChildIds];
     const removed = { recordedHands: 0, communityGames: 0, analysisReports: 0, decisionTraces: 0, tournamentAttempts: 0, replayAttempts: 0 };
 
-    // 1-4: satellites keyed to any id in scope, by exact equality, one table at a time. Tables that carry
-    // BOTH a direct and a chain reference (traces, replay attempts) are swept by each, because a row that
-    // names only the chain root still describes a game that is about to stop existing.
+    // 1-4: satellites keyed to any id in scope, by exact equality, one PROBE at a time. `SWEEP_PROBES` is
+    // the whole scope declaration and this loop reads nothing else, so a table listed there with two
+    // reference columns (traces, replay attempts) is swept by both — a row that names only the chain root
+    // still describes a game that is about to stop existing. The gate asserts every reference column
+    // `GAME_COLUMNS` declares for a satellite is present in that list, which is what turns "declared but
+    // never probed" from a silent omission into a red arm.
     for (const probe of SWEEP_PROBES) {
       if (probe.key === MULTI_COLUMN_SATELLITE) continue;
-      await sweepTable({ key: probe.key, table: T[probe.key], column: C[probe.key][probe.column], ids, ownerId, removed });
+      await sweepTable({ key: probe.key, probeColumn: probe.column, table: T[probe.key], column: C[probe.key][probe.column], ids, ownerId, removed });
       if (removed.__failure) break;
     }
     if (removed.__failure) {
@@ -245,17 +267,20 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
       return { failure, removedSoFar: removed };
     }
 
-    async function sweepTable({ key, table, column, ids: targetIds, ownerId: owner, removed: tally }) {
+    async function sweepTable({ key, probeColumn = null, table, column, ids: targetIds, ownerId: owner, removed: tally }) {
+      const named = (extra) => ({ ...extra, step: key, probeColumn, removedSoFar: { ...tally } });
       for (const id of targetIds) {
         const found = await findBy(table, column, id);
-        if (found.storeFailure) { tally.__failure = { ...found, step: key, removedSoFar: { ...tally } }; return; }
+        if (found.storeFailure) { tally.__failure = named(found); return; }
         if (found.rows.length === 0) continue;
         // Only rows whose column really equals this id are deleted (`findBy` already re-asserted it), so
-        // a trace whose recorded_hand_id is NULL can never be reached from here.
+        // a trace whose recorded_hand_id is NULL is reached only by the root-hand probe, never by this one.
+        // This is the per-write backstop: a row written between the mount's preflight and this moment is
+        // re-tested here, so a foreign-owned row cannot be deleted even when the audit cleared the set.
         const audit = classifySatellites({ ownerId: owner, groups: { [key]: found.rows } });
-        if (audit.blocked) { tally.__failure = foreignSatelliteFailure({ key, blocked: audit }); return; }
+        if (audit.blocked) { tally.__failure = named(foreignSatelliteFailure({ key, column, blocked: audit })); return; }
         const done = await removeRows({ table, column, value: id, rows: found.rows });
-        if (done.storeFailure) { tally.__failure = { ...done, step: key, removedSoFar: { ...tally } }; return; }
+        if (done.storeFailure) { tally.__failure = named(done); return; }
         tally[key] += done.removed;
       }
     }

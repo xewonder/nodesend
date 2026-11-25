@@ -28,7 +28,7 @@ const { readClubSchemaConfig } = require('../clubs/clubSchema.js');
 const { createGameDeletionStore } = require('./gameDeletionStore.js');
 const {
   isCanonicalGameId, planGameDeletion, deletionResult, REFUSALS, auditRecord, GAME_COLUMNS, GAME_TABLES,
-  sweepTargetIds, checkSatelliteOwnership
+  sweepTargetIds, checkSatelliteOwnership, incompleteDeletion, classifyStoreFailure, failureWhere
 } = require('./gameDeletion.js');
 
 const eq = (value) => String(value ?? '').trim();
@@ -43,20 +43,45 @@ const GAME_DELETION_ROUTES = Object.freeze([
 ]);
 
 /*
- * Two different failures were being collapsed into one 503.
+ * THREE DIFFERENT FAILURES, THREE DIFFERENT SENTENCES.
  *
- * A TRANSPORT failure means the storage was never consulted: retrying later is genuinely the right
- * instruction, and 503 says that. A REFUSED write means the storage answered and said NO — most likely
- * the dedicated account has no delete grant on the table (the open capability question in the release
- * notes). Telling an administrator "the game store could not be reached, try again later" about a
- * permission refusal sends them to wait instead of to fix it, and a retry can never succeed. So the two
- * are separated: transport -> 503 `club_store_unavailable`; refusal/unconfirmed -> 502
- * `game_deletion_incomplete`, whose detail names the step. Both remain retry-safe, because the sweep is
+ * A storage that was never reached (session, transport, configuration, an unreadable read) means retrying
+ * later is the right instruction, and 503 says that. A storage that was reached and ANSWERED — 403 refused,
+ * 5xx error, or a 2xx that removed nothing — means the cascade stopped with rows already gone, and 502
+ * `game_deletion_incomplete` says that. Conflating them is what made an unusable feature look like a
+ * transient one: the deployed build enumerated four transport names, so `club_account_identity_*` (a session
+ * that could not be established, nothing written) fell through to 502, and the refusal copy told the
+ * administrator to "retry the same request to finish the cleanup" about a permission grant that a retry can
+ * never change.
+ *
+ * The classes and their wording live in `gameDeletion.js`, which owns the rules; this file only decides
+ * which step the route was in. Both the response body and the audit record come from the SAME builder, so
+ * the log and the answer cannot disagree. Every class remains retry-safe, because the sweep is
  * satellites-first and the canonical row survives either way.
  */
-const TRANSPORT_REASONS = /^(?:club_account_unreachable|club_account_login_failed|club_account_rejected|club_account_cooling_down|game_store_request_failed|game_read_unreadable|club_store_|club_schema_|club_account_unconfigured)/;
-/** Kept for the pre-sweep checks, where these names still mean "cannot be consulted at all". */
-const UNAVAILABLE_REASONS = /^(?:club_account_|club_store_|game_store_request_failed|game_read_unreadable|club_schema_)/;
+const storeUnreachable = (reason) => classifyStoreFailure(reason) === 'storage_unreachable';
+
+/**
+ * The same answer for a read that failed before the sweep, named by the phase it stopped in. It returns the
+ * fault alongside the reply so the audit record and the API body come from ONE construction — building the
+ * description twice is how a log line and an answer start disagreeing about where the sweep stopped.
+ */
+const readRefusal = (failure, phase) => {
+  const answer = incompleteDeletion({
+    reason: failure.reason,
+    step: phase,
+    column: failure.column ?? null,
+    storageStatus: failure.storageStatus ?? null,
+    detail: failure.detail ?? ''
+  });
+  if (storeUnreachable(failure.reason)) {
+    // A storage that was never consulted keeps the existing, already-mapped 503 sentence; the fault object
+    // still travels so the log says which step never got a request.
+    const refusal = REFUSALS.game_store_unavailable();
+    return { http: refusal.http, body: refusal.body, fault: answer.fault };
+  }
+  return answer;
+};
 
 /**
  * @param {object} options
@@ -102,11 +127,16 @@ function buildGameDeletionMount({
      * refused one — the caller cannot tell whether any row was removed. Same rule `tournaments/` states
      * for `guarded()`. An unexpected fault can never yield `deleted:true`, because success here comes
      * only from a confirmed read-back. */
-    try {
     const gameId = eq(req.params.recordedHandId);
-
-    // 1. session — the existing relay semantics, unchanged.
+    /* Declared outside the try so the catch can still say WHO asked and WHERE it stopped. Without this, an
+     * internal fault answered 502 and logged nothing, so an operator reading the log could not tell a
+     * refused write from a crash — the absence of a line was the only signal. */
     let session = null;
+    /* Which phase the route is in, so a failure — including one that escapes as a throw — can name where
+     * the deletion stopped instead of only that it stopped. Never a row, an account or a value. */
+    let phase = 'validate';
+    try {
+    // 1. session — the existing relay semantics, unchanged.
     try { session = await authenticate(req); } catch { session = { ok: false, status: 503, code: 'session_service_unavailable' }; }
     if (!session || session.ok !== true || eq(session.id) === '') {
       const status = session?.status === 503 ? 503 : 401;
@@ -117,6 +147,7 @@ function buildGameDeletionMount({
 
     // Exact-id only, validated before any storage is touched.
     if (!isCanonicalGameId(gameId)) return reply(res, REFUSALS.invalid_game_id());
+    phase = 'authority';
 
     // 2. system_admins, through the club store's own authority.
     let verdict = null;
@@ -128,12 +159,16 @@ function buildGameDeletionMount({
     }
 
     if (!store) return reply(res, REFUSALS.game_store_unavailable());
+    phase = 'canonicalRead';
 
     // 3. the sweep.
     const canonical = await store.findCanonical(gameId);
     if (canonical.storeFailure) {
-      return reply(res, canonical.reason.match(UNAVAILABLE_REASONS) ? REFUSALS.game_store_unavailable()
-        : REFUSALS.incomplete(canonical.reason));
+      const answer = readRefusal(canonical, phase);
+      if (typeof onAudit === 'function') {
+        onAudit(auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: null, replayChildren: 0 }, fault: answer.fault }));
+      }
+      return reply(res, answer);
     }
 
     if (!canonical.row) {
@@ -147,10 +182,14 @@ function buildGameDeletionMount({
       return reply(res, answer);
     }
 
+    phase = 'childRead';
     const children = await store.findChildren(gameId);
     if (children.storeFailure) {
-      return reply(res, children.reason.match(UNAVAILABLE_REASONS) ? REFUSALS.game_store_unavailable()
-        : REFUSALS.incomplete(children.reason));
+      const answer = readRefusal(children, phase);
+      if (typeof onAudit === 'function') {
+        onAudit(auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: null, replayChildren: 0 }, fault: answer.fault }));
+      }
+      return reply(res, answer);
     }
 
     const plan = planGameDeletion({ gameId, canonical: canonical.row, children: children.rows });
@@ -175,10 +214,17 @@ function buildGameDeletionMount({
      */
     const ownerId = eq(canonical.row[GAME_COLUMNS.recordedHands.userId]);
     if (typeof store.findSatellites !== 'function') return reply(res, REFUSALS.game_store_unavailable());
+    phase = 'satelliteInventory';
     const satellites = await store.findSatellites(sweepTargetIds(plan));
     if (satellites.storeFailure) {
-      return reply(res, satellites.reason.match(UNAVAILABLE_REASONS) ? REFUSALS.game_store_unavailable()
-        : REFUSALS.incomplete(satellites.reason));
+      // The store names the probe it died on when it knows (`decisionTraces`), which is more useful than
+      // the route's phase label, so it wins when present.
+      const where = eq(satellites.step) || phase;
+      const answer = readRefusal(satellites, where);
+      if (typeof onAudit === 'function') {
+        onAudit(auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: null, replayChildren: 0 }, fault: answer.fault }));
+      }
+      return reply(res, answer);
     }
     const ownership = checkSatelliteOwnership({ ownerId, groups: satellites.groups });
     if (ownership.ok !== true) {
@@ -186,6 +232,7 @@ function buildGameDeletionMount({
       return reply(res, { http: r.http, body: { status: 'error', error: { code: r.code, message: r.message } } });
     }
 
+    phase = 'sweep';
     const executed = await store.execute({ canonicalId: plan.canonicalId, replayChildIds: plan.replayChildIds, ownerId });
     if (executed.failure) {
       const f = executed.failure;
@@ -194,25 +241,34 @@ function buildGameDeletionMount({
       // way, and "retry the same request" would be an instruction that can never succeed.
       if (f.reason === 'foreign_satellite_owners') {
         if (typeof onAudit === 'function') {
-          onAudit({ ...auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: f.removedSoFar ?? null, replayChildren: 0 } }), failure: `${f.step || 'sweep'}: foreign_satellite_owners` });
+          onAudit({ ...auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: f.removedSoFar ?? null, replayChildren: 0 } }), failure: `${failureWhere({ step: f.step, column: f.column })}: foreign_satellite_owners` });
         }
         return reply(res, REFUSALS.foreign_satellite_owners(f.verdict ?? f, { partial: true }));
       }
-      // A partial sweep is NEVER a success. The canonical row is still present (steps run satellites
-      // first), so the caller can retry the identical request and finish the job.
-      const code = TRANSPORT_REASONS.test(f.reason || '') ? 'club_store_unavailable' : 'game_deletion_incomplete';
-      const http = code === 'club_store_unavailable' ? 503 : 502;
-      const detail = `${f.step || 'sweep'}: ${eq(f.detail) || eq(f.reason)}`;
+      /* A partial sweep is NEVER a success. The canonical row is still present (steps run satellites
+       * first), so the caller can retry the identical request and finish the job — UNLESS the class says a
+       * retry cannot help (a 403 grant, a row with no id), which is why the class and the storage status
+       * travel into both the answer and the log line instead of being flattened into one instruction. */
+      const answer = incompleteDeletion({
+        reason: f.reason,
+        step: f.step,
+        column: f.column ?? f.probeColumn ?? null,
+        storageStatus: f.storageStatus ?? null,
+        detail: f.detail ?? ''
+      });
+      const where = answer.fault.step;
+      const detail = `${where}: ${eq(f.detail) || eq(f.reason)}`;
       if (typeof onAudit === 'function') {
-        onAudit({ ...auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: f.removedSoFar ?? null, replayChildren: 0 } }), failure: detail });
+        onAudit({ ...auditRecord({ adminUserId: session.id, gameId, result: { deleted: false, alreadyAbsent: false, removed: f.removedSoFar ?? null, replayChildren: 0 }, fault: answer.fault }), failure: detail });
       }
-      return reply(res, { http, body: { status: 'error', error: { code, message: `Nothing was reported as deleted. ${detail}` } } });
+      return reply(res, { http: answer.http, body: answer.body });
     }
 
     /* Coach flags are counted AFTER the sweep so the number describes what is actually left pointing at
      * a deleted game. An unreadable count is reported as `unavailable`, never as a confident 0: an
      * administrator reading "0 flags" when the read failed would draw the opposite conclusion from the
      * truth, which is the refused-vs-empty failure this codebase already refuses to make twice. */
+    phase = 'flagCount';
     const flagged = typeof store.countCoachFlags === 'function'
       ? await store.countCoachFlags([plan.canonicalId, ...plan.replayChildIds])
       : { count: 0, unavailable: true };
@@ -226,13 +282,22 @@ function buildGameDeletionMount({
     });
     if (typeof onAudit === 'function') onAudit(auditRecord({ adminUserId: session.id, gameId, result: answer.body.data }));
     return reply(res, answer);
-    } catch (error) {
-      // Named, non-sensitive, and never a success: an internal fault says the deletion state is unknown
-      // rather than claiming anything about rows. No error text from the vendor is echoed here.
-      return reply(res, {
-        http: 502,
-        body: { status: 'error', error: { code: 'game_deletion_incomplete', message: 'The deletion could not be completed. The game is still recorded; retry the same request.' } }
-      });
+    } catch {
+      /* Named, non-sensitive, and never a success: an internal fault says the deletion state is unknown
+       * rather than claiming anything about rows. No error text from the vendor — and none from the
+       * exception — is echoed here, because either can carry a URL, a bearer or a row value. The phase is
+       * reported so the answer and the log line agree on where it stopped, and the fault IS logged: a
+       * destructive verb whose failure leaves no trace is the diagnostic this route could not offer during
+       * the first production refusal. */
+      const answer = incompleteDeletion({ reason: 'internal_fault', step: phase });
+      if (typeof onAudit === 'function') {
+        onAudit(auditRecord({
+          adminUserId: eq(session?.id), gameId,
+          result: { deleted: false, alreadyAbsent: false, removed: null, replayChildren: 0 },
+          fault: answer.fault
+        }));
+      }
+      return reply(res, { http: answer.http, body: answer.body });
     }
   });
 

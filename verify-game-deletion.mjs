@@ -105,7 +105,11 @@ const GAME = '5001';                      // the canonical game under test, owne
 // `acceptDeleteButKeepRow` is per-TABLE, because a global switch let one lying table hide behind another
 // step's verification: the first negative-control plant found that the satellite read-back proof was
 // never actually under test while the canonical proof was.
-const FAULTS = { failDeleteOf: null, refuseRead: null, keepRowsIn: null };
+// `refuseDeleteWith403` is the OTHER vendor answer, and the one production actually gave: the storage was
+// reached, said NO, and removed nothing. `failDeleteOf` answers 500, which the client classifies as
+// `club_account_request_failed`; a 403 classifies as `club_account_forbidden`. The two must not collapse
+// into one instruction, so the harness needs both knobs.
+const FAULTS = { failDeleteOf: null, refuseRead: null, keepRowsIn: null, refuseDeleteWith403: null };
 // `adminOverride` was declared here and never read; NC4b caught it. Authority is varied by choosing the
 // caller token instead, so no knob is needed.
 let nextRowId = 900;
@@ -181,6 +185,14 @@ globalThis.fetch = async (url, init = {}) => {
     if (FAULTS.failDeleteOf && FAULTS.failDeleteOf.table === table && FAULTS.failDeleteOf.id === String(rowId)) {
       return json({ status: 'failed', error: 'delete refused by the vendor' }, 500);
     }
+    // A permission refusal: the row survives and the vendor says so with a 403. This is the shape the
+    // first production deletion hit, and it must NOT be reported the same way as a transport failure.
+    if (FAULTS.refuseDeleteWith403) {
+      const hit = Array.isArray(FAULTS.refuseDeleteWith403)
+        ? FAULTS.refuseDeleteWith403.includes(table)
+        : FAULTS.refuseDeleteWith403 === true;
+      if (hit) return json({ status: 'error', error: 'you do not have permission to perform this action', message: 'Forbidden' }, 403);
+    }
     const index = list.findIndex((r) => String(r.id) === String(rowId));
     if (index === -1) return json({ status: 'success', data: { id: rowId } });   // idempotent
     const keepThisTable = Array.isArray(FAULTS.keepRowsIn)
@@ -226,6 +238,8 @@ const OWNER_A = '7';
 const OWNER_B = '12';
 const seedGame = ({
   foreignChild = false, communityRoot = false, flagTrace = true,
+  rootTraceOwn = true,              // a chain-root-linked trace owned by the game owner (must be swept)
+  foreignRootTrace = false,         // the same shape owned by another account (must refuse)
   foreignCommunityRoot = false,   // B published A's game: matched via root_hand_id
   foreignCommunitySource = false, // B's publication naming A's game directly as its source
   foreignAttempt = false,         // B consumed a replay attempt on A's chain (replayEligibility.js:117)
@@ -264,7 +278,22 @@ const seedGame = ({
   rows.game_analysis_reports.push({ id: 'r1', recorded_hand_id: GAME, author_user_id: '4', user_id: OWNER_A });
   if (mixedForeign) rows.game_analysis_reports.push({ id: 'rF1', recorded_hand_id: GAME, author_user_id: OWNER_B, user_id: OWNER_B });
   rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, kind: 'game', user_id: OWNER_A });
-  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: '4' });
+  /* Three real trace shapes, each written by a different call site in `aiDecisionTraces.js`, and the
+   * reason all three are seeded is that the deployed sweep could only see one of them:
+   *   t2 — `persistAnalysisTrace` (:134-140) with no chain value: `recorded_hand_id` null AND
+   *        `root_hand_id` null. Nothing in the cascade references this game, so it is OUT OF SCOPE: it
+   *        must survive byte-identically and must never block a deletion. Arm 10.
+   *   t3 — `persistTracesForFlag` (:96-106) writes `recorded_hand_id: null` WITH `root_hand_id` set, and
+   *        the row is owned by whoever was signed in. Same owner here: this is the row the omitted probe
+   *        left behind in production (Game 524's surviving traces), and the root probe must now delete it
+   *        and count it. Arms RT1/RT2.
+   *   t4 — the same flag-snapshot shape owned by ANOTHER account (a coach flagged this chain). Foreign,
+   *        so it fails closed as a refusal rather than being deleted behind the admin's click. Arm RT3.
+   * `kind` is deliberately never consulted by the sweep: it is a browser-supplied field on a table with no
+   * row isolation, so a destructive decision cannot be keyed to it. */
+  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: null, kind: 'flag-snapshot', user_id: '4' });
+  if (rootTraceOwn) rows.ai_decision_traces.push({ id: 't3', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: OWNER_A });
+  if (foreignRootTrace) rows.ai_decision_traces.push({ id: 't4', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: OWNER_B });
   // NodeSend writes the attempt link on the SERVICE ACCOUNT, so its stamped user_id is NOT the player.
   // Resolution must prefer `player_user_id`, or every legitimate deletion refuses.
   rows.tournament_attempts.push({ id: 'a1', tournament_id: 'T1', recorded_hand_id: GAME, player_user_id: OWNER_A, user_id: SERVICE_ID });
@@ -355,7 +384,7 @@ const ok = await del(GAME, 'tok-admin');
 const d = ok.body?.data ?? {};
 check('G1/7-9. System Admin deletion succeeds with the exact per-table counts',
   ok.status === 200 && ok.body?.status === 'success' && d.deleted === true && d.alreadyAbsent === false
-    && d.removed?.tournamentAttempts === 1 && d.removed?.decisionTraces === 1
+    && d.removed?.tournamentAttempts === 1 && d.removed?.decisionTraces === 2
     && d.removed?.analysisReports === 1 && d.removed?.communityGames === 2 && d.removed?.recordedHands === 4
     && d.removed?.replayAttempts === 2,
   `${ok.status} ${JSON.stringify(ok.body).slice(0, 300)}`);
@@ -366,10 +395,20 @@ check('8. the analysis report for the game is gone',
   rows.game_analysis_reports.filter((r) => r.recorded_hand_id === GAME).length === 0, JSON.stringify(rows.game_analysis_reports));
 check('9. the game-associated AI trace is gone',
   !rows.ai_decision_traces.some((t) => t.id === 't1'), JSON.stringify(rows.ai_decision_traces));
-check('10. the unrelated flag-only trace (recorded_hand_id NULL) is PRESERVED byte-identically',
+check('RT1. a trace linked to the chain ONLY through root_hand_id (recorded_hand_id NULL) is swept too',
+  !rows.ai_decision_traces.some((t) => t.id === 't3')
+    && calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't3'),
+  `traces=${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))} deletes=${JSON.stringify(calls.deletes.filter((c) => c.table === 'ai_decision_traces'))}`);
+check('RT1b. and the recorded-hand probe alone never reaches it: the delete ledger shows one call per row, not one per matching column',
+  calls.deletes.filter((c) => c.table === 'ai_decision_traces').map((c) => c.id).sort().join(',') === 't1,t3',
+  JSON.stringify(calls.deletes.filter((c) => c.table === 'ai_decision_traces')));
+check('10. the genuinely unlinked flag snapshot (no recorded_hand_id, no root_hand_id) is PRESERVED byte-identically',
   JSON.stringify(rows.ai_decision_traces.filter((t) => t.id === 't2')) === before.flagTrace
     && !calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't2'),
   JSON.stringify(rows.ai_decision_traces));
+check('RT4. and it never blocks the deletion either: out-of-scope data is not an ownership problem',
+  ok.status === 200 && d.deleted === true && rows.ai_decision_traces.some((t) => t.id === 't2'),
+  `${ok.status} ${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))}`);
 check('11. the tournament attempt LINK is removed while the tournament and its boards are untouched',
   !rows.tournament_attempts.some((a) => a.id === 'a1') && snapshot('tournaments') === before.tournament
     && snapshot('tournament_boards') === before.boards && JSON.stringify(rows.tournament_attempts.filter((a) => a.id === 'a2')) === before.otherAttempts,
@@ -402,6 +441,19 @@ check('13. no dangling root reference survives the sweep',
   rows.recorded_hands.every((r) => r.root_hand_id !== GAME)
     && rows.community_games.every((c) => c.root_hand_id !== GAME && c.source_hand_id !== GAME),
   JSON.stringify(rows.recorded_hands.map((r) => [r.id, r.root_hand_id])));
+/* The cascade-complete proof, across EVERY column the inventory declares rather than the ones that happen
+ * to be convenient: a surviving row naming the deleted game in either reference column is a dangling
+ * reference, and the deployed build left exactly this behind while answering `deleted: true`. This arm is
+ * the negative control for the root-hand trace probe — removing the probe makes t3 survive and reddens it
+ * (and reddens RT1/RT1b/G1 for the same reason). */
+check('RT2. nothing in any cascade table still names the deleted game in either reference column',
+  ['recorded_hands', 'community_games', 'game_analysis_reports', 'ai_decision_traces', 'tournament_attempts', 'replay_attempts']
+    .every((table) => (rows[table] ?? []).every((row) => row.recorded_hand_id !== GAME && row.root_hand_id !== GAME
+      && row.source_hand_id !== GAME && row.hand_id !== GAME && row.parent_hand_id !== GAME)),
+  JSON.stringify(Object.fromEntries(Object.keys(rows).map((t) => [t, (rows[t] ?? []).map((r) => [r.id, r.recorded_hand_id, r.root_hand_id])]))));
+check('RT2b. and the route itself proves absence on every cascade column: countSatellites sees the root-linked survivor',
+  rules.SWEEP_PROBES.filter((p) => p.key === 'decisionTraces').map((p) => p.column).sort().join(',') === 'recordedHandId,rootHandId',
+  JSON.stringify(rules.SWEEP_PROBES));
 check('15. another player\u2019s recorded game is byte-identical and was never addressed by a delete call',
   JSON.stringify(rows.recorded_hands.filter((r) => r.id === '7777')) === before.otherPlayersGame
     && !calls.deletes.some((c) => c.id === '7777'), JSON.stringify(calls.deletes));
@@ -534,7 +586,8 @@ const AUDIT_TABLES = Object.keys(rows).filter((k) => !['system_admins', 'clubs',
 const snapshotAll = () => AUDIT_TABLES.map((t) => `${t}=${snapshot(t)}`).join('|');
 const idFree = (body) => {
   const text = JSON.stringify(body ?? {});
-  return !['cF1', 'cF2', 'cU1', 'rF1', 'raF1', 'raF2', 'aS1', 'community_games', 'replay_attempts', OWNER_B].some((leak) => text.includes(leak));
+  return !['cF1', 'cF2', 'cU1', 'rF1', 'raF1', 'raF2', 'aS1', 't4', 'community_games', 'replay_attempts',
+    'ai_decision_traces', 'game_analysis_reports', 'tournament_attempts', OWNER_B].some((leak) => text.includes(leak));
 };
 
 seedGame({ foreignCommunityRoot: true });
@@ -622,6 +675,183 @@ check('F8. the refusal is actionable: once the satellite belongs to the game own
     && fRepaired.body?.data?.removed?.communityGames === 3
     && !rows.recorded_hands.some((r) => r.id === GAME),
   `${fBlocked.status} then ${fRepaired.status} ${JSON.stringify(fRepaired.body).slice(0, 200)}`);
+
+/* ── RT3: the root-linked trace, foreign-owned ──────────────────────────────────────────────────
+ * `persistTracesForFlag` (aiDecisionTraces.js:96-106) writes `recorded_hand_id: null` with
+ * `root_hand_id` set and `user_id` from the SIGNED-IN session, so a coach who flagged a board on
+ * somebody else's chain leaves a trace row that references the chain and belongs to someone else.
+ * Once the root column is probed, that row is in scope — and a reference match is not an ownership
+ * claim, so it must refuse the whole deletion rather than be destroyed behind an admin's click.
+ * This is the counterpart to RT1: the same column that recovers the game owner's own residue also
+ * surfaces the foreign residue, and the sweep must not quietly pick the difference.
+ */
+seedGame({ foreignRootTrace: true });
+worldBefore = snapshotAll();
+const fRootTrace = await del(GAME, 'tok-admin');
+check('RT3. a chain-root-linked trace owned by ANOTHER account refuses the whole deletion and writes nothing',
+  fRootTrace.status === 409 && fRootTrace.body?.error?.code === 'foreign_satellite_owners'
+    && calls.deletes.length === 0 && snapshotAll() === worldBefore
+    && rows.ai_decision_traces.some((t) => t.id === 't4' && t.user_id === OWNER_B),
+  `${fRootTrace.status} ${JSON.stringify(fRootTrace.body).slice(0, 200)} deletes=${calls.deletes.length}`);
+check('RT3b. and the refusal is shaped like the other ownership refusals: a count, no table, no id, no account',
+  /^1 record\(s\) belong to another account/.test(String(fRootTrace.body?.error?.message ?? '')) && idFree(fRootTrace.body),
+  JSON.stringify(fRootTrace.body).slice(0, 200));
+seedGame({ foreignRootTrace: true });
+const repairableTrace = rows.ai_decision_traces.find((t) => t.id === 't4');
+repairableTrace.user_id = OWNER_A;
+const fRootTraceRepaired = await del(GAME, 'tok-admin');
+check('RT3c. the refusal is actionable: re-owning that trace lets the SAME request complete and sweep it',
+  fRootTraceRepaired.status === 200 && fRootTraceRepaired.body?.data?.deleted === true
+    && !rows.ai_decision_traces.some((t) => ['t1', 't3', 't4'].includes(t.id)),
+  `${fRootTraceRepaired.status} ${JSON.stringify(fRootTraceRepaired.body).slice(0, 200)}`);
+
+/* ── RT5: resuming the production state (Game 524's residue) ─────────────────────────────────────
+ * The exact shape the first live deletion left behind: the replay child and the tournament link are
+ * ALREADY gone, the canonical game and a set of root-linked traces survive. A retry must sweep the
+ * residue, report the residue (not the original scope), and issue no write for a row that is absent.
+ */
+seedGame({ communityRoot: true });
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === '5002'), 1);
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === '5003'), 1);
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === '5099'), 1);
+rows.tournament_attempts.splice(rows.tournament_attempts.findIndex((a) => a.id === 'a1'), 1);
+rows.ai_decision_traces.splice(rows.ai_decision_traces.findIndex((t) => t.id === 't1'), 1);
+calls.deletes.length = 0;
+const resumed = await del(GAME, 'tok-admin');
+check('RT5. a deletion resumed after a partial sweep completes, and counts only what it actually removed',
+  resumed.status === 200 && resumed.body?.data?.deleted === true
+    && resumed.body?.data?.removed?.tournamentAttempts === 0
+    && resumed.body?.data?.removed?.recordedHands === 1
+    && resumed.body?.data?.removed?.decisionTraces === 1
+    && resumed.body?.data?.replayChildren === 0,
+  `${resumed.status} ${JSON.stringify(resumed.body).slice(0, 260)}`);
+check('RT5b. and it never issues a delete for a row that is already absent: one call per surviving row',
+  calls.deletes.map((c) => `${c.table}/${c.id}`).sort().join(',') === 'ai_decision_traces/t3,community_games/c1,community_games/c2,game_analysis_reports/r1,recorded_hands/5001,replay_attempts/ra1,replay_attempts/ra2',
+  JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`).sort()));
+check('RT5c. the resumed run still leaves the unlinked snapshot and the other player\u2019s game untouched',
+  rows.ai_decision_traces.some((t) => t.id === 't2') && rows.recorded_hands.some((r) => r.id === '7777')
+    && rows.coach_feedback_flags.length === 2,
+  `traces=${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))}`);
+
+/* ── RT6/RT7: what the storage ANSWERED, told apart ─────────────────────────────────────────────
+ * Three different failures, three different instructions. A 403 means the account cannot do this and
+ * retrying is a circle; a 2xx that removed nothing means the write was acknowledged but not applied;
+ * a session/transport failure (RT8) means nothing was reached at all. Collapsing them is what made the
+ * production 502 unreadable.
+ */
+seedGame({ communityRoot: true });
+worldBefore = snapshotAll();
+FAULTS.refuseDeleteWith403 = ['ai_decision_traces'];
+const refused403 = await del(GAME, 'tok-admin');
+FAULTS.refuseDeleteWith403 = null;
+const traces403 = rows.ai_decision_traces.filter((t) => ['t1', 't3'].includes(t.id)).map((t) => t.id);
+check('RT6. a vendor HTTP 403 on a cascade delete answers 502 game_deletion_incomplete, never 503',
+  refused403.status === 502 && refused403.body?.error?.code === 'game_deletion_incomplete'
+    && refused403.body?.data === undefined,
+  `${refused403.status} ${JSON.stringify(refused403.body).slice(0, 200)}`);
+check('RT6b. and it names the step, the column and the storage status in machine-readable form',
+  refused403.body?.error?.detail?.class === 'authorization_refused'
+    && refused403.body?.error?.detail?.reason === 'club_account_forbidden'
+    && refused403.body?.error?.detail?.storageStatus === 403
+    && refused403.body?.error?.detail?.retryable === false
+    && /^decisionTraces\.(recorded_hand_id|root_hand_id)$/.test(String(refused403.body?.error?.detail?.step ?? '')),
+  JSON.stringify(refused403.body?.error?.detail ?? null));
+check('RT6c. the sentence says a retry cannot help, instead of telling the admin to retry it',
+  /refused the delete at decisionTraces/.test(String(refused403.body?.error?.message ?? ''))
+    && /cannot succeed until the service account is granted delete/.test(String(refused403.body?.error?.message ?? ''))
+    && !/retry the same request/.test(String(refused403.body?.error?.message ?? '')),
+  String(refused403.body?.error?.message ?? '').slice(0, 240));
+check('RT6d. the refused rows survive, the canonical row survives, and the earlier successes are not re-issued',
+  traces403.length === 2 && rows.recorded_hands.some((r) => r.id === GAME)
+    && !rows.tournament_attempts.some((a) => a.id === 'a1')
+    && calls.deletes.filter((c) => c.id === 'a1').length === 1,
+  `traces=${JSON.stringify(traces403)} deletes=${JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`))}`);
+check('RT6e. a 403 leaks no credential, bearer or row content into the answer',
+  !JSON.stringify(refused403.body).includes(SERVICE_TOKEN) && !JSON.stringify(refused403.body).includes(SERVICE_EMAIL)
+    && !JSON.stringify(refused403.body).includes(PASSWORD) && !JSON.stringify(refused403.body).includes('{"private":"cards"}'),
+  JSON.stringify(refused403.body).slice(0, 200));
+
+// A 403 on the canonical row specifically: the worst case, because the satellites are already gone. Seeded
+// without replay children so the first `recorded_hands` write IS the canonical row — with a child present
+// the stop would name `replayChildren`, which is a different (and separately correct) answer.
+seedGame({ communityRoot: true, noChildren: true });
+FAULTS.refuseDeleteWith403 = ['recorded_hands'];
+const refusedCanonical = await del(GAME, 'tok-admin');
+FAULTS.refuseDeleteWith403 = null;
+check('RT6f. a 403 on the canonical row names that step and admits the partial sweep is not restorable',
+  refusedCanonical.status === 502 && refusedCanonical.body?.error?.detail?.step === 'recordedHand'
+    && /Records already removed are not restorable/.test(String(refusedCanonical.body?.error?.message ?? ''))
+    && rows.recorded_hands.some((r) => r.id === GAME),
+  JSON.stringify(refusedCanonical.body).slice(0, 240));
+check('RT6g. and every satellite it did remove stayed removed: the answer describes residue, not a rollback',
+  calls.deletes.filter((c) => c.table === 'recorded_hands').length === 1
+    && !rows.community_games.some((c) => c.id === 'c1') && !rows.game_analysis_reports.some((r) => r.id === 'r1'),
+  JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`)));
+
+// A 2xx that removed nothing, on the table production actually failed on.
+seedGame({ communityRoot: true });
+FAULTS.keepRowsIn = ['ai_decision_traces'];
+const lyingTraces = await del(GAME, 'tok-admin');
+FAULTS.keepRowsIn = null;
+check('RT7. a DELETE acknowledged with 2xx that leaves the trace row is refused as write_not_applied',
+  lyingTraces.status === 502 && lyingTraces.body?.error?.code === 'game_deletion_incomplete'
+    && lyingTraces.body?.error?.detail?.class === 'write_not_applied'
+    && lyingTraces.body?.error?.detail?.reason === 'game_delete_unconfirmed'
+    && lyingTraces.body?.data === undefined
+    && rows.ai_decision_traces.some((t) => t.id === 't1'),
+  JSON.stringify(lyingTraces.body).slice(0, 240));
+check('RT7b. and no trace count is reported, because an acknowledged call is not a removed row',
+  String(JSON.stringify(lyingTraces.body?.error?.message ?? '')).includes('still present')
+    && lyingTraces.body?.data === undefined,
+  JSON.stringify(lyingTraces.body).slice(0, 200));
+
+/* ── RT9 / RT10: the proof list and the sweep list cannot disagree ─────────────────────────────── */
+seedGame({ communityRoot: true });
+rows.recorded_hands.splice(rows.recorded_hands.findIndex((r) => r.id === GAME), 1);
+// Every OTHER satellite table is emptied first. A version of this arm that left the publications in place
+// would be satisfied (here: falsified) by an unrelated probe, so a build blind to the root column could
+// still claim clean absence — the masked-assertion failure already measured on arm 16d. With this setup
+// ONLY a root-linked trace can make the answer false, and only a truly empty set can make it true.
+rows.community_games.length = 0;
+rows.game_analysis_reports.length = 0;
+rows.tournament_attempts.length = 0;
+rows.replay_attempts.length = 0;
+rows.ai_decision_traces.splice(0, rows.ai_decision_traces.length,
+  ...rows.ai_decision_traces.filter((t) => ['t2', 't3'].includes(t.id)));
+const survivorLook = await del(GAME, 'tok-admin');
+check('RT10. with the canonical row gone but a root-linked trace still naming it, clean absence is NOT claimed',
+  survivorLook.status === 200 && survivorLook.body?.data?.alreadyAbsent === true
+    && survivorLook.body?.data?.noTraceRemaining === false,
+  JSON.stringify(survivorLook.body?.data ?? null).slice(0, 220));
+check('RT10b. and the leftover row is reported, not cleaned up by a route that never audited it',
+  rows.ai_decision_traces.some((t) => t.id === 't3')
+    && !calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't3'),
+  JSON.stringify(rows.ai_decision_traces.map((t) => t.id)));
+// The other side of the same assertion: with the root-linked row gone as well, the claim must flip to
+// true. Without this half, an arm that merely always answered "not clean" would pass every plant.
+rows.ai_decision_traces.splice(0, rows.ai_decision_traces.length,
+  ...rows.ai_decision_traces.filter((t) => t.id !== 't3'));
+const emptiedLook = await del(GAME, 'tok-admin');
+check('RT10c. and once the root-linked trace is gone too, the same request DOES claim clean absence',
+  emptiedLook.status === 200 && emptiedLook.body?.data?.alreadyAbsent === true
+    && emptiedLook.body?.data?.noTraceRemaining === true && calls.deletes.length === 0,
+  JSON.stringify(emptiedLook.body?.data ?? null).slice(0, 220));
+
+// The structural invariant that makes this whole class of omission impossible to reintroduce quietly:
+// every reference column the inventory DECLARES for a cascade table must be a probe. `root_hand_id` on
+// traces was declared, documented as covered, and never swept — an assertion on the list is what turns
+// that into a red arm on the day it happens instead of a production incident.
+const declaredRefs = Object.entries(rules.GAME_COLUMNS)
+  .filter(([key]) => key !== 'recordedHands')
+  .flatMap(([key, cols]) => Object.keys(cols).filter((c) => c !== 'id').map((c) => `${key}.${c}`));
+const probedPairs = rules.SWEEP_PROBES.map((p) => `${p.key}.${p.column}`).sort();
+check('RT9. every reference column declared for a cascade table is probed by the audit, the sweep and the absence proof',
+  declaredRefs.slice().sort().join(',') === probedPairs.join(','),
+  JSON.stringify({ declared: declaredRefs.slice().sort(), probed: probedPairs }));
+check('RT9b. the probe that production was missing is present exactly once per column (no duplicate delete pass)',
+  rules.SWEEP_PROBES.filter((p) => p.key === 'decisionTraces').map((p) => p.column).sort().join(',') === 'recordedHandId,rootHandId'
+    && new Set(probedPairs).size === probedPairs.length,
+  JSON.stringify(rules.SWEEP_PROBES));
 
 // ── 17: partial failure and safe retry ──────────────────────────────────────────────────────────
 seedGame({ communityRoot: true });
@@ -755,6 +985,29 @@ check('NC5b. and the foreign row was never addressed by a delete call, survived,
   !calls.deletes.some((c) => c.id === 'cF1') && rows.community_games.some((c) => c.id === 'cF1')
     && rows.recorded_hands.some((r) => r.id === GAME) && backstop.result === undefined,
   `deletes=${JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`))}`);
+/* The same backstop on the column that was missing in production: a foreign root-linked trace written
+ * between the mount's preflight and the sweep must still not be removable, and the stop must name the
+ * column it hit — `root_hand_id` is the only place the deployed build could not see the row at all. */
+seedGame({ foreignRootTrace: true });
+const backstopRootTrace = await storeModule.createGameDeletionStore({ client: directClient })
+  .execute({ canonicalId: GAME, replayChildIds: ['5002', '5003', '5099'], ownerId: OWNER_A });
+check('RT3d. the sweep re-tests ownership on the root-hand trace probe and names the column it stopped on',
+  backstopRootTrace.failure?.reason === 'foreign_satellite_owners'
+    && backstopRootTrace.failure?.step === 'decisionTraces'
+    && backstopRootTrace.failure?.column === 'root_hand_id'
+    && !calls.deletes.some((c) => c.id === 't4'),
+  JSON.stringify(backstopRootTrace.failure ?? backstopRootTrace.result ?? null).slice(0, 220));
+seedGame({ foreignRootTrace: true });
+// Re-seeded deliberately: this arm must not depend on the arm above having LEFT `t4` behind, or removing
+// the ownership guard turns this line into a throw that hides every arm below it — which is exactly how an
+// inert negative control reads as a pass.
+rows.ai_decision_traces.find((t) => t.id === 't4').user_id = OWNER_A;
+const ownRootSweep = await storeModule.createGameDeletionStore({ client: directClient })
+  .execute({ canonicalId: GAME, replayChildIds: [], ownerId: OWNER_A });
+check('RT3e. and the own-owner root-linked trace on the same column IS swept once the set is clean',
+  Number(ownRootSweep.result?.removed?.decisionTraces ?? 0) >= 1
+    && !rows.ai_decision_traces.some((t) => ['t1', 't3', 't4'].includes(t.id)),
+  JSON.stringify(ownRootSweep.result ?? ownRootSweep.failure ?? null).slice(0, 200));
 seedGame({ foreignAttempt: true });
 const noOwnerArg = await storeModule.createGameDeletionStore({ client: directClient })
   .execute({ canonicalId: GAME, replayChildIds: [] });
@@ -879,6 +1132,158 @@ check('NC5i. a store that cannot produce the satellite inventory is refused befo
     && !JSON.stringify(noInventory.body).includes('must not be entered'),
   JSON.stringify(noInventory).slice(0, 200));
 
+/* ── RT8: the reasons that mean "nothing was reached" must not read as "half-deleted" ────────────
+ * The deployed classifier enumerated four transport names, so a session that could not be established or
+ * verified mid-sweep fell through to 502 `game_deletion_incomplete` — telling an administrator rows had
+ * been left half-removed when no write had reached any table. These three stubs are the three answers an
+ * operator must be able to tell apart from the same request shape.
+ */
+const midSweepStub = (reason, extra = {}) => callStubMount({
+  findCanonical: async () => ({ row: { id: '5001', user_id: OWNER_A, root_hand_id: null } }),
+  findChildren: async () => ({ rows: [] }),
+  findSatellites: async () => ({ groups: {} }),
+  countSatellites: async () => ({ total: 0 }),
+  execute: async () => ({ failure: { storeFailure: true, reason, step: 'decisionTraces', detail: '', ...extra } })
+});
+const sessionFault = await midSweepStub('club_account_identity_unverifiable');
+const coolingFault = await midSweepStub('club_account_cooling_down');
+const unreachableFault = await midSweepStub('club_account_unreachable');
+check('RT8. a mid-sweep session or identity failure is 503 club_store_unavailable, not a 502 about rows',
+  sessionFault.status === 503 && sessionFault.body?.error?.code === 'club_store_unavailable'
+    && coolingFault.status === 503 && unreachableFault.status === 503
+    && sessionFault.body?.data === undefined,
+  `${sessionFault.status}/${sessionFault.body?.error?.code} ${coolingFault.status} ${unreachableFault.status}`);
+const forbiddenFault = await midSweepStub('club_account_forbidden', { storageStatus: 403 });
+const unconfirmedFault = await midSweepStub('game_delete_unconfirmed');
+const rowIdFault = await midSweepStub('game_row_id_unusable');
+check('RT8b. refusal, acknowledged-but-unapplied and unusable-id stops stay 502 and stay three different sentences',
+  forbiddenFault.status === 502 && unconfirmedFault.status === 502 && rowIdFault.status === 502
+    && forbiddenFault.body?.error?.detail?.class === 'authorization_refused'
+    && unconfirmedFault.body?.error?.detail?.class === 'write_not_applied'
+    && rowIdFault.body?.error?.detail?.class === 'unaddressable_row'
+    && new Set([forbiddenFault, unconfirmedFault, rowIdFault].map((a) => a.body?.error?.message)).size === 3,
+  JSON.stringify([forbiddenFault.body?.error?.detail, unconfirmedFault.body?.error?.detail, rowIdFault.body?.error?.detail]));
+check('RT8c. the refusal carries the storage status and the retry verdict; the others do not invent one',
+  forbiddenFault.body?.error?.detail?.storageStatus === 403 && forbiddenFault.body?.error?.detail?.retryable === false
+    && unconfirmedFault.body?.error?.detail?.storageStatus === null
+    && unreachableFault.body?.error?.detail?.retryable === true,
+  JSON.stringify([forbiddenFault.body?.error?.detail, unconfirmedFault.body?.error?.detail, unreachableFault.body?.error?.detail]));
+
+// The classifier must be TOTAL over the reasons the shipped code can actually emit — an enumeration that
+// misses a name is exactly how the identity variants fell through to a data-claiming 502. Reasons are
+// harvested from the sources rather than typed out here, so adding a reason to the client without
+// declaring its class reddens this arm instead of silently defaulting it.
+const clientSrc = fs.readFileSync(path.join(ROOT, 'clubs/ncbAccountClient.js'), 'utf8');
+const storeSrc = fs.readFileSync(path.join(ROOT, 'games/gameDeletionStore.js'), 'utf8');
+const harvested = [...new Set([
+  ...[...clientSrc.matchAll(/'((?:club|game|ncb)_[a-z_]+)'/g)].map((m) => m[1]),
+  ...[...storeSrc.matchAll(/storeFailure\(\s*'([a-z_]+)'/g)].map((m) => m[1])
+])].sort();
+const EXPECTED_FAULT_CLASS = {
+  club_account_forbidden: 'authorization_refused',
+  club_account_request_failed: 'storage_error',
+  club_account_unreachable: 'storage_unreachable',
+  club_account_login_failed: 'storage_unreachable',
+  club_account_rejected: 'storage_unreachable',
+  club_account_cooling_down: 'storage_unreachable',
+  club_account_unconfigured: 'storage_unreachable',
+  club_account_identity_unverifiable: 'storage_unreachable',
+  club_account_identity_mismatch: 'storage_unreachable',
+  club_credentials_must_not_be_frontend_env: 'storage_unreachable',
+  game_read_unreadable: 'storage_unreachable',
+  game_store_request_failed: 'storage_unreachable',
+  game_delete_unconfirmed: 'write_not_applied',
+  game_row_id_unusable: 'unaddressable_row',
+  foreign_satellite_owners: 'incomplete'
+};
+const classDrift = harvested
+  .filter((r) => EXPECTED_FAULT_CLASS[r] === undefined || rules.classifyStoreFailure(r) !== EXPECTED_FAULT_CLASS[r])
+  .map((r) => `${r}=${rules.classifyStoreFailure(r)}${EXPECTED_FAULT_CLASS[r] ? `(want ${EXPECTED_FAULT_CLASS[r]})` : '(undeclared)'}`);
+check('RT8d. every reason the shipped client or store can emit is declared in the fault table, with the class it must get',
+  harvested.length >= 10 && classDrift.length === 0,
+  `harvested=${JSON.stringify(harvested)} drift=${JSON.stringify(classDrift)}`);
+check('RT8e. and no club_account_* session/transport reason can answer 502 any more (the production misclassification)',
+  harvested.filter((r) => /^club_account_(unreachable|login_failed|rejected|cooling_down|unconfigured|identity_)/.test(r))
+    .every((r) => rules.classifyStoreFailure(r) === 'storage_unreachable'
+      && rules.DELETION_FAULT_CLASSES[rules.classifyStoreFailure(r)].http === 503)
+    && rules.classifyStoreFailure('club_account_forbidden') === 'authorization_refused',
+  JSON.stringify(Object.fromEntries(harvested.map((r) => [r, rules.classifyStoreFailure(r)]))));
+
+/* ── RT11: a destructive verb's failure must leave a trace ────────────────────────────────────────
+ * The deployed route audited four outcomes and NOT the catch-all, so during the production incident an
+ * operator could only infer a crash from the ABSENCE of a log line. This stub captures what the mount
+ * hands `onAudit` and asserts every failing answer writes a sanitized record naming the step and class.
+ */
+const auditLines = [];
+const auditApp = express();
+auditApp.use(bridge.buildGameDeletionMount({
+  env: process.env,
+  authenticate: async () => ({ ok: true, id: '1' }),
+  clubStore: { isSystemAdmin: async () => ({ declared: true, available: true, isAdmin: true }) },
+  clubAccount: { configured: true },
+  onAudit: (record) => auditLines.push(record),
+  deletionStore: {
+    findCanonical: async () => ({ row: { id: '5001', user_id: OWNER_A, root_hand_id: null } }),
+    findChildren: async () => ({ rows: [] }),
+    findSatellites: async () => ({ groups: {} }),
+    countSatellites: async () => ({ total: 0 }),
+    execute: async () => { throw new TypeError('simulated internal fault naming a bearer and a row'); }
+  }
+}).router);
+const auditServer = auditApp.listen(0, '127.0.0.1');
+await new Promise((resolve) => auditServer.once('listening', resolve));
+try {
+  await fetch(`http://127.0.0.1:${auditServer.address().port}/games/5001`, {
+    method: 'DELETE', headers: { authorization: 'Bearer x' }
+  });
+} finally { auditServer.close(); }
+const crashLine = auditLines.find((r) => r?.fault?.class === 'internal_fault') ?? null;
+check('RT11. an internal fault is AUDITED, not just answered: the log names the step and the class',
+  crashLine !== null && crashLine.fault.step === 'sweep'
+    && crashLine.deleted === false && crashLine.recordedHandId === '5001',
+  JSON.stringify(auditLines).slice(0, 240));
+check('RT11b. and the audit record carries no exception text, bearer or row content',
+  crashLine !== null && !JSON.stringify(crashLine).includes('bearer')
+    && !JSON.stringify(crashLine).includes('simulated internal fault') && !JSON.stringify(crashLine).includes('Bearer '),
+  JSON.stringify(crashLine).slice(0, 220));
+
+/* ── RT12: the log line an operator actually reads, captured from the shipped wiring ─────────────
+ * `auditRecord` used to read `result.data.x` while every call site hands it the payload object itself, so
+ * the bridge logged `deleted:false, removed:null` for a SUCCESSFUL deletion and dropped the partial tally
+ * for a refused one. A unit test of the builder cannot see that — only the emitted line can. Captured here
+ * by wrapping the console, so it asserts `bridge.js`'s real `onAudit` wiring rather than a copy.
+ */
+async function captureAudit(run) {
+  const lines = [];
+  const realInfo = console.info;
+  console.info = (...args) => { lines.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')); };
+  try { await run(); } finally { console.info = realInfo; }
+  return lines.filter((l) => l.includes('admin_game_deletion')).map((l) => {
+    try { return JSON.parse(l.slice(l.indexOf('{'))); } catch { return { unparsable: l.slice(0, 80) }; }
+  });
+}
+seedGame({ communityRoot: true });
+const [successLine] = await captureAudit(() => del(GAME, 'tok-admin'));
+check('RT12. a completed deletion is LOGGED as completed, with the per-table counts (the shipped console line)',
+  successLine?.deleted === true && successLine?.alreadyAbsent === false
+    && successLine?.recordedHandId === GAME && Number(successLine?.removed?.decisionTraces) === 2
+    && Number(successLine?.removed?.recordedHands) === 4 && successLine?.replayChildren === 3,
+  JSON.stringify(successLine ?? null).slice(0, 240));
+seedGame({ communityRoot: true });
+FAULTS.keepRowsIn = ['ai_decision_traces'];
+const [refusedLine] = await captureAudit(() => del(GAME, 'tok-admin'));
+FAULTS.keepRowsIn = null;
+check('RT12b. a refused sweep logs the residue it DID remove and the fault class, never a bare null',
+  refusedLine?.deleted === false && refusedLine?.fault?.class === 'write_not_applied'
+    && Number(refusedLine?.removed?.tournamentAttempts) === 1 && /decisionTraces/.test(String(refusedLine?.failure ?? '')),
+  JSON.stringify(refusedLine ?? null).slice(0, 260));
+check('RT12c. and the log line names no email, bearer, hand or account value',
+  [successLine, refusedLine].every((l) => {
+    const text = JSON.stringify(l ?? {});
+    return !text.includes(SERVICE_TOKEN) && !text.includes(SERVICE_EMAIL) && !text.includes(PASSWORD)
+      && !text.includes('{"private":"cards"}') && !text.includes('Bearer ');
+  }), JSON.stringify([successLine, refusedLine]).slice(0, 200));
+
 check('NC3e. the sweep order is satellites-first and canonical-last — the recovery marker contract',
   rules.SWEEP_STEPS.indexOf('recordedHand') === rules.SWEEP_STEPS.length - 1
     && rules.SWEEP_STEPS.indexOf('communityGames') < rules.SWEEP_STEPS.indexOf('recordedHand'),
@@ -895,7 +1300,10 @@ const refusalBodies = [
   ['unconfirmed-delete', lying.body], ['unreachable', unreachable.body],
   ['foreign-satellites', fRoot.body], ['foreign-direct', fSource.body], ['foreign-attempt', fAttempt.body],
   ['unowned-satellite', fUnowned.body], ['mixed-satellites', fMixed.body], ['orphan-owner', fOrphan.body],
-  ['mid-sweep-stop', midSweep.body], ['inventory-unavailable', noInventory.body]
+  ['mid-sweep-stop', midSweep.body], ['inventory-unavailable', noInventory.body],
+  ['vendor-403', refused403.body], ['vendor-403-canonical', refusedCanonical.body],
+  ['acknowledged-keeps-row', lyingTraces.body], ['foreign-root-trace', fRootTrace.body],
+  ['session-fault', sessionFault.body], ['refusal-fault', forbiddenFault.body]
 ].filter(([, body]) => body);
 const badRefusals = refusalBodies
   .filter(([, body]) => typeof body?.error?.code !== 'string' || body.error.code.trim() === ''
@@ -943,14 +1351,16 @@ check('NC4b. every declared fault knob is actually read by the mock (no inert ne
 check('NC4. no credential, bearer or private hand content appears in any deletion answer',
   (() => {
     const seen = JSON.stringify([ok.body, foreign.body, partial.body, lying.body, unreachable.body, repeat.body,
-      fRoot.body, fMixed.body, fOrphan.body, midSweep.body, noInventory.body]);
+      fRoot.body, fMixed.body, fOrphan.body, midSweep.body, noInventory.body,
+      refused403.body, refusedCanonical.body, lyingTraces.body, fRootTrace.body, resumed.body,
+      sessionFault.body, forbiddenFault.body, unconfirmedFault.body, JSON.stringify(auditLines)]);
     return !seen.includes(SERVICE_TOKEN) && !seen.includes(PASSWORD) && !seen.includes(SERVICE_EMAIL)
       && !seen.includes('{"private":"cards"}') && !seen.includes('Bearer ');
   })(), '');
 check('NC4c. no ownership refusal names a table, a row id or another account id',
-  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].every((answer) => idFree(answer.body))
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep, fRootTrace].every((answer) => idFree(answer.body))
     && idFree(noInventory.body),
-  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].map((a) => JSON.stringify(a.body).slice(0, 90)).join(' | '));
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep, fRootTrace].map((a) => JSON.stringify(a.body).slice(0, 90)).join(' | '));
 
 let failed = 0;
 for (const r of results) {

@@ -167,12 +167,29 @@ const SATELLITE_OWNER_COLUMNS = Object.freeze({
 
 /**
  * The (table, column) pairs through which a satellite is selected for deletion. THE SINGLE SOURCE: the
- * ownership preflight and the sweep both iterate this, so a probe added here is audited automatically and
- * a probe that exists in one place only cannot be introduced silently.
+ * ownership preflight, the sweep, the per-write backstop and the final absence proof all iterate this, so
+ * a probe added here is audited automatically and a probe that exists in one place only cannot be
+ * introduced silently.
+ *
+ * THE INVARIANT, asserted by the gate rather than left to a reviewer: every reference column a satellite
+ * table DECLARES in `GAME_COLUMNS` (every entry but `id`) must appear here. A declared-but-unprobed column
+ * is not a documentation gap — it is a row that survives the sweep and is then reported as absent, which is
+ * what happened on the first production deletion: `ai_decision_traces.rootHandId` was declared at
+ * `GAME_COLUMNS` and described as swept by the store's own comment, but was never probed. The live writer
+ * proves the shape exists: `persistTracesForFlag` (aiDecisionTraces.js:96-106) writes
+ * `recorded_hand_id: null` WITH `root_hand_id` set, and `persistAnalysisTrace` (:134-140) writes
+ * `recorded_hand_id: trace.recorded_hand_id ?? null`. So a trace of this game is reachable through the root
+ * column alone, and a sweep keyed only on `recorded_hand_id` leaves it behind while still answering
+ * `deleted: true`.
+ *
+ * Two passes per table, never one `OR`, because NCB's filter grammar has no OR; the row sets are
+ * deduplicated by row id, so a row carrying the same value in both columns is audited, swept and counted
+ * exactly once.
  */
 const SWEEP_PROBES = Object.freeze([
   { key: 'tournamentAttempts', column: 'recordedHandId' },
   { key: 'decisionTraces', column: 'recordedHandId' },
+  { key: 'decisionTraces', column: 'rootHandId' },
   { key: 'analysisReports', column: 'recordedHandId' },
   { key: 'replayAttempts', column: 'recordedHandId' },
   { key: 'replayAttempts', column: 'rootHandId' },
@@ -320,8 +337,112 @@ function exactRowOps(rows) {
  * emits the object form the client parses, and says so in the module header rather than silently
  * diverging from the tournament convention.
  */
-function deletionRefusal(http, code, message) {
-  return { http, body: { status: 'error', error: { code, message } } };
+function deletionRefusal(http, code, message, detail = null) {
+  const error = { code, message };
+  // `detail` is additive on purpose: the client of record reads only `error.code` and `error.message`, so
+  // an operator-visible structure can be carried without introducing a new code (a new code costs the
+  // frontend four edits and a locale pair, and an unmapped code degrades to `malformed_envelope`).
+  if (detail && typeof detail === 'object') error.detail = detail;
+  return { http, body: { status: 'error', error } };
+}
+
+/*
+ * ── 5. WHAT A FAILED WRITE MEANS ────────────────────────────────────────────────────────────────
+ *
+ * Four different things can stop a sweep, and an administrator told to "retry the same request" about the
+ * one of them where retrying can never help is being sent in a circle. The deployed classifier enumerated
+ * transport reasons and let EVERYTHING ELSE fall through to 502 `game_deletion_incomplete`, so a vendor
+ * 403, a vendor 500, a write that was acknowledged but not applied, and a mid-sweep session-identity
+ * failure all answered with one code and one retry instruction. These sets are total: every reason the
+ * client or the store can emit lands in exactly one class, and the gate asserts that exhaustiveness
+ * against the reason strings harvested from the shipped sources.
+ *
+ * `storage_unreachable` is the only class that answers 503, because it is the only one that means the
+ * storage was never asked. A refusal or an error IS an answer.
+ */
+const DELETION_FAULT_CLASSES = Object.freeze({
+  storage_unreachable: { http: 503, code: 'club_store_unavailable', retryable: true },
+  authorization_refused: { http: 502, code: 'game_deletion_incomplete', retryable: false },
+  storage_error: { http: 502, code: 'game_deletion_incomplete', retryable: true },
+  write_not_applied: { http: 502, code: 'game_deletion_incomplete', retryable: false },
+  unaddressable_row: { http: 502, code: 'game_deletion_incomplete', retryable: false },
+  internal_fault: { http: 502, code: 'game_deletion_incomplete', retryable: true },
+  incomplete: { http: 502, code: 'game_deletion_incomplete', retryable: true }
+});
+
+/**
+ * Session/transport/configuration/unreadability: the storage was not consulted, or its answer could not be
+ * read. The whole `club_account_` family belongs here, because a signing-in or token problem is a session
+ * failure and not an incomplete cascade — the deployed build enumerated four of these names and let the
+ * identity variants fall through to 502 `game_deletion_incomplete`, which told an administrator rows had been
+ * left half-removed when no request had reached the tables at all. The two reasons that ARE answers from the
+ * storage (`club_account_forbidden`, `club_account_request_failed`) are matched before this test.
+ */
+const STORAGE_UNREACHABLE_REASONS = /^(?:club_account_|club_credentials_|club_store_|club_schema_|game_store_request_failed|game_read_unreadable)/;
+
+/** One store reason → what it means, which status answers it, and whether retrying can help. */
+function classifyStoreFailure(reason) {
+  const name = eq(reason);
+  if (name === 'club_account_forbidden') return 'authorization_refused';
+  // A non-2xx that is not a refusal: the storage was reached and answered badly. 502 (the cascade really
+  // did stop with rows removed) with retry-friendly copy, never 503 "could not be reached".
+  if (name === 'club_account_request_failed') return 'storage_error';
+  if (name === 'game_delete_unconfirmed') return 'write_not_applied';
+  if (name === 'game_row_id_unusable') return 'unaddressable_row';
+  if (name === 'internal_fault') return 'internal_fault';
+  if (STORAGE_UNREACHABLE_REASONS.test(name)) return 'storage_unreachable';
+  return 'incomplete';
+}
+
+/** Where the sweep stopped, named by step and column. Never a table name, never a row id, never a value. */
+function failureWhere({ step = null, column = null } = {}) {
+  const s = eq(step) || 'sweep';
+  const c = eq(column);
+  return c === '' ? s : `${s}.${c}`;
+}
+
+/** The operator sentence for one class. Counts and names of steps only — no record contents, no accounts. */
+function incompleteMessage({ class: kind = 'incomplete', where = 'sweep', storageStatus = null, detail = '' } = {}) {
+  const at = ` at ${where}`;
+  const via = Number.isInteger(storageStatus) && storageStatus > 0 ? ` (storage HTTP ${storageStatus})` : '';
+  switch (kind) {
+    case 'storage_unreachable':
+      return `The game store could not be consulted at ${where}${via}, so the cascade never reached that step and no row was reported as removed. The game is still recorded. Retry later.`;
+    case 'authorization_refused':
+      return `The game store refused the delete${at}${via}, so the cascade stopped part-way. Records already removed are not restorable, and repeating this request cannot succeed until the service account is granted delete on the remaining table. The game is still recorded.`;
+    case 'write_not_applied':
+      return `The game store accepted the delete${at}${via} but the row is still present, so nothing was reported as removed. The cascade stopped there; records already removed are not restorable, and the game is still recorded.`;
+    case 'unaddressable_row':
+      return `A row matched${at} carries no usable row id${via}, so the cascade stopped before it and nothing from that table was reported as removed. The game is still recorded.`;
+    case 'storage_error':
+      return `The game store answered the delete${at} with an error${via}, so the cascade stopped part-way. Records already removed are not restorable. The game is still recorded; the same request can be retried.`;
+    case 'internal_fault':
+      return `The deletion stopped unexpectedly${at}. The rows removed before the stop are not restorable and the deletion state is unconfirmed; the game may still be recorded.`;
+    default:
+      return `The deletion stopped before it completed (${where}${via}${detail ? `: ${detail}` : ''}). The game is still recorded; retry the same request to finish the cleanup.`;
+  }
+}
+
+/**
+ * The incomplete-cascade answer, built once so the HTTP status, the wire code, the operator sentence, the
+ * audit record and the structured detail can never disagree about which step stopped the sweep.
+ */
+function incompleteDeletion({ reason = null, step = null, column = null, storageStatus = null, detail = '' } = {}) {
+  const kind = classifyStoreFailure(reason);
+  const shape = DELETION_FAULT_CLASSES[kind];
+  const where = failureWhere({ step, column });
+  const status = Number.isInteger(Number(storageStatus)) && Number(storageStatus) > 0 ? Number(storageStatus) : null;
+  const message = incompleteMessage({ class: kind, where, storageStatus: status, detail: eq(detail) });
+  const fault = { class: kind, step: where, reason: eq(reason) || null, storageStatus: status, retryable: shape.retryable === true };
+  // The fault travels in `error.detail` so the operator (and a later client revision) can read the class,
+  // the step, the vendor status and whether a retry can help WITHOUT a new error code — the client of
+  // record switches on `error.code` alone, so an unmapped new code would degrade to `malformed_envelope`
+  // and lose the message too. `error.code`, `error.message` and their meaning are unchanged.
+  return {
+    http: shape.http,
+    body: deletionRefusal(shape.http, shape.code, message, fault).body,
+    fault
+  };
 }
 
 const REFUSALS = Object.freeze({
@@ -334,8 +455,10 @@ const REFUSALS = Object.freeze({
     const body = satelliteRefusal(verdict, options);
     return deletionRefusal(409, body.code, body.message);
   },
-  incomplete: (detail) => deletionRefusal(502, 'game_deletion_incomplete',
-    `The deletion stopped before it completed (${detail}). The game is still recorded; retry the same request to finish the cleanup.`)
+  incomplete: (detail, options = {}) => {
+    const answer = incompleteDeletion({ reason: options.reason ?? null, step: options.step ?? null, column: options.column ?? null, storageStatus: options.storageStatus ?? null, detail: eq(detail) });
+    return { http: answer.http, body: answer.body };
+  }
 });
 
 /**
@@ -377,17 +500,42 @@ function deletionResult({ removed = {}, replayChildren = 0, preserved = {}, alre
   };
 }
 
-/** What the bridge log may carry: names and counts, never a hand, an email or a player id. */
-function auditRecord({ adminUserId, gameId, result }) {
-  return {
+/**
+ * What the bridge log may carry: names and counts, never a hand, an email or a player id.
+ *
+ * `result` arrives as the payload object ITSELF at every call site (the success path passes
+ * `answer.body.data`, the refusal paths pass a literal), so reading `result.data.x` returned undefined for
+ * every request on the deployed build: a completed deletion was logged as `deleted:false, removed:null`,
+ * and a refused one lost the partial tally that is the entire reason to log it. Both shapes are accepted
+ * now. The gate asserts the shipped log line rather than this function's return value, because the defect
+ * was invisible to a unit check of the builder alone.
+ *
+ * `fault` is the sanitized stop description from `incompleteDeletion` — a class, the step and column where
+ * the sweep stopped, the reason name and the storage HTTP status. No vendor message body and no row
+ * identifier is ever passed into the log line.
+ */
+function auditRecord({ adminUserId, gameId, result, fault = null } = {}) {
+  const source = (result && typeof result === 'object') ? result : {};
+  const data = (source.data && typeof source.data === 'object') ? source.data : source;
+  const record = {
     adminUserId: eq(adminUserId),
     recordedHandId: eq(gameId),
-    deleted: result?.data?.deleted === true,
-    alreadyAbsent: result?.data?.alreadyAbsent === true,
-    removed: result?.data?.removed ?? null,
-    replayChildren: result?.data?.replayChildren ?? 0,
+    deleted: data.deleted === true,
+    alreadyAbsent: data.alreadyAbsent === true,
+    removed: data.removed ?? null,
+    replayChildren: data.replayChildren ?? 0,
     ts: new Date().toISOString()
   };
+  if (fault && typeof fault === 'object') {
+    record.fault = {
+      class: eq(fault.class) || 'incomplete',
+      step: eq(fault.step) || 'sweep',
+      reason: eq(fault.reason) || null,
+      storageStatus: Number.isInteger(Number(fault.storageStatus)) && Number(fault.storageStatus) > 0 ? Number(fault.storageStatus) : null,
+      retryable: fault.retryable === true
+    };
+  }
+  return record;
 }
 
 module.exports = {
@@ -399,6 +547,8 @@ module.exports = {
   SWEEP_PROBES,
   SATELLITE_OWNER_COLUMNS,
   MULTI_COLUMN_SATELLITE,
+  DELETION_FAULT_CLASSES,
+  STORAGE_UNREACHABLE_REASONS,
   REFUSALS,
   isCanonicalGameId,
   classifyReplayChildren,
@@ -406,6 +556,10 @@ module.exports = {
   classifySatellites,
   checkSatelliteOwnership,
   satelliteRefusal,
+  classifyStoreFailure,
+  failureWhere,
+  incompleteMessage,
+  incompleteDeletion,
   planGameDeletion,
   sweepTargetIds,
   exactRowOps,
