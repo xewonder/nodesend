@@ -89,7 +89,7 @@ const COLUMNS = {
   // these tables are precisely what let a missing owner predicate survive a green suite.
   community_games: ['id', 'source_hand_id', 'root_hand_id', 'user_id'],
   game_analysis_reports: ['id', 'recorded_hand_id', 'author_user_id', 'user_id'],
-  ai_decision_traces: ['id', 'recorded_hand_id', 'board_id', 'root_hand_id', 'kind', 'user_id'],
+  ai_decision_traces: ['id', 'recorded_hand_id', 'board_id', 'root_hand_id', 'source', 'operation', 'decision_id', 'user_id'],
   tournament_attempts: ['id', 'tournament_id', 'recorded_hand_id', 'player_user_id', 'user_id'],
   replay_attempts: ['id', 'recorded_hand_id', 'root_hand_id', 'user_id'],
   coach_feedback_flags: ['id', 'hand_id', 'root_hand_id', 'coach_user_id', 'user_id'],
@@ -270,30 +270,33 @@ const seedGame = ({
     rows.community_games.push({ id: 'cS1', source_hand_id: '8801', root_hand_id: '8801', user_id: OWNER_B });
     rows.replay_attempts.push({ id: 'raS1', recorded_hand_id: '8801', root_hand_id: '8801', user_id: OWNER_B });
     rows.game_analysis_reports.push({ id: 'rS1', recorded_hand_id: '8801', author_user_id: OWNER_B, user_id: OWNER_B });
-    rows.ai_decision_traces.push({ id: 'tS1', recorded_hand_id: '8801', board_id: '95', root_hand_id: '8801', kind: 'game', user_id: OWNER_B });
+    rows.ai_decision_traces.push({ id: 'tS1', recorded_hand_id: '8801', board_id: '95', root_hand_id: '8801', source: 'gameplay', operation: 'play_card', decision_id: 'dS1', user_id: OWNER_B });
     rows.tournament_attempts.push({ id: 'aS2', tournament_id: 'T1', recorded_hand_id: '8801', player_user_id: OWNER_B, user_id: SERVICE_ID });
   }
   // A report authored by the coach but OWNED by the player: authorship is not ownership, and it must
   // still cascade. `gameAnalysisService.js:305` writes user_id = the hand owner.
   rows.game_analysis_reports.push({ id: 'r1', recorded_hand_id: GAME, author_user_id: '4', user_id: OWNER_A });
   if (mixedForeign) rows.game_analysis_reports.push({ id: 'rF1', recorded_hand_id: GAME, author_user_id: OWNER_B, user_id: OWNER_B });
-  rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, kind: 'game', user_id: OWNER_A });
-  /* Three real trace shapes, each written by a different call site in `aiDecisionTraces.js`, and the
-   * reason all three are seeded is that the deployed sweep could only see one of them:
-   *   t2 — `persistAnalysisTrace` (:134-140) with no chain value: `recorded_hand_id` null AND
-   *        `root_hand_id` null. Nothing in the cascade references this game, so it is OUT OF SCOPE: it
-   *        must survive byte-identically and must never block a deletion. Arm 10.
-   *   t3 — `persistTracesForFlag` (:96-106) writes `recorded_hand_id: null` WITH `root_hand_id` set, and
-   *        the row is owned by whoever was signed in. Same owner here: this is the row the omitted probe
-   *        left behind in production (Game 524's surviving traces), and the root probe must now delete it
-   *        and count it. Arms RT1/RT2.
-   *   t4 — the same flag-snapshot shape owned by ANOTHER account (a coach flagged this chain). Foreign,
-   *        so it fails closed as a refusal rather than being deleted behind the admin's click. Arm RT3.
-   * `kind` is deliberately never consulted by the sweep: it is a browser-supplied field on a table with no
-   * row isolation, so a destructive decision cannot be keyed to it. */
-  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '94', root_hand_id: null, kind: 'flag-snapshot', user_id: '4' });
-  if (rootTraceOwn) rows.ai_decision_traces.push({ id: 't3', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: OWNER_A });
-  if (foreignRootTrace) rows.ai_decision_traces.push({ id: 't4', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, kind: 'flag-snapshot', user_id: OWNER_B });
+  /* Three real trace shapes, taken from the live writers and readers in `aiDecisionTraces.js`. Field names
+   * are the ones the writers actually send (`source`, `operation`, `decision_id`, `board_id`) — there is no
+   * `kind` column in any writer, and a fixture that invents one is how the `publisher_user_id` audit passed
+   * while testing a fictional field.
+   *   t1 — `persistTraces(recordedHandId)` (:49-75): `recorded_hand_id` set. THIS is the hand's own audit
+   *        trail, read back by `loadTracesByHand`, and it must cascade with the hand.
+   *   t2 — `persistAnalysisTrace` (:120-152) with no chain value at all: out of scope for every probe, so
+   *        it survives byte-identically and must never block anything.
+   *   t3 — `persistTracesForFlag` (:87-115, called only when `recordedHandId == null`):
+   *        `recorded_hand_id: null` WITH `board_id`/`root_hand_id` set. This is the durable full
+   *        request/response audit an Auction Review flag resolves (`coachFlagSnapshot.js:64-89` keeps only
+   *        `fullAuditAvailable: true`; `FlaggedGamesAdmin.jsx:177-186` reads the trace table by
+   *        `decision_id`; `loadTracesByBoard` reads it by `board_id`). It is PROTECTED EVIDENCE: counted,
+   *        reported as `preserved.flagSnapshotTraces`, never deleted.
+   *   t4 — the same ledger row owned by another account (the coach who flagged it). Also protected:
+   *        retaining a row needs no ownership claim, so it must not refuse the deletion either. */
+  rows.ai_decision_traces.push({ id: 't1', recorded_hand_id: GAME, board_id: '94', root_hand_id: GAME, source: 'gameplay', operation: 'play_card', decision_id: 'd1', user_id: OWNER_A });
+  if (flagTrace) rows.ai_decision_traces.push({ id: 't2', recorded_hand_id: null, board_id: '96', root_hand_id: null, source: 'coach', operation: 'analyze_hand', decision_id: 'd2', user_id: '4' });
+  if (rootTraceOwn) rows.ai_decision_traces.push({ id: 't3', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, source: 'coach', operation: 'analyze_hand', decision_id: 'd3', user_id: OWNER_A });
+  if (foreignRootTrace) rows.ai_decision_traces.push({ id: 't4', recorded_hand_id: null, board_id: '94', root_hand_id: GAME, source: 'coach', operation: 'analyze_hand', decision_id: 'd4', user_id: OWNER_B });
   // NodeSend writes the attempt link on the SERVICE ACCOUNT, so its stamped user_id is NOT the player.
   // Resolution must prefer `player_user_id`, or every legitimate deletion refuses.
   rows.tournament_attempts.push({ id: 'a1', tournament_id: 'T1', recorded_hand_id: GAME, player_user_id: OWNER_A, user_id: SERVICE_ID });
@@ -384,9 +387,10 @@ const ok = await del(GAME, 'tok-admin');
 const d = ok.body?.data ?? {};
 check('G1/7-9. System Admin deletion succeeds with the exact per-table counts',
   ok.status === 200 && ok.body?.status === 'success' && d.deleted === true && d.alreadyAbsent === false
-    && d.removed?.tournamentAttempts === 1 && d.removed?.decisionTraces === 2
+    && d.removed?.tournamentAttempts === 1 && d.removed?.decisionTraces === 1
     && d.removed?.analysisReports === 1 && d.removed?.communityGames === 2 && d.removed?.recordedHands === 4
-    && d.removed?.replayAttempts === 2,
+    && d.removed?.replayAttempts === 2
+    && d.preserved?.coachFeedbackFlags === 1 && d.preserved?.flagSnapshotTraces === 1,
   `${ok.status} ${JSON.stringify(ok.body).slice(0, 300)}`);
 check('7. every community publication row is gone, by BOTH source_hand_id and root_hand_id, counted once',
   rows.community_games.filter((c) => c.source_hand_id === GAME || c.root_hand_id === GAME).length === 0,
@@ -395,13 +399,22 @@ check('8. the analysis report for the game is gone',
   rows.game_analysis_reports.filter((r) => r.recorded_hand_id === GAME).length === 0, JSON.stringify(rows.game_analysis_reports));
 check('9. the game-associated AI trace is gone',
   !rows.ai_decision_traces.some((t) => t.id === 't1'), JSON.stringify(rows.ai_decision_traces));
-check('RT1. a trace linked to the chain ONLY through root_hand_id (recorded_hand_id NULL) is swept too',
-  !rows.ai_decision_traces.some((t) => t.id === 't3')
-    && calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't3'),
-  `traces=${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))} deletes=${JSON.stringify(calls.deletes.filter((c) => c.table === 'ai_decision_traces'))}`);
-check('RT1b. and the recorded-hand probe alone never reaches it: the delete ledger shows one call per row, not one per matching column',
-  calls.deletes.filter((c) => c.table === 'ai_decision_traces').map((c) => c.id).sort().join(',') === 't1,t3',
+check('RT1. a chain-root-linked trace with recorded_hand_id NULL (the flag ledger row) is PRESERVED, never deleted',
+  rows.ai_decision_traces.some((t) => t.id === 't3' && t.recorded_hand_id === null && t.root_hand_id === GAME)
+    && !calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't3'),
+  `traces=${JSON.stringify(rows.ai_decision_traces.map((t) => [t.id, t.recorded_hand_id, t.root_hand_id]))} deletes=${JSON.stringify(calls.deletes.filter((c) => c.table === 'ai_decision_traces'))}`);
+check('RT1b. the delete ledger for traces is exactly the hand-owned audit row, one call, no root-pass delete',
+  calls.deletes.filter((c) => c.table === 'ai_decision_traces').map((c) => c.id).sort().join(',') === 't1',
   JSON.stringify(calls.deletes.filter((c) => c.table === 'ai_decision_traces')));
+check('RT1c. and the retained evidence is REPORTED, not silent: preserved.flagSnapshotTraces counts it',
+  d.preserved?.flagSnapshotTraces === 1, JSON.stringify(d.preserved ?? null));
+/* The pair the retention contract is really about: a flag row survives (D3) AND the ledger row its
+ * `fullAuditAvailable: true` / `decision_id` reference resolves through survives with it. Preserving the
+ * pointer while deleting the target is the violation this gate exists to catch. */
+check('RV1. the surviving coach flag can still resolve the audit it points at after the game is deleted',
+  rows.coach_feedback_flags.some((f) => f.id === 'f1')
+    && rows.ai_decision_traces.some((t) => t.id === 't3' && t.operation === 'analyze_hand' && t.decision_id === 'd3'),
+  `flags=${JSON.stringify(rows.coach_feedback_flags.map((f) => f.id))} traces=${JSON.stringify(rows.ai_decision_traces.map((t) => [t.id, t.operation, t.decision_id]))}`);
 check('10. the genuinely unlinked flag snapshot (no recorded_hand_id, no root_hand_id) is PRESERVED byte-identically',
   JSON.stringify(rows.ai_decision_traces.filter((t) => t.id === 't2')) === before.flagTrace
     && !calls.deletes.some((c) => c.table === 'ai_decision_traces' && c.id === 't2'),
@@ -441,19 +454,27 @@ check('13. no dangling root reference survives the sweep',
   rows.recorded_hands.every((r) => r.root_hand_id !== GAME)
     && rows.community_games.every((c) => c.root_hand_id !== GAME && c.source_hand_id !== GAME),
   JSON.stringify(rows.recorded_hands.map((r) => [r.id, r.root_hand_id])));
-/* The cascade-complete proof, across EVERY column the inventory declares rather than the ones that happen
- * to be convenient: a surviving row naming the deleted game in either reference column is a dangling
- * reference, and the deployed build left exactly this behind while answering `deleted: true`. This arm is
- * the negative control for the root-hand trace probe — removing the probe makes t3 survive and reddens it
- * (and reddens RT1/RT1b/G1 for the same reason). */
-check('RT2. nothing in any cascade table still names the deleted game in either reference column',
-  ['recorded_hands', 'community_games', 'game_analysis_reports', 'ai_decision_traces', 'tournament_attempts', 'replay_attempts']
+/* The cascade-complete proof for every table whose rows the deletion OWNS: nothing in the sweep scope may
+ * still name the deleted game in any reference column. `ai_decision_traces` is checked separately, because
+ * its root-linked ledger rows are retained on purpose — the contract being verified here is "no orphaned
+ * ordinary analysis record", not "no row ever mentioned the game". */
+check('RT2. no swept table still names the deleted game in any reference column',
+  ['recorded_hands', 'community_games', 'game_analysis_reports', 'tournament_attempts', 'replay_attempts']
     .every((table) => (rows[table] ?? []).every((row) => row.recorded_hand_id !== GAME && row.root_hand_id !== GAME
-      && row.source_hand_id !== GAME && row.hand_id !== GAME && row.parent_hand_id !== GAME)),
+      && row.source_hand_id !== GAME && row.hand_id !== GAME && row.parent_hand_id !== GAME))
+    && !rows.ai_decision_traces.some((t) => t.recorded_hand_id === GAME),
   JSON.stringify(Object.fromEntries(Object.keys(rows).map((t) => [t, (rows[t] ?? []).map((r) => [r.id, r.recorded_hand_id, r.root_hand_id])]))));
-check('RT2b. and the route itself proves absence on every cascade column: countSatellites sees the root-linked survivor',
-  rules.SWEEP_PROBES.filter((p) => p.key === 'decisionTraces').map((p) => p.column).sort().join(',') === 'recordedHandId,rootHandId',
-  JSON.stringify(rules.SWEEP_PROBES));
+check('RT2b. every retained trace row is a flag ledger row, never an ordinary analysis record of this hand',
+  rows.ai_decision_traces.filter((t) => t.recorded_hand_id !== GAME)
+    .every((t) => t.recorded_hand_id === null && t.board_id !== null),
+  JSON.stringify(rows.ai_decision_traces.map((t) => [t.id, t.recorded_hand_id, t.board_id])));
+check('RT2c. the deletion scope and the retention scope are disjoint, and their union is the whole inventory',
+  rules.SWEEP_PROBES.every((p) => rules.INVENTORY_PROBES.some((q) => q.key === p.key && q.column === p.column))
+    && rules.RETAINED_EVIDENCE_PROBES.every((p) => !rules.SWEEP_PROBES.some((q) => q.key === p.key && q.column === p.column))
+    && rules.INVENTORY_PROBES.length === rules.SWEEP_PROBES.length + rules.RETAINED_EVIDENCE_PROBES.length
+    && rules.SWEEP_PROBES.filter((p) => p.key === 'decisionTraces').map((p) => p.column).join(',') === 'recordedHandId'
+    && rules.RETAINED_EVIDENCE_PROBES.map((p) => `${p.key}.${p.column}`).join(',') === 'decisionTraces.rootHandId',
+  JSON.stringify({ sweep: rules.SWEEP_PROBES, retained: rules.RETAINED_EVIDENCE_PROBES }));
 check('15. another player\u2019s recorded game is byte-identical and was never addressed by a delete call',
   JSON.stringify(rows.recorded_hands.filter((r) => r.id === '7777')) === before.otherPlayersGame
     && !calls.deletes.some((c) => c.id === '7777'), JSON.stringify(calls.deletes));
@@ -676,34 +697,32 @@ check('F8. the refusal is actionable: once the satellite belongs to the game own
     && !rows.recorded_hands.some((r) => r.id === GAME),
   `${fBlocked.status} then ${fRepaired.status} ${JSON.stringify(fRepaired.body).slice(0, 200)}`);
 
-/* ── RT3: the root-linked trace, foreign-owned ──────────────────────────────────────────────────
- * `persistTracesForFlag` (aiDecisionTraces.js:96-106) writes `recorded_hand_id: null` with
- * `root_hand_id` set and `user_id` from the SIGNED-IN session, so a coach who flagged a board on
- * somebody else's chain leaves a trace row that references the chain and belongs to someone else.
- * Once the root column is probed, that row is in scope — and a reference match is not an ownership
- * claim, so it must refuse the whole deletion rather than be destroyed behind an admin's click.
- * This is the counterpart to RT1: the same column that recovers the game owner's own residue also
- * surfaces the foreign residue, and the sweep must not quietly pick the difference.
+/* ── RT3: the foreign-owned flag ledger row ─────────────────────────────────────────────────────
+ * `persistTracesForFlag` stamps `user_id` from the SIGNED-IN session, so a coach who flagged a board on
+ * somebody else's chain leaves a ledger row owned by the coach. It is retained, not deleted — and because
+ * nothing is deleted, the ownership rule has nothing to refuse: the foreign-owner refusal exists to stop
+ * another account's row being REMOVED, and making it block a legitimate deletion over a row the sweep never
+ * touches would be a refusal with nothing to protect.
  */
 seedGame({ foreignRootTrace: true });
-worldBefore = snapshotAll();
 const fRootTrace = await del(GAME, 'tok-admin');
-check('RT3. a chain-root-linked trace owned by ANOTHER account refuses the whole deletion and writes nothing',
-  fRootTrace.status === 409 && fRootTrace.body?.error?.code === 'foreign_satellite_owners'
-    && calls.deletes.length === 0 && snapshotAll() === worldBefore
-    && rows.ai_decision_traces.some((t) => t.id === 't4' && t.user_id === OWNER_B),
-  `${fRootTrace.status} ${JSON.stringify(fRootTrace.body).slice(0, 200)} deletes=${calls.deletes.length}`);
-check('RT3b. and the refusal is shaped like the other ownership refusals: a count, no table, no id, no account',
-  /^1 record\(s\) belong to another account/.test(String(fRootTrace.body?.error?.message ?? '')) && idFree(fRootTrace.body),
-  JSON.stringify(fRootTrace.body).slice(0, 200));
+check('RT3. a foreign-owned flag ledger row neither blocks the deletion nor is deleted by it',
+  fRootTrace.status === 200 && fRootTrace.body?.data?.deleted === true
+    && rows.ai_decision_traces.some((t) => t.id === 't4' && t.user_id === OWNER_B)
+    && !calls.deletes.some((c) => c.id === 't4'),
+  `${fRootTrace.status} ${JSON.stringify(fRootTrace.body).slice(0, 200)}`);
+check('RT3b. and it is counted in the retained evidence, so the retention is visible rather than implied',
+  fRootTrace.body?.data?.preserved?.flagSnapshotTraces === 2,
+  JSON.stringify(fRootTrace.body?.data?.preserved ?? null));
+// Re-owning the ledger row must not silently convert protected evidence into cascade residue.
 seedGame({ foreignRootTrace: true });
-const repairableTrace = rows.ai_decision_traces.find((t) => t.id === 't4');
-repairableTrace.user_id = OWNER_A;
+rows.ai_decision_traces.find((t) => t.id === 't4').user_id = OWNER_A;
 const fRootTraceRepaired = await del(GAME, 'tok-admin');
-check('RT3c. the refusal is actionable: re-owning that trace lets the SAME request complete and sweep it',
+check('RT3c. re-owning that ledger row does NOT turn it into cascade residue: it is still preserved',
   fRootTraceRepaired.status === 200 && fRootTraceRepaired.body?.data?.deleted === true
-    && !rows.ai_decision_traces.some((t) => ['t1', 't3', 't4'].includes(t.id)),
-  `${fRootTraceRepaired.status} ${JSON.stringify(fRootTraceRepaired.body).slice(0, 200)}`);
+    && rows.ai_decision_traces.some((t) => t.id === 't4')
+    && !calls.deletes.some((c) => c.id === 't4'),
+  `${fRootTraceRepaired.status} ${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))}`);
 
 /* ── RT5: resuming the production state (Game 524's residue) ─────────────────────────────────────
  * The exact shape the first live deletion left behind: the replay child and the tournament link are
@@ -722,15 +741,16 @@ check('RT5. a deletion resumed after a partial sweep completes, and counts only 
   resumed.status === 200 && resumed.body?.data?.deleted === true
     && resumed.body?.data?.removed?.tournamentAttempts === 0
     && resumed.body?.data?.removed?.recordedHands === 1
-    && resumed.body?.data?.removed?.decisionTraces === 1
+    && resumed.body?.data?.removed?.decisionTraces === 0
+    && resumed.body?.data?.preserved?.flagSnapshotTraces === 1
     && resumed.body?.data?.replayChildren === 0,
   `${resumed.status} ${JSON.stringify(resumed.body).slice(0, 260)}`);
-check('RT5b. and it never issues a delete for a row that is already absent: one call per surviving row',
-  calls.deletes.map((c) => `${c.table}/${c.id}`).sort().join(',') === 'ai_decision_traces/t3,community_games/c1,community_games/c2,game_analysis_reports/r1,recorded_hands/5001,replay_attempts/ra1,replay_attempts/ra2',
+check('RT5b. and it never issues a delete for a row that is absent or retained: one call per swept row',
+  calls.deletes.map((c) => `${c.table}/${c.id}`).sort().join(',') === 'community_games/c1,community_games/c2,game_analysis_reports/r1,recorded_hands/5001,replay_attempts/ra1,replay_attempts/ra2',
   JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`).sort()));
-check('RT5c. the resumed run still leaves the unlinked snapshot and the other player\u2019s game untouched',
-  rows.ai_decision_traces.some((t) => t.id === 't2') && rows.recorded_hands.some((r) => r.id === '7777')
-    && rows.coach_feedback_flags.length === 2,
+check('RT5c. the resumed run still leaves the retained ledger row, the unlinked snapshot and the other player\u2019s game untouched',
+  rows.ai_decision_traces.some((t) => t.id === 't2') && rows.ai_decision_traces.some((t) => t.id === 't3')
+    && rows.recorded_hands.some((r) => r.id === '7777') && rows.coach_feedback_flags.length === 2,
   `traces=${JSON.stringify(rows.ai_decision_traces.map((t) => t.id))}`);
 
 /* ── RT6/RT7: what the storage ANSWERED, told apart ─────────────────────────────────────────────
@@ -844,14 +864,15 @@ check('RT10c. and once the root-linked trace is gone too, the same request DOES 
 const declaredRefs = Object.entries(rules.GAME_COLUMNS)
   .filter(([key]) => key !== 'recordedHands')
   .flatMap(([key, cols]) => Object.keys(cols).filter((c) => c !== 'id').map((c) => `${key}.${c}`));
-const probedPairs = rules.SWEEP_PROBES.map((p) => `${p.key}.${p.column}`).sort();
-check('RT9. every reference column declared for a cascade table is probed by the audit, the sweep and the absence proof',
-  declaredRefs.slice().sort().join(',') === probedPairs.join(','),
-  JSON.stringify({ declared: declaredRefs.slice().sort(), probed: probedPairs }));
-check('RT9b. the probe that production was missing is present exactly once per column (no duplicate delete pass)',
-  rules.SWEEP_PROBES.filter((p) => p.key === 'decisionTraces').map((p) => p.column).sort().join(',') === 'recordedHandId,rootHandId'
-    && new Set(probedPairs).size === probedPairs.length,
-  JSON.stringify(rules.SWEEP_PROBES));
+const seenPairs = rules.INVENTORY_PROBES.map((p) => `${p.key}.${p.column}`).sort();
+check('RT9. every reference column declared for a cascade table is at least SEEN (swept or explicitly retained)',
+  declaredRefs.slice().sort().join(',') === seenPairs.join(','),
+  JSON.stringify({ declared: declaredRefs.slice().sort(), seen: seenPairs }));
+check('RT9b. and the protected ledger column is in the retention list, never in the delete list',
+  !rules.SWEEP_PROBES.some((p) => p.key === 'decisionTraces' && p.column === 'rootHandId')
+    && rules.RETAINED_EVIDENCE_PROBES.some((p) => p.key === 'decisionTraces' && p.column === 'rootHandId')
+    && new Set(seenPairs).size === seenPairs.length,
+  JSON.stringify({ sweep: rules.SWEEP_PROBES, retained: rules.RETAINED_EVIDENCE_PROBES }));
 
 // ── 17: partial failure and safe retry ──────────────────────────────────────────────────────────
 seedGame({ communityRoot: true });
@@ -985,29 +1006,25 @@ check('NC5b. and the foreign row was never addressed by a delete call, survived,
   !calls.deletes.some((c) => c.id === 'cF1') && rows.community_games.some((c) => c.id === 'cF1')
     && rows.recorded_hands.some((r) => r.id === GAME) && backstop.result === undefined,
   `deletes=${JSON.stringify(calls.deletes.map((c) => `${c.table}/${c.id}`))}`);
-/* The same backstop on the column that was missing in production: a foreign root-linked trace written
- * between the mount's preflight and the sweep must still not be removable, and the stop must name the
- * column it hit — `root_hand_id` is the only place the deployed build could not see the row at all. */
+/* Retention holds at the STORE level too, with no preflight in front of it: the sweep must never issue a
+ * delete against a root-linked ledger row, whoever owns it, and must still report the ones it kept. */
 seedGame({ foreignRootTrace: true });
-const backstopRootTrace = await storeModule.createGameDeletionStore({ client: directClient })
+const retainedStore = await storeModule.createGameDeletionStore({ client: directClient })
   .execute({ canonicalId: GAME, replayChildIds: ['5002', '5003', '5099'], ownerId: OWNER_A });
-check('RT3d. the sweep re-tests ownership on the root-hand trace probe and names the column it stopped on',
-  backstopRootTrace.failure?.reason === 'foreign_satellite_owners'
-    && backstopRootTrace.failure?.step === 'decisionTraces'
-    && backstopRootTrace.failure?.column === 'root_hand_id'
-    && !calls.deletes.some((c) => c.id === 't4'),
-  JSON.stringify(backstopRootTrace.failure ?? backstopRootTrace.result ?? null).slice(0, 220));
-seedGame({ foreignRootTrace: true });
-// Re-seeded deliberately: this arm must not depend on the arm above having LEFT `t4` behind, or removing
-// the ownership guard turns this line into a throw that hides every arm below it — which is exactly how an
-// inert negative control reads as a pass.
-rows.ai_decision_traces.find((t) => t.id === 't4').user_id = OWNER_A;
-const ownRootSweep = await storeModule.createGameDeletionStore({ client: directClient })
-  .execute({ canonicalId: GAME, replayChildIds: [], ownerId: OWNER_A });
-check('RT3e. and the own-owner root-linked trace on the same column IS swept once the set is clean',
-  Number(ownRootSweep.result?.removed?.decisionTraces ?? 0) >= 1
-    && !rows.ai_decision_traces.some((t) => ['t1', 't3', 't4'].includes(t.id)),
-  JSON.stringify(ownRootSweep.result ?? ownRootSweep.failure ?? null).slice(0, 200));
+check('RT3d. the sweep never addresses a root-linked ledger row, even called directly with no preflight',
+  retainedStore.result !== undefined && retainedStore.failure === undefined
+    && retainedStore.result?.removed?.decisionTraces === 1
+    && !calls.deletes.some((c) => c.table === 'ai_decision_traces' && ['t3', 't4'].includes(c.id)),
+  JSON.stringify(retainedStore.result ?? retainedStore.failure ?? null).slice(0, 200));
+check('RT3e. and countRetainedEvidence is the store\u2019s own read of that column, never a guess',
+  (await storeModule.createGameDeletionStore({ client: directClient }).countRetainedEvidence([GAME])).count === 2,
+  JSON.stringify(rows.ai_decision_traces.map((t) => [t.id, t.recorded_hand_id, t.root_hand_id])));
+const blindRetained = await storeModule.createGameDeletionStore({
+  client: { configured: true, async request() { return { ok: false, reason: 'club_account_unreachable', detail: 'unreachable' }; } }
+}).countRetainedEvidence([GAME]);
+check('RT3f. an unreadable retained read reports unavailable, never a confident zero',
+  blindRetained.unavailable === true && blindRetained.count === 0,
+  JSON.stringify(blindRetained));
 seedGame({ foreignAttempt: true });
 const noOwnerArg = await storeModule.createGameDeletionStore({ client: directClient })
   .execute({ canonicalId: GAME, replayChildIds: [] });
@@ -1266,7 +1283,7 @@ seedGame({ communityRoot: true });
 const [successLine] = await captureAudit(() => del(GAME, 'tok-admin'));
 check('RT12. a completed deletion is LOGGED as completed, with the per-table counts (the shipped console line)',
   successLine?.deleted === true && successLine?.alreadyAbsent === false
-    && successLine?.recordedHandId === GAME && Number(successLine?.removed?.decisionTraces) === 2
+    && successLine?.recordedHandId === GAME && Number(successLine?.removed?.decisionTraces) === 1
     && Number(successLine?.removed?.recordedHands) === 4 && successLine?.replayChildren === 3,
   JSON.stringify(successLine ?? null).slice(0, 240));
 seedGame({ communityRoot: true });
@@ -1302,7 +1319,7 @@ const refusalBodies = [
   ['unowned-satellite', fUnowned.body], ['mixed-satellites', fMixed.body], ['orphan-owner', fOrphan.body],
   ['mid-sweep-stop', midSweep.body], ['inventory-unavailable', noInventory.body],
   ['vendor-403', refused403.body], ['vendor-403-canonical', refusedCanonical.body],
-  ['acknowledged-keeps-row', lyingTraces.body], ['foreign-root-trace', fRootTrace.body],
+  ['acknowledged-keeps-row', lyingTraces.body],
   ['session-fault', sessionFault.body], ['refusal-fault', forbiddenFault.body]
 ].filter(([, body]) => body);
 const badRefusals = refusalBodies
@@ -1358,9 +1375,9 @@ check('NC4. no credential, bearer or private hand content appears in any deletio
       && !seen.includes('{"private":"cards"}') && !seen.includes('Bearer ');
   })(), '');
 check('NC4c. no ownership refusal names a table, a row id or another account id',
-  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep, fRootTrace].every((answer) => idFree(answer.body))
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].every((answer) => idFree(answer.body))
     && idFree(noInventory.body),
-  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep, fRootTrace].map((a) => JSON.stringify(a.body).slice(0, 90)).join(' | '));
+  [fRoot, fSource, fAttempt, fUnowned, fMixed, fOrphan, midSweep].map((a) => JSON.stringify(a.body).slice(0, 90)).join(' | '));
 
 let failed = 0;
 for (const r of results) {

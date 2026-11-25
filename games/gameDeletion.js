@@ -166,30 +166,39 @@ const SATELLITE_OWNER_COLUMNS = Object.freeze({
 });
 
 /**
- * The (table, column) pairs through which a satellite is selected for deletion. THE SINGLE SOURCE: the
- * ownership preflight, the sweep, the per-write backstop and the final absence proof all iterate this, so
- * a probe added here is audited automatically and a probe that exists in one place only cannot be
- * introduced silently.
- *
- * THE INVARIANT, asserted by the gate rather than left to a reviewer: every reference column a satellite
- * table DECLARES in `GAME_COLUMNS` (every entry but `id`) must appear here. A declared-but-unprobed column
- * is not a documentation gap — it is a row that survives the sweep and is then reported as absent, which is
- * what happened on the first production deletion: `ai_decision_traces.rootHandId` was declared at
- * `GAME_COLUMNS` and described as swept by the store's own comment, but was never probed. The live writer
- * proves the shape exists: `persistTracesForFlag` (aiDecisionTraces.js:96-106) writes
- * `recorded_hand_id: null` WITH `root_hand_id` set, and `persistAnalysisTrace` (:134-140) writes
- * `recorded_hand_id: trace.recorded_hand_id ?? null`. So a trace of this game is reachable through the root
- * column alone, and a sweep keyed only on `recorded_hand_id` leaves it behind while still answering
- * `deleted: true`.
+ * The (table, column) pairs through which a satellite is selected for DELETION. THE SINGLE SOURCE for the
+ * deletion scope: the ownership preflight, the sweep and the per-write backstop all iterate this, so a
+ * probe added here is audited automatically and a probe that exists in one place only cannot be introduced
+ * silently.
  *
  * Two passes per table, never one `OR`, because NCB's filter grammar has no OR; the row sets are
  * deduplicated by row id, so a row carrying the same value in both columns is audited, swept and counted
  * exactly once.
+ *
+ * WHY `ai_decision_traces` IS SWEPT ON `recorded_hand_id` ONLY. The root column DOES reach more rows — and
+ * those rows are protected evidence, not this game's residue. The writers and readers say so in the
+ * frontend's own words:
+ *   · `persistTracesForFlag` (aiDecisionTraces.js:87-115, called from coachFeedbackService.js:168-176 ONLY
+ *     when `recordedHandId == null`) writes `recorded_hand_id: null` with `board_id`/`root_hand_id` set,
+ *     so an Auction Review flag's raw request/response audit survives the compaction of the flag payload —
+ *     "Persist them durably first so the raw request/response audit is never lost".
+ *   · `coachFlagSnapshot.js:64-89` keeps only a compact reference in the flag row
+ *     (`fullAuditAvailable: true`, "Full request/response is captured in the immutable ai_decision_traces
+ *     ledger"), because the full audit blew the flag payload past the body limit.
+ *   · `FlaggedGamesAdmin.jsx:177-186` resolves the audit from the trace table and prefers the row the flag
+ *     names by `decision_id`: "The durable copy is the ai_decision_traces row (the flag's embedded audit is
+ *     only a convenience and can be absent after a page reload)".
+ *   · `loadTracesByBoard` (aiDecisionTraces.js:166-183) reads those rows back BY `board_id`, and its
+ *     comment states they "are keyed by board_id rather than recorded_hand_id".
+ * So a trace row whose `recorded_hand_id` is NULL is not this recorded hand's audit trail at all — it is a
+ * board/flag-keyed ledger row that `coach_feedback_flags` depends on, and the existing contract for that
+ * dependency is PRESERVE AND REPORT (see COACH_FLAGS_DISPOSITION). Deleting it would turn every such flag
+ * into a dangling `fullAuditAvailable: true` reference to a row that no longer exists. The root column is
+ * therefore still probed — for inventory and absence verification, never for deletion — below.
  */
 const SWEEP_PROBES = Object.freeze([
   { key: 'tournamentAttempts', column: 'recordedHandId' },
   { key: 'decisionTraces', column: 'recordedHandId' },
-  { key: 'decisionTraces', column: 'rootHandId' },
   { key: 'analysisReports', column: 'recordedHandId' },
   { key: 'replayAttempts', column: 'recordedHandId' },
   { key: 'replayAttempts', column: 'rootHandId' },
@@ -197,6 +206,33 @@ const SWEEP_PROBES = Object.freeze([
   { key: 'communityGames', column: 'sourceHandId' },
   { key: 'communityGames', column: 'rootHandId' }
 ]);
+
+/**
+ * Rows the cascade must SEE, count and report but never remove. Reported as
+ * `data.preserved.flagSnapshotTraces`, alongside `coachFeedbackFlags`.
+ *
+ * These probes are deliberately OUTSIDE `SWEEP_PROBES` and outside the ownership audit: a refusal exists
+ * to stop another account's row being deleted, and nothing here is deleted, so no ownership claim is
+ * needed and a foreign-owned snapshot must never block a legitimate deletion. Their only role is
+ * truthfulness — `countSatellites` iterates the combined list, so the route cannot answer
+ * `noTraceRemaining: true` while a row still names the deleted game, which is the claim the first
+ * production deletion would otherwise have made.
+ */
+const RETAINED_EVIDENCE_PROBES = Object.freeze([
+  { key: 'decisionTraces', column: 'rootHandId' }
+]);
+
+/**
+ * Every (table, column) pair the cascade knows about: deleted rows plus deliberately retained evidence.
+ * This is what the absence verification iterates.
+ *
+ * THE INVARIANT, asserted by the gate rather than left to a reviewer: every reference column a satellite
+ * table DECLARES in `GAME_COLUMNS` (every entry but `id`) must appear here. A declared-but-unseen column is
+ * not a documentation gap — it is a row that survives a deletion and is then reported as absent.
+ * `ai_decision_traces.root_hand_id` was exactly that: declared, described as swept by the store's own
+ * comment, and invisible to both the ownership audit and the absence proof.
+ */
+const INVENTORY_PROBES = Object.freeze([...SWEEP_PROBES, ...RETAINED_EVIDENCE_PROBES]);
 
 /** The key whose rows are collected across several columns before deletion (its own read-back proof). */
 const MULTI_COLUMN_SATELLITE = 'communityGames';
@@ -483,7 +519,14 @@ function deletionResult({ removed = {}, replayChildren = 0, preserved = {}, alre
   };
   // Reported, never deleted — see COACH_FLAG_TABLE. A zero here means the game had no flags; a non-zero
   // means the administrator should expect a flag pointing at a game that is now gone.
-  const kept = { coachFeedbackFlags: Number(preserved.coachFeedbackFlags) || 0 };
+  // `flagSnapshotTraces` is the same disposition for the LEDGER rows those flags resolve their full audit
+  // from (RETAINED_EVIDENCE_PROBES): a null means the count could not be read, NEVER that it was zero.
+  const kept = {
+    coachFeedbackFlags: Number(preserved.coachFeedbackFlags) || 0,
+    flagSnapshotTraces: preserved.flagSnapshotTraces === null || preserved.flagSnapshotTraces === undefined
+      ? null
+      : Number(preserved.flagSnapshotTraces) || 0
+  };
   return {
     http: 200,
     body: {
@@ -545,6 +588,8 @@ module.exports = {
   COACH_FLAGS_DISPOSITION,
   SWEEP_STEPS,
   SWEEP_PROBES,
+  RETAINED_EVIDENCE_PROBES,
+  INVENTORY_PROBES,
   SATELLITE_OWNER_COLUMNS,
   MULTI_COLUMN_SATELLITE,
   DELETION_FAULT_CLASSES,

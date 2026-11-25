@@ -25,7 +25,7 @@
  *      between the audit and the sweep must still not be removable. (§4b of `gameDeletion.js`.)
  */
 
-const { GAME_TABLES, GAME_COLUMNS, COACH_FLAG_TABLE, exactRowOps, SWEEP_PROBES, MULTI_COLUMN_SATELLITE, classifySatellites, satelliteRefusal } = require('./gameDeletion.js');
+const { GAME_TABLES, GAME_COLUMNS, COACH_FLAG_TABLE, exactRowOps, SWEEP_PROBES, INVENTORY_PROBES, RETAINED_EVIDENCE_PROBES, MULTI_COLUMN_SATELLITE, classifySatellites, satelliteRefusal } = require('./gameDeletion.js');
 
 const READ = (table, query) => ({ group: 'data', path: `read/${table}${query ? `?${query}` : ''}`, method: 'GET' });
 const REMOVE = (table, id) => ({ group: 'data', path: `delete/${table}/${encodeURIComponent(id)}`, method: 'DELETE' });
@@ -218,15 +218,22 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { groups: out };
   }
 
-  /** Satellite count without deleting — used to tell "already swept" from "never existed". */
+  /**
+   * Satellite count without deleting — used to tell "already swept" from "never existed", and to answer
+   * `noTraceRemaining` honestly.
+   *
+   * It iterates INVENTORY_PROBES (swept columns PLUS deliberately retained ones), not SWEEP_PROBES: a
+   * retained flag-snapshot ledger row still NAMES the deleted game, so claiming "nothing mentioning this id
+   * remains" while it stands would be the same false absence proof that hid the residue in the first
+   * production deletion. Retained rows are never removed; they are simply not invisible.
+   */
   async function countSatellites(ids) {
-    // Every table AND column the sweep touches is probed, or a game that still has a satellite row could
-    // be reported as "no trace remaining" — the one claim this function exists to make honestly. Derived
-    // from SWEEP_PROBES so `community_games` cannot fall out of the proof the way it once did.
+    // Every table AND column the cascade knows about is probed, or a game that still has a satellite row
+    // could be reported as "no trace remaining" — the one claim this function exists to make honestly.
     let total = 0;
     const counted = new Set();
     let unique = 0;
-    for (const probe of SWEEP_PROBES) {
+    for (const probe of INVENTORY_PROBES) {
       const found = await rowsForAny(T[probe.key], C[probe.key][probe.column], ids);
       if (found.storeFailure) return found;
       // rowsForAny deduplicates within one column, so a row matched by two probes of the same table would
@@ -235,6 +242,26 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
       total = counted.size;
     }
     return { total };
+  }
+
+  /**
+   * The rows the cascade deliberately keeps: trace rows linked to the chain only through `root_hand_id`,
+   * which is where an Auction Review flag's full request/response audit lives
+   * (`persistTracesForFlag` → `loadTracesByBoard`, referenced by `coach_feedback_flags`). Counted and
+   * reported, NEVER deleted — the same disposition as the flag row itself. An unreadable count is
+   * `unavailable`, never a confident 0.
+   */
+  async function countRetainedEvidence(ids) {
+    const seen = new Set();
+    for (const probe of RETAINED_EVIDENCE_PROBES) {
+      const found = await rowsForAny(T[probe.key], C[probe.key][probe.column], ids);
+      if (found.storeFailure) return { unavailable: true, count: seen.size };
+      for (const row of found.rows) {
+        const rowId = eq(row?.id);
+        if (rowId !== '') seen.add(rowId);
+      }
+    }
+    return { count: seen.size };
   }
 
   /**
@@ -362,7 +389,7 @@ function createGameDeletionStore({ client, rowLimit = 200 } = {}) {
     return { count };
   }
 
-  return { findCanonical, findChildren, findSatellites, countSatellites, countCoachFlags, execute, readBackPublications };
+  return { findCanonical, findChildren, findSatellites, countSatellites, countRetainedEvidence, countCoachFlags, execute, readBackPublications };
 }
 
 module.exports = { createGameDeletionStore, rowsOf, MAX_ROWS_PER_TABLE };

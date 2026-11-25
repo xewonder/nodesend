@@ -272,11 +272,23 @@ function buildGameDeletionMount({
     const flagged = typeof store.countCoachFlags === 'function'
       ? await store.countCoachFlags([plan.canonicalId, ...plan.replayChildIds])
       : { count: 0, unavailable: true };
+    /* The flag-snapshot ledger rows are counted over the same id set and reported, never removed: they are
+     * where an Auction Review flag resolves its full request/response audit
+     * (`coach_feedback_flags` keeps only `fullAuditAvailable: true` plus a `decision_id`). Deleting them
+     * would leave the preserved flag pointing at a row that no longer exists — the same dangling-reference
+     * harm the replay-child rule refuses to create, arriving from the other direction. */
+    phase = 'retainedEvidenceCount';
+    const snapshots = typeof store.countRetainedEvidence === 'function'
+      ? await store.countRetainedEvidence([plan.canonicalId, ...plan.replayChildIds])
+      : { count: 0, unavailable: true };
     const answer = deletionResult({
       removed: executed.result.removed,
       replayChildren: executed.result.replayChildren,
       // A failed count is reported as unknown (null), never as a confident 0.
-      preserved: { coachFeedbackFlags: flagged?.unavailable ? null : (flagged?.count ?? 0) },
+      preserved: {
+        coachFeedbackFlags: flagged?.unavailable ? null : (flagged?.count ?? 0),
+        flagSnapshotTraces: snapshots?.unavailable ? null : (snapshots?.count ?? 0)
+      },
       alreadyAbsent: false,
       confirmedGone: true
     });
