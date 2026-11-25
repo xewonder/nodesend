@@ -2115,9 +2115,13 @@ function invitationRateHit(ip) {
    with that account's own row scope, and never the database secret. `readClubAccountConfig` supplies
    it; if the account is not configured the answer is a named 503 rather than a guess.
 
-   The shape it returns is the same vendor envelope `ncbPublicRead` produced, so the predicate in
-   `findUsableInvitationRow` — exact code match, unused flag, duplicates refused — is preserved
-   verbatim rather than rewritten around the new transport. */
+   The shape it returns is the same vendor envelope `ncbPublicRead` produced, so no caller had to change.
+   The PREDICATE in `findUsableInvitationRow` is NOT the old one, and the comment that used to say
+   "exact code match, unused flag, duplicates refused" was describing a rule that had already been
+   retired: a code value is a PROMOTIONAL POOL (up to a hundred rows carrying `AOMB`, each one
+   redemption), so more than one match is the normal case, never a fault. What the predicate enforces is
+   exact case-sensitive code match, an unused flag, no allocation to a different account, and the lowest
+   record id among the eligible rows. */
 async function invitationRowRead({ code = "", id = "", registeredUserId = "" } = {}) {
   /* ONE FILTER NAME, CHOSEN FROM THREE. The value is always URL-encoded and the name is never taken
      from the caller, so a route cannot smuggle a fourth column name into a privileged read: NCB's
@@ -2257,8 +2261,17 @@ async function consumeInvitationDecision(req) {
   };
   if (outcome.ok) {
     const claimed = outcome.outcome === "already_claimed";
+    /* `recordId` is the row this account's claim spent, and it is carried because the alternative is the
+       client re-finding the row BY CODE — and a promotional code legitimately names up to a hundred
+       rows, any of which may be somebody else's spent record. A first-match lookup on a pool answers
+       "not mine" about a claim that succeeded, which is precisely how a spent code ends up displayed as
+       "invalid or already used". The id is the caller's own row, on a session-guarded route; the
+       anonymous validate route still returns a bare boolean and never an id or a count. */
     return { status: 200, body: {
       success: true, recovered: outcome.recovered === true, alreadyClaimed: claimed,
+      ...(outcome.recordId !== null && outcome.recordId !== undefined ? { recordId: outcome.recordId } : {}),
+      ...(Array.isArray(outcome.strayReservationsReleased) && outcome.strayReservationsReleased.length
+        ? { strayReservationsReleased: outcome.strayReservationsReleased } : {}),
       code: claimed ? "INVITATION_ALREADY_CLAIMED" : "INVITATION_CLAIMED",
       messageKey: claimed ? "auth.invitation_claimed" : "auth.invitation_claimed_now", fields: []
     } };
@@ -2358,7 +2371,17 @@ async function consumeInvitationHandler(req, res) {
     // `recovered` is the difference between "this call spent a code" and "this call finished a
     // registration a previous call had already reserved". A client that cannot tell them apart
     // cannot report the truth to the person waiting on the screen.
-    ...(decision.body.recovered === true ? { recovered: true } : {}), requestId });
+    ...(decision.body.recovered === true ? { recovered: true } : {}),
+    // `recordId` names the row that was spent, and it is forwarded HERE rather than left in the
+    // decision: this handler builds its own envelope, and a field that is computed and then dropped on
+    // the way out is indistinguishable from a field that was never decided. The client needs the id
+    // because a promotional code legitimately names up to a hundred rows — verifying a claim by
+    // re-reading the code and taking the first match answers "not mine" about a claim that succeeded.
+    ...(decision.body.recordId !== undefined && decision.body.recordId !== null
+      ? { recordId: decision.body.recordId } : {}),
+    ...(Array.isArray(decision.body.strayReservationsReleased) && decision.body.strayReservationsReleased.length
+      ? { strayReservationsReleased: decision.body.strayReservationsReleased } : {}),
+    requestId });
 }
 
 // ── PER-USER AI CREDENTIALS — the one Stage 1 surface that can really tighten ─
@@ -4453,5 +4476,12 @@ module.exports = {
   invitationClaim, createInvitationClaim, invitationReservations, createInvitationReservations,
   ncbTransportHealth, ncbNativeTransport: NCB_TRANSPORT,
   ncbGatewayTables: require("./ncb/gateway.js").DEFAULT_TABLES,
-  ncbGatewayClubTables: require("./ncb/gateway.js").NEVER_THROUGH_THE_GATEWAY
+  ncbGatewayClubTables: require("./ncb/gateway.js").NEVER_THROUGH_THE_GATEWAY,
+  // The CORS contract as shipped data, for the same reason every other table here is exported: a gate
+  // that re-typed the credentialed path list would keep passing after the route it describes was renamed
+  // or widened — which is how this defect reached production while every /ncb route was already correct.
+  corsContractForGate: {
+    credentialedBridgePaths: require("./ncb/gateway.js").CREDENTIALED_BRIDGE_PATHS,
+    isCredentialed: require("./ncb/gateway.js").isCredentialedCorsPath
+  }
 };

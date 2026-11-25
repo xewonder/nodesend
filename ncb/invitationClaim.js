@@ -242,8 +242,33 @@ function createInvitationClaim({ readRows, writeRow, reservations = null, readRe
       const codeValue = normalizeInvitationCode(record.row.code);
       if (!codeValue) continue;
       const outcome = await finish({ code: codeValue, recordId, reservationId: reservation.id, userId: account, emailHash });
-      if (outcome.ok) return { ...outcome, recovered: true, code: codeValue };
-      if (outcome.outcome === OUTCOME.CONFLICT) event('invitation_recovery_conflict', { recordId, attemptedBy: account });
+      if (!outcome.ok) {
+        if (outcome.outcome === OUTCOME.CONFLICT) event('invitation_recovery_conflict', { recordId, attemptedBy: account });
+        continue;
+      }
+      /* ONE ACCOUNT, ONE RECORD. Under the deployed defect a single address could come to hold more than
+         one reservation: every retry of a claim whose response the browser could not read took the NEXT
+         record, because its own pending reservation looked like a rival's. Fixing that at the source
+         (invitationReservations.reserve now recognises our own digest) does not retire the residue such
+         a run may already have left, and a pending reservation on a record that is still unused and
+         unallocated helps nobody - it holds a valid invitation out of the pool with no account behind
+         it. So the surplus rows under THIS digest are given back, one record kept: the spend, and only
+         the spend, stays held. The release is evidence-bound through `recordSpent` - used, allocated or
+         merely unreadable all refuse the release - so no record that anything depends on is freed, and
+         no second record is ever spent by this path. */
+      const strays = [];
+      for (const other of rows) {
+        const otherId = other?.code_row_id;
+        if (otherId === null || otherId === undefined || otherId === '') continue;
+        if (String(otherId) === String(recordId)) continue;
+        const done = await release({ reservationId: other.id, recordId: otherId });
+        strays.push(String(otherId));
+        event(done.ok === true ? 'invitation_stray_reservation_released' : 'invitation_stray_release_refused',
+          { recordId: String(otherId), reason: done.reason ?? null });
+      }
+      return { ...outcome, recovered: true, code: codeValue,
+        ...(outcome.recordId !== undefined ? { recordId: outcome.recordId } : {}),
+        ...(strays.length ? { strayReservationsReleased: strays } : {}) };
     }
     return { ok: false, outcome: OUTCOME.UNCONFIRMED, candidates: rows.length };
   }

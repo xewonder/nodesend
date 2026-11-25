@@ -470,6 +470,35 @@ function parseTables(env) {
 
 const GATEWAY_PREFIX = '/ncb';
 
+/*
+ * RELAY ROUTES OUTSIDE `/ncb` THAT THE BROWSER CALLS WITH CREDENTIALS.
+ *
+ * Measured, not inferred: `src/api.js:132` issues EVERY relay fetch with `credentials: 'include'`, and
+ * `src/pages/Login.jsx:364` finishes registration through `relayFetch('auth/consume-invitation')` — a
+ * relay-root path, not a `/ncb` one. Under the app-wide `cors()` mount, a credentialed request whose
+ * response carries `Access-Control-Allow-Origin: *` is rejected by the browser before the page can read
+ * it, however correct the body is: the player sees "invalid or already used" for a code the server just
+ * spent. Confirmed against production on 2026-11-25 — `OPTIONS /auth/consume-invitation` answered 204
+ * with `Access-Control-Allow-Origin: *` and NO `Access-Control-Allow-Credentials`, while the control
+ * `OPTIONS /ncb/auth/get-session` on the same build answered the explicit origin plus credentials.
+ *
+ * So the credentialed treatment is extended to EXACTLY these paths, from the SAME allow-list the gateway
+ * already trusts — which is what makes this a tightening rather than a widening: an origin that can
+ * already reach `/ncb/auth/sign-up/email` is the only origin that can read this response, and everything
+ * else loses the wildcard it never needed. A path absent from this list keeps today's answer verbatim,
+ * because `/ai`, `/health`, Trickster, quota, multiplayer and Clubs must not see their browser contract
+ * change on the strength of a registration fix.
+ *
+ * Deliberately a LIST of exact paths rather than a prefix rule: a prefix like `/auth` would silently
+ * bring every future authentication route under credentialed CORS without anyone deciding it.
+ */
+const CREDENTIALED_BRIDGE_PATHS = Object.freeze(['/auth/consume-invitation']);
+
+/** Does this path need the explicit-origin-with-credentials treatment? */
+function isCredentialedCorsPath(path) {
+  return path === GATEWAY_PREFIX || path.startsWith(`${GATEWAY_PREFIX}/`) || CREDENTIALED_BRIDGE_PATHS.includes(path);
+}
+
 /**
  * THE CORS DECISION, for the relay's single app-wide `cors()` call in bridge.js.
  *
@@ -505,7 +534,7 @@ function createCorsResolver({ env = process.env, exposedHeaders = null } = {}) {
   return function ncbCors(req, callback) {
     let path = '';
     try { path = String(req.path || (req.url || '').split('?')[0]); } catch { path = ''; }
-    if (path !== GATEWAY_PREFIX && !path.startsWith(`${GATEWAY_PREFIX}/`)) {
+    if (!isCredentialedCorsPath(path)) {
       return callback(null, base);
     }
     const origin = String(req.headers?.origin || '');
@@ -881,7 +910,14 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
           // `settled` means the reservation has been driven to a conclusion by this request, either
           // way: the finish hook must not release what is now either spent or awaiting recovery.
           if (held.settled !== 'released') held.settled = outcome.ok ? 'claimed' : 'held_for_recovery';
-          claimed = { invitationClaimed: outcome.ok === true, invitationClaim: outcome.outcome };
+          claimed = {
+            invitationClaimed: outcome.ok === true,
+            invitationClaim: outcome.outcome,
+            // The row this claim spent, so a pool of a hundred identical codes never has to be resolved
+            // by a first-match lookup that could land on somebody else's record.
+            ...(outcome.recordId !== null && outcome.recordId !== undefined
+              ? { invitationRecordId: String(outcome.recordId) } : {})
+          };
           if (outcome.outcome === 'claim_conflict') {
             event('ncb_gateway_registration_conflict', { recordId: held.recordId, requestId });
           }
@@ -1221,6 +1257,7 @@ function buildNcbGateway({ env = process.env, fetchImpl = null, log = null, gues
 // tables would pass while the shipped contract drifted.
 module.exports = {
   buildNcbGateway, createCorsResolver, authUpstreamStatus, signUpOutcomeIsAmbiguous, AUTH_ROUTES, DEFAULT_TABLES, NEVER_THROUGH_THE_GATEWAY,
+  CREDENTIALED_BRIDGE_PATHS, isCredentialedCorsPath,
   // The tournament narrowing, as data: a gate asserts the blocked set and the refusal NAME the caller
   // receives, rather than re-typing them and passing while the shipped surface drifts.
   TOURNAMENT_TABLES, TOURNAMENT_GATEWAY_REFUSAL, TOURNAMENT_GATEWAY_DETAIL, AUTHORITY_TABLES, PLAYER_TABLE_WRITE_POLICY,

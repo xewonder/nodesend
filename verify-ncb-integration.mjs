@@ -1234,6 +1234,126 @@ check('12. a rebuilt relay with the same key opens the live handle; a different 
     `sign-in=${signInStill.status} get-session=${refreshedStill.status} leaked=${leaked14.join(',')}`);
 }
 
+/* ── 15. THE CLAIM ROUTE'S BROWSER CONTRACT ─────────────────────────────────────────────────────
+ * Registration ends in `relayFetch('auth/consume-invitation')`, and EVERY relay fetch in the shipped
+ * client carries `credentials: 'include'` (src/api.js:132). A credentialed response that carries
+ * `Access-Control-Allow-Origin: *` is not merely untidy — the browser discards it before the page can
+ * read the body, so a code the server had just spent arrived at the player as "invalid or already
+ * used". Measured against production 2026-11-25: this route answered the preflight with `*` and no
+ * `Access-Control-Allow-Credentials`, while `/ncb/auth/get-session` on the same build answered the
+ * explicit origin plus credentials. So the header set is asserted here as data, on preflight, on
+ * success, and on every error shape — an error body the page cannot read is the same bug as a missing
+ * error handler. The counterpart arms below are the ones that keep the fix narrow: a route NOT declared
+ * as credentialed must keep answering exactly as it did before, because `/ai`, `/health`, Trickster,
+ * quota, multiplayer and Clubs are not this incident's to change.
+ */
+{
+  const probe = async (method, target, { origin = PROD_ORIGINS[0], headers = {}, body } = {}) => {
+    const res = await fetch(`${BASE}${target}`, {
+      method, ...(body === undefined ? {} : { body }),
+      headers: { ...(origin === null ? {} : { Origin: origin }), ...headers }
+    });
+    const h = {};
+    res.headers.forEach((v, k) => { h[k] = v; });
+    let parsed = null;
+    try { parsed = await res.json(); } catch {}
+    return { status: res.status, h, body: parsed };
+  };
+  const ACAO = 'access-control-allow-origin';
+  const ACC = 'access-control-allow-credentials';
+
+  const preflight = await probe('OPTIONS', '/auth/consume-invitation', {
+    headers: { 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type,authorization' }
+  });
+  check('15a. the claim preflight answers the EXPLICIT origin with Allow-Credentials, never the wildcard the browser discards',
+    preflight.status === 204 && preflight.h[ACAO] === PROD_ORIGINS[0] && preflight.h[ACC] === 'true'
+      && /POST/.test(String(preflight.h['access-control-allow-methods'] || ''))
+      && /authorization/i.test(String(preflight.h['access-control-allow-headers'] || ''))
+      && preflight.h['access-control-max-age'] === '600',
+    JSON.stringify(preflight.h));
+
+  // Every origin the deployment trusts for /ncb/auth/sign-up must be able to READ the claim that
+  // follows it — one allow-list, one decision, no second table to drift.
+  const perOrigin = [];
+  for (const origin of PROD_ORIGINS) {
+    perOrigin.push({ origin, ...(await probe('OPTIONS', '/auth/consume-invitation', { origin, headers: { 'Access-Control-Request-Method': 'POST' } })) });
+  }
+  check('15b. every allow-listed production origin gets its own origin echoed with credentials on the claim route',
+    perOrigin.length === PROD_ORIGINS.length
+      && perOrigin.every((r) => r.status === 204 && r.h[ACAO] === r.origin && r.h[ACC] === 'true'),
+    JSON.stringify(perOrigin.map((r) => `${r.origin}=${r.h[ACAO]}/${r.h[ACC]}`)));
+
+  const stranger = await probe('OPTIONS', '/auth/consume-invitation', {
+    origin: 'https://evil-cors-probe.invalid', headers: { 'Access-Control-Request-Method': 'POST' }
+  });
+  check('15c. an origin that is not on the list gets NO allow-origin header at all — the fix tightens, it does not widen',
+    stranger.h[ACAO] === undefined && stranger.h[ACC] === undefined, JSON.stringify(stranger.h));
+
+  const noOrigin = await probe('POST', '/auth/consume-invitation', { origin: null, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'FLOW-VALID-1' }) });
+  check('15d. a caller with no Origin header (CLI, another server) is unaffected — no browser is involved to satisfy',
+    noOrigin.status === 401 && noOrigin.h[ACAO] === '*', JSON.stringify({ status: noOrigin.status, acao: noOrigin.h[ACAO] }));
+
+  const anonPost = await probe('POST', '/auth/consume-invitation', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'FLOW-VALID-1' }) });
+  check('15e. the 401 error response carries the credentialed header pair too — an unreadable refusal is the same failure as no refusal',
+    anonPost.status === 401 && anonPost.h[ACAO] === PROD_ORIGINS[0] && anonPost.h[ACC] === 'true',
+    JSON.stringify({ status: anonPost.status, acao: anonPost.h[ACAO], acc: anonPost.h[ACC] }));
+
+  // A real registration, claimed through the route, with the headers measured on the SUCCESS path.
+  rows.push(
+    { id: 981, table: 'user_codes', user_id: 'club-svc-1', code: 'CORS-FLOW-1', used: 0, registered_user_id: null },
+    { id: 980, table: 'user_codes', user_id: 'club-svc-1', code: 'CORS-FLOW-1', used: 0, registered_user_id: null }
+  );
+  const corsSignUp = await fetch(`${BASE}/ncb/auth/sign-up/email`, {
+    method: 'POST', headers: { Origin: PROD_ORIGINS[0], 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Cors Flow', email: 'cors-flow@poc.invalid', password: 'pw-flow-fixture', invitationCode: 'CORS-FLOW-1' })
+  });
+  const corsSigned = await corsSignUp.json().catch(() => ({}));
+  const corsHandle = String(corsSigned?.token || '');
+  const corsClaim = await probe('POST', '/auth/consume-invitation', {
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${corsHandle}` },
+    body: JSON.stringify({ code: 'CORS-FLOW-1' })
+  });
+  const corsRetry = await probe('POST', '/auth/consume-invitation', {
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${corsHandle}` },
+    body: JSON.stringify({ code: 'CORS-FLOW-1' })
+  });
+  const corsRows = rows.filter((r) => r.table === 'user_codes' && String(r.code) === 'CORS-FLOW-1');
+  check('15f. a successful claim answers 200 with the header pair and names the record it spent, so the client never has to resolve a pool by first match',
+    corsClaim.status === 200 && corsClaim.body?.success === true && corsClaim.h[ACAO] === PROD_ORIGINS[0]
+      && corsClaim.h[ACC] === 'true' && String(corsClaim.body?.recordId ?? '').length > 0
+      && corsRows.some((r) => String(r.id) === String(corsClaim.body?.recordId) && Number(r.used) === 1),
+    JSON.stringify({ status: corsClaim.status, body: corsClaim.body, rows: corsRows.map((r) => `${r.id}:${r.used}`) }));
+  check('15g. and the idempotent retry answers alreadyClaimed with the SAME record and headers, spending nothing further',
+    corsRetry.status === 200 && corsRetry.body?.success === true && corsRetry.body?.alreadyClaimed === true
+      && String(corsRetry.body?.recordId) === String(corsClaim.body?.recordId)
+      && corsRetry.h[ACC] === 'true'
+      && corsRows.filter((r) => Number(r.used) === 1).length === 1,
+    JSON.stringify({ first: corsClaim.body, second: corsRetry.body }));
+
+  // The narrowness proof: routes the client does NOT fetch credentialed, or that were already correct,
+  // keep answering exactly as before this change.
+  const validateCors = await probe('OPTIONS', '/auth/validate-invitation', { headers: { 'Access-Control-Request-Method': 'POST' } });
+  const healthCors = await probe('GET', '/health');
+  const aiCors = await probe('GET', '/ai/quota');
+  const ncbCors = await probe('OPTIONS', '/ncb/auth/get-session', { headers: { 'Access-Control-Request-Method': 'GET' } });
+  check('15h. nothing else changed shape: undeclared relay paths keep the wildcard they always gave, /ncb keeps its explicit pair',
+    validateCors.h[ACAO] === '*' && validateCors.h[ACC] === undefined
+      && healthCors.h[ACAO] === '*' && aiCors.h[ACAO] === '*'
+      && ncbCors.h[ACAO] === PROD_ORIGINS[0] && ncbCors.h[ACC] === 'true',
+    JSON.stringify({ validate: validateCors.h[ACAO], validateAcc: validateCors.h[ACC], health: healthCors.h[ACAO], ai: aiCors.h[ACAO], ncb: `${ncbCors.h[ACAO]}/${ncbCors.h[ACC]}` }));
+  const corsContract = bridge.corsContractForGate ?? {};
+  check('15i. the credentialed set is shipped data, not a comment: exactly one relay path, plus the gateway prefix that already had it',
+    JSON.stringify(corsContract.credentialedBridgePaths ?? []) === JSON.stringify(['/auth/consume-invitation'])
+      && corsContract.isCredentialed?.('/auth/consume-invitation') === true
+      && corsContract.isCredentialed?.('/ncb/auth/sign-up/email') === true
+      && corsContract.isCredentialed?.('/ncb') === true
+      && corsContract.isCredentialed?.('/auth/validate-invitation') === false
+      && corsContract.isCredentialed?.('/auth/consume-invitation-x') === false
+      && corsContract.isCredentialed?.('/ai/quota') === false
+      && corsContract.isCredentialed?.('/health') === false,
+    JSON.stringify(corsContract.credentialedBridgePaths ?? null));
+}
+
 await new Promise((r) => relay.close(r));
 await vite.close();
 await new Promise((r) => native.close(r));

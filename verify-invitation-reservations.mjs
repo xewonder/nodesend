@@ -22,7 +22,7 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const ROOT = process.cwd();
 const { createInvitationReservations } = require(path.join(ROOT, 'ncb/invitationReservations.js'));
-const { createInvitationClaim } = require(path.join(ROOT, 'ncb/invitationClaim.js'));
+const { createInvitationClaim, hashOf } = require(path.join(ROOT, 'ncb/invitationClaim.js'));
 const { normalizeInvitationCode, INVITATION_CODE_MAX_LENGTH } = require(path.join(ROOT, 'ncb/invitationCode.js'));
 
 const results = [];
@@ -744,6 +744,134 @@ await check('R47. requirement 6 again at the store: a spent record stays unreser
     && Number(row.used) === 1 && String(row.registered_user_id) === 'acct-777' && row.user_id === 'issuer'
     || { ok: false, why: `${JSON.stringify(rival)} row=${JSON.stringify(row)}` };
 });
+/* ── THE HUNDRED-RECORD PROMOTIONAL POOL, AND THE RETRY THAT MUST NOT COST A RECORD ──────────────
+ * The production incident this file now guards against was not a claim that failed — it was a claim that
+ * SUCCEEDED and whose response the browser could not read (the relay answered a credentialed request with
+ * `Access-Control-Allow-Origin: *`). Every retry of that registration took the NEXT record, because its own
+ * pending reservation looked like a rival's, so a holder of `AOMB` issued a hundred times could drain the
+ * pool one retry at a time while never finishing a registration. The arms below are the pool at the size a
+ * promotion is actually issued, the exhaustion boundary, the concurrency guarantee at that size, and the
+ * retry that has to cost nothing.
+ */
+const hundredPool = (code, startId = 3000) => Array.from({ length: 100 }, (_, i) => (
+  { id: startId + i, code, used: 0, registered_user_id: null, user_id: 'issuer' }
+));
+
+await check('R48. requirement 1+4+5 at promotional scale: 100 identical codes are one pool, 100 claims spend 100 DISTINCT records in ascending id order, and the code is valid until the last one', async () => {
+  const { claim, store } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const taken = [];
+  for (let i = 0; i < 100; i += 1) {
+    const begun = await claim.begin({ code: 'AOMB', email: `fan-${i}@example.com` });
+    if (!begun.ok) return { ok: false, why: `claim ${i} refused early: ${JSON.stringify(begun)}` };
+    const done = await claim.finish({ code: 'AOMB', recordId: begun.recordId, reservationId: begun.reservationId, userId: `acct-${i}`, emailHash: begun.emailHash });
+    if (!done.ok) return { ok: false, why: `finish ${i} failed: ${JSON.stringify(done)}` };
+    taken.push(Number(begun.recordId));
+  }
+  const rows = store.codes.filter((r) => r.code === 'AOMB');
+  const over = await claim.begin({ code: 'AOMB', email: 'one-too-many@example.com' });
+  return new Set(taken).size === 100 && taken.every((id, i) => id === 3000 + i)
+    && rows.filter((r) => Number(r.used) === 1).length === 100
+    && rows.every((r) => String(r.registered_user_id ?? '').length > 0)
+    && rows.every((r) => r.user_id === 'issuer')
+    && over.ok === false && over.outcome === 'invitation_exhausted'
+    || { ok: false, why: `taken=${taken.length} distinct=${new Set(taken).size} used=${rows.filter((r) => Number(r.used) === 1).length} over=${JSON.stringify(over)}` };
+});
+
+await check('R49. requirement 3: a USED record never blocks the pool — with the first forty ids spent, the forty-first is claimed and the tail stays available', async () => {
+  const { claim, store } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  store.codes.filter((r) => r.code === 'AOMB' && r.id < 3040).forEach((r) => { r.used = 1; r.registered_user_id = 'earner'; });
+  const begun = await claim.begin({ code: 'AOMB', email: emailA });
+  const free = store.codes.filter((r) => r.code === 'AOMB' && Number(r.used) === 0).length;
+  return begun.ok === true && Number(begun.recordId) === 3040 && free === 60
+    || { ok: false, why: JSON.stringify({ begun, free }) };
+});
+
+await check('R50. requirement 7 at scale: one hundred SIMULTANEOUS claims on one code value take one hundred different records, and the store holds one reservation per record', async () => {
+  const { claim, store } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const raced = await Promise.all(Array.from({ length: 100 }, (_, i) => claim.begin({ code: 'AOMB', email: `racer-${i}@example.com` })));
+  const ok = raced.filter((r) => r.ok);
+  const ids = ok.map((r) => String(r.recordId));
+  const held = store.reservations.filter((r) => store.codes.some((c) => c.code === 'AOMB' && String(c.id) === String(r.code_row_id)));
+  return ok.length === 100 && new Set(ids).size === 100 && held.length === 100 && store.refused >= 0
+    || { ok: false, why: `ok=${ok.length} distinct=${new Set(ids).size} reservations=${held.length}` };
+});
+
+await check('R51. requirement 8 — the defect itself: retrying a claim the browser could not read REUSES its own record and costs no second one', async () => {
+  const { claim, store } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const first = await claim.begin({ code: 'AOMB', email: emailA });
+  const second = await claim.begin({ code: 'AOMB', email: emailA });
+  const third = await claim.begin({ code: 'AOMB', email: emailA });
+  const rowsForUs = store.reservations.filter((r) => String(r.invitee_email_hash) === String(first.emailHash));
+  const untouched = store.codes.filter((r) => r.code === 'AOMB' && Number(r.used) === 0 && String(r.registered_user_id ?? '') === '').length;
+  return first.ok === true && second.ok === true && third.ok === true
+    && String(first.recordId) === String(second.recordId) && String(second.recordId) === String(third.recordId)
+    && rowsForUs.length === 1
+    && untouched === 100
+    || { ok: false, why: `ids=${JSON.stringify([first.recordId, second.recordId, third.recordId])} ourRows=${rowsForUs.length} untouched=${untouched}` };
+});
+
+await check('R52. requirement 7 across accounts: a STRANGER holds the lowest record, so the next registrant is advanced to the following one and nobody else\u2019s reservation is touched', async () => {
+  const { claim, store } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const holder = await claim.begin({ code: 'AOMB', email: emailA });
+  const rival = await claim.begin({ code: 'AOMB', email: emailB });
+  const holderRow = store.reservations.find((r) => String(r.code_row_id) === String(holder.recordId));
+  return Number(rival.recordId) === Number(holder.recordId) + 1
+    && holderRow && String(holderRow.invitee_email_hash) === String(holder.emailHash)
+    && store.reservations.filter((r) => String(r.code_row_id) === String(rival.recordId)).length === 1
+    || { ok: false, why: JSON.stringify({ holder: holder.recordId, rival: rival.recordId, rows: store.reservations.length }) };
+});
+
+await check('R53. an unkeyed deployment adopts NOTHING: with no HMAC secret, a duplicate is reported as taken rather than reused, so no caller can claim a reservation it did not make', async () => {
+  const { reservations } = build();
+  const made = await reservations.reserve({ recordId: '7001', emailHash: 'digest-of-somebody-else' });
+  const strangerRetry = await reservations.reserve({ recordId: '7001', emailHash: 'a-different-digest' });
+  const unkeyedRetry = await reservations.reserve({ recordId: '7001', emailHash: '' });
+  const sameDigestRetry = await reservations.reserve({ recordId: '7001', emailHash: 'digest-of-somebody-else' });
+  return made.ok === true && strangerRetry.ok === false && strangerRetry.taken === true
+    && unkeyedRetry.ok === false && unkeyedRetry.taken === true
+    && sameDigestRetry.ok === true && sameDigestRetry.reused === true
+    || { ok: false, why: JSON.stringify({ made, strangerRetry, unkeyedRetry, sameDigestRetry }) };
+});
+
+await check('R54. recovery finishes ONE record and gives the surplus back: a stray pending reservation under the same digest whose record is still unused returns to the pool, and the spent record stays held', async () => {
+  const { claim, store, reservations } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const a = await reservations.reserve({ recordId: '3000', emailHash: hashOf(emailA, KEY) });
+  const b = await reservations.reserve({ recordId: '3001', emailHash: hashOf(emailA, KEY) });
+  const finished = await claim.finish({ code: 'AOMB', recordId: '3000', reservationId: a.reservationId, userId: 'acct-A', emailHash: hashOf(emailA, KEY) });
+  const recovered = await claim.recover({ email: emailA, userId: 'acct-A' });
+  const stillHeld = store.reservations.map((r) => String(r.code_row_id)).sort();
+  const row3001 = store.codes.find((r) => String(r.id) === '3001');
+  return finished.ok === true && recovered.ok === true
+    && stillHeld.length === 1 && stillHeld[0] === '3000'
+    && Number(row3001.used) === 0 && String(row3001.registered_user_id ?? '') === ''
+    && (recovered.strayReservationsReleased || []).includes('3001')
+    || { ok: false, why: JSON.stringify({ b: b.ok, finished, recovered, stillHeld, row3001 }) };
+});
+
+await check('R55. and the release is evidence-bound: a surplus reservation whose record is USED or ALLOCATED is never given back, because something real already depends on it', async () => {
+  const { claim, store, reservations } = build();
+  store.codes.push(...hundredPool('AOMB'));
+  const held = await reservations.reserve({ recordId: '3002', emailHash: hashOf(emailA, KEY) });
+  // Somebody else's spend, visible on the record while our reservation row still points at it.
+  const other = await reservations.reserve({ recordId: '3003', emailHash: hashOf(emailA, KEY) });
+  store.codes.find((r) => String(r.id) === '3003').used = 1;
+  store.codes.find((r) => String(r.id) === '3003').registered_user_id = 'acct-somebody-else';
+  const first = await claim.finish({ code: 'AOMB', recordId: '3002', reservationId: held.reservationId, userId: 'acct-A', emailHash: hashOf(emailA, KEY) });
+  const recovered = await claim.recover({ email: emailA, userId: 'acct-A' });
+  const row3003 = store.codes.find((r) => String(r.id) === '3003');
+  const stillHeld = store.reservations.map((r) => String(r.code_row_id)).sort();
+  return first.ok === true && recovered.ok === true
+    && Number(row3003.used) === 1 && String(row3003.registered_user_id) === 'acct-somebody-else'
+    && stillHeld.includes('3003') && other.ok === true
+    || { ok: false, why: JSON.stringify({ first, recovered, row3003, stillHeld }) };
+});
+
 const failed = results.filter((r) => !r.pass);
 for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? `   [${r.detail}]` : ''}`);
 console.log(`\nRESULTS: ${results.length - failed.length}/${results.length} passed, ${failed.length} failed  (invitation reservations)`);

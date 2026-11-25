@@ -115,12 +115,30 @@ function createInvitationReservations({
   }
 
   /**
-   * The atomic step. Returns `{ok:true}` when THIS call created the reservation,
-   * `{ok:false, taken:true}` when the record is already reserved by anyone, and
-   * `{ok:false}` with a reason when the store could not answer — which is never treated as free.
+   * The atomic step. Returns `{ok:true}` when THIS call created the reservation - or when the record
+   * turns out to be held under OUR OWN digest, which is the same entitlement arriving by a different
+   * route - `{ok:false, taken:true}` when a STRANGER holds it, and `{ok:false}` with a reason when the
+   * store could not answer, which is never treated as free.
    */
   async function reserve({ recordId, emailHash }) {
     if (recordId === null || recordId === undefined || recordId === '') return { ok: false, reason: 'no_record_id' };
+    /* OUR OWN RESERVATION IS NOT A RIVAL. A retry of a registration whose response the browser could not
+       read (the CORS rejection this route had, a dropped socket, a page reload) arrives here with a
+       reservation on the table that WE made. Treating that as "taken by someone else" makes the caller
+       take the NEXT record, so one person quietly holds two invitations and a pool of 100 drains one
+       retry at a time - the exact double-consumption the reservation exists to prevent, performed
+       correctly. The digest is the only thing that can tell the two cases apart, and it is the same
+       digest that made the original row, so this is a re-read of our own write and never an adoption:
+       an unkeyed deployment (no HMAC secret, empty digest) cannot prove ownership and therefore takes
+       nothing here. */
+    const heldByUs = async () => {
+      if (!emailHash) return { ours: null, unreadable: true };
+      const back = await readByRecordId(recordId);
+      if (!back || back.ok !== true) return { ours: null, unreadable: true };
+      const mine = (back.rows || []).find((r) => String(r?.invitee_email_hash ?? '') === String(emailHash));
+      return { ours: mine ? { ok: true, reservationId: mine.id ?? null, recordId, reused: true } : null,
+        holders: (back.rows || []).length, unreadable: false };
+    };
     const attempt = await request({
       path: path('create'), method: 'POST',
       body: { code_row_id: String(recordId), invitee_email_hash: String(emailHash || ''), status: RESERVED }
@@ -131,7 +149,14 @@ function createInvitationReservations({
       return { ok: true, reservationId: id, created: true };
     }
     if (looksLikeDuplicate(attempt?.httpStatus, attempt?.body, attempt?.detail)) {
-      // The normal outcome under contention, and the one that must not be logged as an error.
+      const seen = await heldByUs();
+      if (seen.ours) {
+        log('invitation_reservation_reused_ours', { recordId, reservationId: seen.ours.reservationId });
+        return seen.ours;
+      }
+      // The normal outcome under contention, and the one that must not be logged as an error. An
+      // UNREADABLE holder list still answers `taken`, because saying "free" without evidence is how a
+      // record gets spent twice.
       return { ok: false, taken: true, recordId };
     }
     /* THE ANSWER WE NEVER GOT. A create that times out or dies in transit tells us nothing about
@@ -143,15 +168,12 @@ function createInvitationReservations({
        unkeyed deployment (no HMAC secret, empty digest) reconciles nothing rather than adopting a
        stranger's reservation. */
     if (emailHash) {
-      const back = await readByRecordId(recordId);
-      if (back && back.ok === true) {
-        const mine = (back.rows || []).find((r) => String(r?.invitee_email_hash ?? '') === String(emailHash));
-        if (mine) {
-          log('invitation_reservation_reconciled_after_lost_response', { recordId, reservationId: mine.id });
-          return { ok: true, reservationId: mine.id ?? null, recordId, reconciled: true };
-        }
-        if ((back.rows || []).length) return { ok: false, taken: true, recordId };
+      const seen = await heldByUs();
+      if (seen.ours) {
+        log('invitation_reservation_reconciled_after_lost_response', { recordId, reservationId: seen.ours.reservationId });
+        return { ok: true, reservationId: seen.ours.reservationId, recordId, reconciled: true };
       }
+      if (!seen.unreadable && seen.holders > 0) return { ok: false, taken: true, recordId };
     }
     // A store that cannot answer is not a store that said no. Callers must stop, not proceed
     // unprotected, or an outage silently degrades the design back to a read-then-write.
